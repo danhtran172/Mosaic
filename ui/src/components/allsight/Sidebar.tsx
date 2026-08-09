@@ -442,7 +442,7 @@ export function Sidebar({
   return (
     <aside
       className={cn(
-        "glass-panel flex h-full shrink-0 flex-col rounded-none border-y-0 border-l-0 bg-sidebar transition-[width] duration-200",
+        "glass-panel flex h-full min-h-0 shrink-0 flex-col rounded-none border-y-0 border-l-0 bg-sidebar transition-[width] duration-200",
         collapsed ? "w-14" : "w-64",
       )}
     >
@@ -468,7 +468,7 @@ export function Sidebar({
         </button>
       </div>
 
-      <div ref={navListRef} className={cn("app-scroll relative flex-1 overflow-y-auto", collapsed ? "px-2" : "px-3")}>
+      <div ref={navListRef} className={cn("app-scroll relative min-h-0 flex-1 overflow-y-auto", collapsed ? "px-2" : "px-3")}>
         {!collapsed && (
           <div className="mt-2 mb-1 flex items-center justify-between px-1.5">
             <button
@@ -535,7 +535,7 @@ export function Sidebar({
       })()}
 
       {/* Bottom: tags + settings */}
-      <div className={cn("space-y-1 border-t border-border/60 p-3", collapsed && "px-2")}>
+      <div className={cn("shrink-0 space-y-1 border-t border-border/60 p-3", collapsed && "px-2")}>
         <button
           onClick={() => setSettingsOpen(true)}
           title={t("settings")}
