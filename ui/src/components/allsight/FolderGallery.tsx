@@ -41,6 +41,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   // from onDragStart. Keep the active Gallery entry in a ref, just as the
   // media board keeps its active drag outside the render cycle.
   const draggedRef = useRef<DragEntry | null>(null);
+  const completedDragRef = useRef(false);
   const hold = useRef<{ targetId: string; timer: number } | null>(null);
   const boardRef = useRef<HTMLDivElement>(null);
   const dragFrame = useRef(0);
@@ -82,9 +83,23 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   const beginDrag = (event: React.DragEvent, entry: DragEntry) => {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("application/x-indeck-gallery", JSON.stringify(entry));
+    completedDragRef.current = false;
     draggedRef.current = entry;
     setDragged(entry);
     setDragPoint({ x: event.clientX, y: event.clientY });
+  };
+  // Library cards live inside ContextMenu triggers.  Electron can deliver a
+  // drop before React has rendered the drag state for those wrapped controls,
+  // so retain the native payload as the fallback (the Extension manager uses
+  // the same pattern).
+  const dragFromEvent = (event: React.DragEvent): DragEntry | null => {
+    if (completedDragRef.current) return null;
+    if (draggedRef.current) return draggedRef.current;
+    try {
+      const entry = JSON.parse(event.dataTransfer.getData("application/x-indeck-gallery")) as DragEntry;
+      if (entry && (entry.kind === "folder" || entry.kind === "group") && typeof entry.id === "string") return entry;
+    } catch { /* Ignore unrelated external drops. */ }
+    return null;
   };
   const trackDrag = (event: React.DragEvent) => {
     if (!event.clientX && !event.clientY) return;
@@ -104,6 +119,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     pendingDragPoint.current = null;
     pendingRail.current = null;
     lastRail.current = null;
+    completedDragRef.current = false;
     draggedRef.current = null;
     setDragged(null);
     setDragPoint(null);
@@ -152,6 +168,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
       const dragging = draggedRef.current;
       if (dragging?.kind === "folder") createGalleryGroup([dragging.id, targetId]);
       hold.current = null;
+      completedDragRef.current = true;
       draggedRef.current = null;
       setDragged(null);
       setLibraryRail(null);
@@ -224,7 +241,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         onDrop={(event) => {
           event.preventDefault();
           clearHold();
-          const active = draggedRef.current;
+          const active = dragFromEvent(event);
           if (active && !(active.kind === "folder" && active.id === folder.id)) moveGalleryEntry(active, targetInsertIndex(event, index));
           finishDrag();
         }}
@@ -256,7 +273,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         }}
         onDrop={(event) => {
           event.preventDefault();
-          const active = draggedRef.current;
+          const active = dragFromEvent(event);
           if (!active || (active.kind === "group" && active.id === group.id)) return finishDrag();
           if (active.kind === "folder" && !edge(event)) addGalleryToGroup(group.id, active.id);
           else moveGalleryEntry(active, targetInsertIndex(event, index));
@@ -275,7 +292,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   };
 
   return <div ref={boardRef} className="app-scroll relative flex-1 overflow-y-auto p-5" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
-    const active = draggedRef.current;
+    const active = dragFromEvent(event);
     if (event.target === event.currentTarget && active?.kind === "folder") removeGalleryFromGroup(active.id);
     finishDrag();
   }}>
@@ -304,7 +321,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
                 const rect = event.currentTarget.getBoundingClientRect();
                 setMemberDrop(index, event.clientX < rect.left + rect.width / 2 ? "left" : "right");
               }}
-              onDrop={(event) => { event.preventDefault(); const active = draggedRef.current; if (active?.kind === "folder" && active.id !== folder.id && openedGroup) moveGalleryInGroup(openedGroup.id, active.id, event.clientX < event.currentTarget.getBoundingClientRect().left + event.currentTarget.getBoundingClientRect().width / 2 ? index : index + 1); finishDrag(); }}
+              onDrop={(event) => { event.preventDefault(); const active = dragFromEvent(event); if (active?.kind === "folder" && active.id !== folder.id && openedGroup) moveGalleryInGroup(openedGroup.id, active.id, event.clientX < event.currentTarget.getBoundingClientRect().left + event.currentTarget.getBoundingClientRect().width / 2 ? index : index + 1); finishDrag(); }}
               onClick={(event) => selectFolder(event, folder.id)}
               onDoubleClick={() => { setOpenedGroupId(null); onOpen({ kind: "folder", id: folder.id }); }}
               className={cn("relative rounded-xl text-left", selected.includes(folder.id) && "ring-2 ring-primary", dragged?.kind === "folder" && dragged.id === folder.id && "opacity-45")}

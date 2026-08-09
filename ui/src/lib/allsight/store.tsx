@@ -1080,8 +1080,13 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           const galleryOrder = s.galleryOrder.filter((entry) => entry.kind !== "folder" || entry.id !== folderId);
           const galleryGroups = s.galleryGroups.flatMap((group) => {
             if (group.id === groupId) {
+              const previousIndex = group.folderIds.indexOf(folderId);
               const folderIds = group.folderIds.filter((id) => id !== folderId);
-              folderIds.splice(Math.max(0, Math.min(targetIndex ?? folderIds.length, folderIds.length)), 0, folderId);
+              const requestedIndex = targetIndex ?? folderIds.length;
+              const adjustedIndex = previousIndex >= 0 && previousIndex < requestedIndex
+                ? requestedIndex - 1
+                : requestedIndex;
+              folderIds.splice(Math.max(0, Math.min(adjustedIndex, folderIds.length)), 0, folderId);
               return [{ ...group, folderIds }];
             }
             if (!group.folderIds.includes(folderId)) return [group];
@@ -1119,8 +1124,10 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         set((s) => ({ ...s, galleryGroups: s.galleryGroups.map((group) => group.id === groupId ? { ...group, ...patch } : group) })),
       moveGalleryEntry: (entry, targetIndex) =>
         set((s) => {
+          const previousIndex = s.galleryOrder.findIndex((item) => item.kind === entry.kind && item.id === entry.id);
           const galleryOrder = s.galleryOrder.filter((item) => !(item.kind === entry.kind && item.id === entry.id));
-          galleryOrder.splice(Math.max(0, Math.min(targetIndex, galleryOrder.length)), 0, entry);
+          const adjustedIndex = previousIndex >= 0 && previousIndex < targetIndex ? targetIndex - 1 : targetIndex;
+          galleryOrder.splice(Math.max(0, Math.min(adjustedIndex, galleryOrder.length)), 0, entry);
           return { ...s, galleryOrder };
         }),
       moveGalleryInGroup: (groupId, folderId, targetIndex) =>
@@ -1128,8 +1135,10 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           ...s,
           galleryGroups: s.galleryGroups.map((group) => {
             if (group.id !== groupId || !group.folderIds.includes(folderId)) return group;
+            const previousIndex = group.folderIds.indexOf(folderId);
             const folderIds = group.folderIds.filter((id) => id !== folderId);
-            folderIds.splice(Math.max(0, Math.min(targetIndex, folderIds.length)), 0, folderId);
+            const adjustedIndex = previousIndex < targetIndex ? targetIndex - 1 : targetIndex;
+            folderIds.splice(Math.max(0, Math.min(adjustedIndex, folderIds.length)), 0, folderId);
             return { ...group, folderIds };
           }),
         })),
