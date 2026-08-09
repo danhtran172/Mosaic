@@ -64,29 +64,43 @@ function equalJustifiedRows(items: MediaItem[], width: number, target: number): 
   const maxHeight = Math.min(target, MAX_ROW_HEIGHT);
   if (!items.length) return [];
 
-  // Every row must contain the same number of cards. Choose the smallest
-  // divisor of the item count that also keeps *every* justified row under the
-  // configured height cap. If needed, this deliberately increases the number
-  // of items per row instead of stretching a short final row.
-  const possibleColumns = Array.from({ length: items.length }, (_, index) => index + 1)
-    .filter((columns) => items.length % columns === 0);
-  const columns = possibleColumns.find((candidate) => {
-    for (let start = 0; start < items.length; start += candidate) {
-      const row = items.slice(start, start + candidate);
-      const gaps = GAP * (candidate - 1);
-      const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
-      if ((Math.max(width - gaps, 80) / totalRatio) > maxHeight) return false;
-    }
-    return true;
-  }) ?? items.length;
+  // Do not require the item total to divide evenly into rows: prime counts
+  // would otherwise force every card into a single tiny row. Instead, pick
+  // the most rows that stay below the height cap, then distribute the cards
+  // across them as evenly as mathematically possible (the last-row difference
+  // can only ever be one card).
+  const balancedRows = (rowCount: number) => {
+    const base = Math.floor(items.length / rowCount);
+    const extra = items.length % rowCount;
+    let start = 0;
+    return Array.from({ length: rowCount }, (_, index) => {
+      const count = base + (index < extra ? 1 : 0);
+      const row = items.slice(start, start + count);
+      start += count;
+      return row;
+    });
+  };
 
-  const rows: MediaItem[][] = [];
-  for (let start = 0; start < items.length; start += columns) {
-    rows.push(items.slice(start, start + columns));
+  const totalRatio = items.reduce((sum, item) => sum + mediaRatio(item), 0);
+  // This is the largest approximate row count that can fit at maxHeight.
+  // Start there rather than trying every possible count from `items.length`.
+  let rowCount = Math.max(1, Math.min(items.length, Math.floor((totalRatio * maxHeight) / width)));
+  let rows = [items];
+  for (; rowCount >= 2; rowCount -= 1) {
+    const candidate = balancedRows(rowCount);
+    const isWithinHeightCap = candidate.every((row) => {
+      const gaps = GAP * (row.length - 1);
+      const ratio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
+      return Math.max(width - gaps, 80) / ratio <= maxHeight;
+    });
+    if (isWithinHeightCap) {
+      rows = candidate;
+      break;
+    }
   }
 
   return rows.map((row) => {
-    const gaps = GAP * (columns - 1);
+    const gaps = GAP * (row.length - 1);
     const availableWidth = Math.max(width - gaps, 80);
     const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
     const height = availableWidth / totalRatio;
