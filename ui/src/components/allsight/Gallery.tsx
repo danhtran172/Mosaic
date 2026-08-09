@@ -49,7 +49,7 @@ const HOLD_MS = 1500;
 const DWELL_MS = 500; // hovering an insertion point this long widens the gap
 const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
-const DEFAULT_ITEMS_PER_ROW = 6;
+const DEFAULT_ITEMS_PER_ROW = 5;
 
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
@@ -63,7 +63,7 @@ function mediaRatio(item: MediaItem) {
 function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
   if (!items.length) return [];
 
-  // A Gallery uses six cards per regular row. The final row keeps its remaining
+  // A Gallery uses five cards per regular row. The final row keeps its remaining
   // cards and is still justified across the available width.
   const rows: MediaItem[][] = [];
   for (let start = 0; start < items.length; start += DEFAULT_ITEMS_PER_ROW) {
