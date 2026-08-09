@@ -37,6 +37,10 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   const [memberRail, setMemberRail] = useState<{ index: number; side: "left" | "right" } | null>(null);
   const [renamingGalleryGroup, setRenamingGalleryGroup] = useState<GalleryGroup | null>(null);
   const selectedRef = useRef<string[]>([]);
+  // Native drag events can arrive before React has committed the state update
+  // from onDragStart. Keep the active Gallery entry in a ref, just as the
+  // media board keeps its active drag outside the render cycle.
+  const draggedRef = useRef<DragEntry | null>(null);
   const hold = useRef<{ targetId: string; timer: number } | null>(null);
   const boardRef = useRef<HTMLDivElement>(null);
   const dragFrame = useRef(0);
@@ -78,6 +82,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   const beginDrag = (event: React.DragEvent, entry: DragEntry) => {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("application/x-indeck-gallery", JSON.stringify(entry));
+    draggedRef.current = entry;
     setDragged(entry);
     setDragPoint({ x: event.clientX, y: event.clientY });
   };
@@ -99,6 +104,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     pendingDragPoint.current = null;
     pendingRail.current = null;
     lastRail.current = null;
+    draggedRef.current = null;
     setDragged(null);
     setDragPoint(null);
     setLibraryRail(null);
@@ -139,11 +145,14 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     setMemberRail((current) => current?.index === index && current.side === side ? current : { index, side });
   };
   const startGroupHold = (targetId: string, isEdge: boolean) => {
-    if (isEdge || !dragged || dragged.kind !== "folder" || dragged.id === targetId || hold.current?.targetId === targetId) return;
+    const active = draggedRef.current;
+    if (isEdge || !active || active.kind !== "folder" || active.id === targetId || hold.current?.targetId === targetId) return;
     clearHold();
     hold.current = { targetId, timer: window.setTimeout(() => {
-      if (dragged?.kind === "folder") createGalleryGroup([dragged.id, targetId]);
+      const dragging = draggedRef.current;
+      if (dragging?.kind === "folder") createGalleryGroup([dragging.id, targetId]);
       hold.current = null;
+      draggedRef.current = null;
       setDragged(null);
       setLibraryRail(null);
       lastRail.current = null;
@@ -215,7 +224,8 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         onDrop={(event) => {
           event.preventDefault();
           clearHold();
-          if (dragged && !(dragged.kind === "folder" && dragged.id === folder.id)) moveGalleryEntry(dragged, targetInsertIndex(event, index));
+          const active = draggedRef.current;
+          if (active && !(active.kind === "folder" && active.id === folder.id)) moveGalleryEntry(active, targetInsertIndex(event, index));
           finishDrag();
         }}
         onClick={(event) => selectFolder(event, folder.id)}
@@ -238,16 +248,18 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         onDrag={trackDrag}
         onDragOver={(event) => {
           event.preventDefault();
-          if (dragged?.kind === "folder" && !edge(event)) {
+          const active = draggedRef.current;
+          if (active?.kind === "folder" && !edge(event)) {
             setLibraryRail(null);
             lastRail.current = null;
           } else setLibraryDrop(event, index);
         }}
         onDrop={(event) => {
           event.preventDefault();
-          if (!dragged || (dragged.kind === "group" && dragged.id === group.id)) return finishDrag();
-          if (dragged.kind === "folder" && !edge(event)) addGalleryToGroup(group.id, dragged.id);
-          else moveGalleryEntry(dragged, targetInsertIndex(event, index));
+          const active = draggedRef.current;
+          if (!active || (active.kind === "group" && active.id === group.id)) return finishDrag();
+          if (active.kind === "folder" && !edge(event)) addGalleryToGroup(group.id, active.id);
+          else moveGalleryEntry(active, targetInsertIndex(event, index));
           finishDrag();
         }}
         onClick={() => setOpenedGroupId(group.id)}
@@ -263,7 +275,8 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   };
 
   return <div ref={boardRef} className="app-scroll relative flex-1 overflow-y-auto p-5" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
-    if (event.target === event.currentTarget && dragged?.kind === "folder") removeGalleryFromGroup(dragged.id);
+    const active = draggedRef.current;
+    if (event.target === event.currentTarget && active?.kind === "folder") removeGalleryFromGroup(active.id);
     finishDrag();
   }}>
     <div className="grid grid-cols-[repeat(auto-fill,minmax(170px,1fr))] gap-x-4 gap-y-5">
@@ -291,7 +304,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
                 const rect = event.currentTarget.getBoundingClientRect();
                 setMemberDrop(index, event.clientX < rect.left + rect.width / 2 ? "left" : "right");
               }}
-              onDrop={(event) => { event.preventDefault(); if (dragged?.kind === "folder" && dragged.id !== folder.id && openedGroup) moveGalleryInGroup(openedGroup.id, dragged.id, event.clientX < event.currentTarget.getBoundingClientRect().left + event.currentTarget.getBoundingClientRect().width / 2 ? index : index + 1); finishDrag(); }}
+              onDrop={(event) => { event.preventDefault(); const active = draggedRef.current; if (active?.kind === "folder" && active.id !== folder.id && openedGroup) moveGalleryInGroup(openedGroup.id, active.id, event.clientX < event.currentTarget.getBoundingClientRect().left + event.currentTarget.getBoundingClientRect().width / 2 ? index : index + 1); finishDrag(); }}
               onClick={(event) => selectFolder(event, folder.id)}
               onDoubleClick={() => { setOpenedGroupId(null); onOpen({ kind: "folder", id: folder.id }); }}
               className={cn("relative rounded-xl text-left", selected.includes(folder.id) && "ring-2 ring-primary", dragged?.kind === "folder" && dragged.id === folder.id && "opacity-45")}
