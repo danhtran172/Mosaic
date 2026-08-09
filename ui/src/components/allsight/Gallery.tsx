@@ -49,7 +49,7 @@ const HOLD_MS = 1500;
 const DWELL_MS = 500; // hovering an insertion point this long widens the gap
 const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
-const MAX_ROW_HEIGHT = 260;
+const DEFAULT_ITEMS_PER_ROW = 6;
 
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
@@ -60,43 +60,14 @@ function mediaRatio(item: MediaItem) {
   return Math.max(0.12, Math.min(8, width / height));
 }
 
-function equalJustifiedRows(items: MediaItem[], width: number, target: number): Row[] {
-  const maxHeight = Math.min(target, MAX_ROW_HEIGHT);
+function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
   if (!items.length) return [];
 
-  // Do not require the item total to divide evenly into rows: prime counts
-  // would otherwise force every card into a single tiny row. Instead, pick
-  // the most rows that stay below the height cap, then distribute the cards
-  // across them as evenly as mathematically possible (the last-row difference
-  // can only ever be one card).
-  const balancedRows = (rowCount: number) => {
-    const base = Math.floor(items.length / rowCount);
-    const extra = items.length % rowCount;
-    let start = 0;
-    return Array.from({ length: rowCount }, (_, index) => {
-      const count = base + (index < extra ? 1 : 0);
-      const row = items.slice(start, start + count);
-      start += count;
-      return row;
-    });
-  };
-
-  const totalRatio = items.reduce((sum, item) => sum + mediaRatio(item), 0);
-  // This is the largest approximate row count that can fit at maxHeight.
-  // Start there rather than trying every possible count from `items.length`.
-  let rowCount = Math.max(1, Math.min(items.length, Math.floor((totalRatio * maxHeight) / width)));
-  let rows = [items];
-  for (; rowCount >= 2; rowCount -= 1) {
-    const candidate = balancedRows(rowCount);
-    const isWithinHeightCap = candidate.every((row) => {
-      const gaps = GAP * (row.length - 1);
-      const ratio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
-      return Math.max(width - gaps, 80) / ratio <= maxHeight;
-    });
-    if (isWithinHeightCap) {
-      rows = candidate;
-      break;
-    }
+  // A Gallery uses six cards per regular row. The final row keeps its remaining
+  // cards and is still justified across the available width.
+  const rows: MediaItem[][] = [];
+  for (let start = 0; start < items.length; start += DEFAULT_ITEMS_PER_ROW) {
+    rows.push(items.slice(start, start + DEFAULT_ITEMS_PER_ROW));
   }
 
   return rows.map((row) => {
@@ -1081,7 +1052,7 @@ export function Gallery({
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return equalJustifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
+            return equalJustifiedRows(block.items, width).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1112,7 +1083,7 @@ export function Gallery({
           }
           const group = state.groups.find((g) => g.id === block.entry.id)!;
           const gi = globalIndex(block.entry);
-          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight * 0.78);
+          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100));
           const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
           const insertY =
             drop?.type === "insert" && drop.axis === "y"
