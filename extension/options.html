@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>InDeck Extension Settings</title>
+    <style>
+      body{max-width:680px;margin:48px auto;padding:0 24px;background:#121416;color:#edf0ea;font:15px/1.5 system-ui,sans-serif}main{padding:28px;border:1px solid #343a34;border-radius:12px;background:#1a1d1a}h1{margin:0 0 8px;font-size:24px}p{color:#b5bcb1}label{display:block;margin:24px 0 8px;font-weight:700}select,button{box-sizing:border-box;border-radius:7px;font:inherit}select{width:100%;padding:10px;background:#101210;color:#edf0ea;border:1px solid #4c5548}button{margin-top:14px;padding:10px 15px;border:0;background:#c6ff59;color:#172000;font-weight:800;cursor:pointer}#status{min-height:24px;margin:16px 0 0;color:#c7cec4}.error{color:#ffb4ac!important}.hint{font-size:13px}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>InDeck Extension</h1>
+      <p>Chọn profile đích. Mọi media về sau sẽ tự lưu vào profile này, kể cả khi không có cửa sổ InDeck nào đang mở.</p>
+      <label for="profile">Profile</label>
+      <select id="profile" disabled><option>Đang tải profiles…</option></select>
+      <button id="save" disabled>Lưu lựa chọn</button>
+      <p id="status" role="status"></p>
+      <p class="hint">Tạo, đổi tên hoặc xoá profile trong InDeck → Settings → Profiles.</p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

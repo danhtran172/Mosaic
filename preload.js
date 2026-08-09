@@ -3,8 +3,28 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('vision', {
   readStore: () => ipcRenderer.invoke('store:read'),
   writeStore: value => ipcRenderer.invoke('store:write', value),
+  readLibrarySnapshot: () => ipcRenderer.invoke('library:snapshot'),
+  listProfiles: () => ipcRenderer.invoke('profiles:list'),
+  currentProfile: () => ipcRenderer.invoke('profiles:current'),
+  createProfile: name => ipcRenderer.invoke('profiles:create', name),
+  renameProfile: (profileId, name) => ipcRenderer.invoke('profiles:rename', profileId, name),
+  deleteProfile: profileId => ipcRenderer.invoke('profiles:delete', profileId),
+  openProfile: profileId => ipcRenderer.invoke('profiles:open', profileId),
+  createProfileShortcut: profileId => ipcRenderer.invoke('profiles:create-shortcut', profileId),
+  minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
+  isWindowMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+  toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
+  closeWindow: () => ipcRenderer.invoke('window:close'),
   pickFolder: () => ipcRenderer.invoke('folders:pick'),
-  scanFolder: folder => ipcRenderer.invoke('folder:scan', folder),
+  ensureGalleryDefaultSource: gallery => ipcRenderer.invoke('gallery:default-source:ensure', gallery),
+  discardGalleryDefaultSource: source => ipcRenderer.invoke('gallery:default-source:discard', source),
+  scanFolder: source => ipcRenderer.invoke('folder:scan', source),
+  cachedSource: source => ipcRenderer.invoke('source:catalog', source),
+  removeCachedSource: sourceId => ipcRenderer.invoke('source:catalog-remove', sourceId),
+  resolveSource: source => ipcRenderer.invoke('source:resolve', source),
+  ensureThumbnails: assets => ipcRenderer.invoke('thumbnails:ensure', assets),
+  listVaultBridges: () => ipcRenderer.invoke('vault:bridges'),
+  syncMediaLocations: entries => ipcRenderer.invoke('media:sync-locations', entries),
   watchSources: folders => ipcRenderer.invoke('sources:watch', folders),
   onFolderChanged: callback => {
     const listener = (_, folder) => callback(folder);
@@ -16,7 +36,8 @@ contextBridge.exposeInMainWorld('vision', {
     ipcRenderer.on('media:imported', listener);
     return () => ipcRenderer.removeListener('media:imported', listener);
   },
-  copyImage: filePath => ipcRenderer.invoke('image:copy', filePath),
-  showInFolder: filePath => ipcRenderer.invoke('image:show-in-folder', filePath),
-  permanentDelete: filePath => ipcRenderer.invoke('media:permanent-delete', filePath)
+  copyImage: asset => ipcRenderer.invoke('image:copy', asset),
+  showInFolder: asset => ipcRenderer.invoke('image:show-in-folder', asset),
+  openWithDefaultApp: asset => ipcRenderer.invoke('media:open-default', asset),
+  permanentDelete: asset => ipcRenderer.invoke('media:permanent-delete', asset)
 });

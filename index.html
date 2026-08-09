@@ -13,7 +13,7 @@
         <div class="library-actions"><button id="manageTags" class="tag-manager-button">Quản lý tag</button></div>
         <nav class="side-section" id="libraryNav">
           <div class="section-heading library-heading"><button id="libraryHome" class="library-home"><p class="section-label">THƯ VIỆN</p></button><button id="addCollection" title="Create Gallery">＋</button></div>
-          <button class="nav-item active" data-view="all"><span>◈</span> <em data-i18n="allMedia">Tất cả media</em> <b id="assetCount">0</b></button>
+          <button class="nav-item active" data-view="all"><span>◈</span> <em data-i18n="allMedia">Main Gallery</em> <b id="assetCount">0</b></button>
           <div id="collectionsList" class="collection-list library-collections"></div>
         </nav>
         <div class="sidebar-bottom"><button id="settingsButton" class="nav-item"><span>◉</span> <em>Settings</em></button></div>
@@ -21,12 +21,12 @@
 
       <main class="main-panel">
         <header class="topbar">
-          <div class="title-wrap"><p class="eyebrow" id="viewOverline">THƯ VIỆN</p><h1 id="viewTitle">Tất cả media</h1></div>
+          <div class="title-wrap"><p class="eyebrow" id="viewOverline">THƯ VIỆN</p><h1 id="viewTitle">Main Gallery</h1></div>
           <div class="top-actions"><div class="search-wrap"><span>⌕</span><input id="searchInput" placeholder="Tìm kiếm ảnh, tag, nhân vật..." /></div><button class="icon-button" id="selectAll" title="Chọn tất cả">□</button><button class="icon-button" id="toggleInspector" title="Thông tin">ⓘ</button></div>
         </header>
         <section class="toolbar">
           <div class="filter-chip-row" id="filterBar"><button class="filter-chip selected" data-filter="all">Tất cả</button><button class="filter-chip" data-filter="favorites">★ Yêu thích</button><button class="filter-chip" data-filter="images">▧ Hình ảnh</button><button class="filter-chip" data-filter="videos">▷ Video</button></div>
-          <div class="toolbar-right"><div id="bulkActions" class="bulk-actions hidden"><button data-bulk="folder">＋ Gallery</button><button data-bulk="group">◌ Group</button><button data-bulk="tag">＋ Tag</button><button data-bulk="hide">Hide</button><button data-bulk="copy">▣ Copy</button><button data-bulk="dissolve" id="dissolveGroup" class="hidden">Rã nhóm</button></div><div class="zoom-actions"><button id="zoomOut" title="Zoom out">−</button><span id="zoomValue">155</span><button id="zoomIn" title="Zoom in">＋</button></div><button id="editCollection" class="text-button hidden">Edit Gallery</button><button id="sortButton" class="text-button">Mới nhất <span>⌄</span></button><button id="clearLayout" class="text-button">Sắp xếp lại</button></div>
+          <div class="toolbar-right"><div id="bulkActions" class="bulk-actions hidden"><button data-bulk="folder">＋ Gallery</button><button data-bulk="group">◌ Group</button><button data-bulk="tag">＋ Tag</button><button data-bulk="hide">Hide</button><button data-bulk="copy">▣ Copy</button><button data-bulk="dissolve" id="dissolveGroup" class="hidden">Rã nhóm</button></div><div class="zoom-actions"><button id="zoomOut" title="Zoom out">−</button><span id="zoomValue">155</span><button id="zoomIn" title="Zoom in">＋</button></div><button id="addLibrarySource" class="text-button" title="Add a source to Main Gallery">＋ Source</button><button id="advancedFilter" class="text-button">Filter</button><button id="allMediaExcludeGalleries" class="text-button hidden" title="Hide media that only belongs to selected Galleries">Exclude Gallery</button><button id="refreshMedia" class="text-button" title="Scan source folders again">⟳ Refresh</button><button id="editCollection" class="text-button hidden">Edit Gallery</button><button id="sortButton" class="text-button">Mới nhất <span>⌄</span></button><button id="clearLayout" class="text-button">Sắp xếp lại</button></div>
         </section>
         <section id="content" class="content-area">
           <div id="emptyState" class="empty-state"><div class="empty-orb">✦</div><h2 data-i18n="emptyTitle">Không gian hình ảnh của bạn</h2><p data-i18n="emptyText">Thêm một thư mục để bắt đầu sắp xếp ảnh và video theo cách của riêng bạn.</p><button class="primary-button" id="emptyAdd" data-i18n="emptyAdd">Thêm thư mục đầu tiên</button></div>
@@ -54,7 +54,7 @@
           <section class="detail-section gallery-name-section"><div class="detail-label">GALLERY NAME</div><div class="gallery-name-row"><input id="galleryNameInput" class="gallery-name-input" /><button id="saveGalleryName" class="primary-button">Save</button></div></section>
           <section class="detail-section"><div class="detail-label detail-label-action">AUTO TAG · THEME <button class="property-add" data-gallery-auto-kind="tags">＋</button></div><div id="galleryThemeTags" class="pill-box"></div></section>
           <section class="detail-section"><div class="detail-label detail-label-action">AUTO TAG · CHARACTER <button class="property-add" data-gallery-auto-kind="persons">＋</button></div><div id="galleryCharacterTags" class="pill-box person-box"></div></section>
-          <section class="detail-section"><div class="detail-label">MEDIA SOURCES</div><div id="galleryMediaSources" class="gallery-media-sources"></div></section>
+          <section class="detail-section"><div class="detail-label detail-label-action">MEDIA SOURCES <button id="addGallerySource" class="property-add" title="Add source folder">＋</button></div><div id="galleryMediaSources" class="gallery-media-sources"></div></section>
         </div>
       </aside>
     </div>
