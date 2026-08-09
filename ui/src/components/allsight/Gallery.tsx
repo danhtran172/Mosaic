@@ -60,38 +60,33 @@ function mediaRatio(item: MediaItem) {
   return Math.max(0.12, Math.min(8, width / height));
 }
 
-function justifiedRows(items: MediaItem[], width: number, target: number): Row[] {
+function equalJustifiedRows(items: MediaItem[], width: number, target: number): Row[] {
   const maxHeight = Math.min(target, MAX_ROW_HEIGHT);
-  const rawRows: MediaItem[][] = [];
-  let current: MediaItem[] = [];
-  let ratioSum = 0;
+  if (!items.length) return [];
 
-  const hasReachedMaxHeight = () => {
-    const gaps = GAP * Math.max(0, current.length - 1);
-    return (Math.max(width - gaps, 80) / ratioSum) <= maxHeight;
-  };
-
-  for (const item of items) {
-    current.push(item);
-    ratioSum += mediaRatio(item);
-    // Add enough cards to keep the justified row at or below the height cap.
-    if (hasReachedMaxHeight()) {
-      rawRows.push(current);
-      current = [];
-      ratioSum = 0;
+  // Every row must contain the same number of cards. Choose the smallest
+  // divisor of the item count that also keeps *every* justified row under the
+  // configured height cap. If needed, this deliberately increases the number
+  // of items per row instead of stretching a short final row.
+  const possibleColumns = Array.from({ length: items.length }, (_, index) => index + 1)
+    .filter((columns) => items.length % columns === 0);
+  const columns = possibleColumns.find((candidate) => {
+    for (let start = 0; start < items.length; start += candidate) {
+      const row = items.slice(start, start + candidate);
+      const gaps = GAP * (candidate - 1);
+      const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
+      if ((Math.max(width - gaps, 80) / totalRatio) > maxHeight) return false;
     }
+    return true;
+  }) ?? items.length;
+
+  const rows: MediaItem[][] = [];
+  for (let start = 0; start < items.length; start += columns) {
+    rows.push(items.slice(start, start + columns));
   }
 
-  if (current.length) {
-    // A short final row cannot be both full width and under the cap on its
-    // own. Merge it with the preceding row: that increases the item count
-    // while preserving every image's aspect ratio.
-    if (rawRows.length) current = [...rawRows.pop()!, ...current];
-    rawRows.push(current);
-  }
-
-  return rawRows.map((row) => {
-    const gaps = GAP * Math.max(0, row.length - 1);
+  return rows.map((row) => {
+    const gaps = GAP * (columns - 1);
     const availableWidth = Math.max(width - gaps, 80);
     const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
     const height = availableWidth / totalRatio;
@@ -1072,7 +1067,7 @@ export function Gallery({
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return justifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
+            return equalJustifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1103,7 +1098,7 @@ export function Gallery({
           }
           const group = state.groups.find((g) => g.id === block.entry.id)!;
           const gi = globalIndex(block.entry);
-          const rows = justifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight * 0.78);
+          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight * 0.78);
           const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
           const insertY =
             drop?.type === "insert" && drop.axis === "y"
