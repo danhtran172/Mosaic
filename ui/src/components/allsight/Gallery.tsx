@@ -54,24 +54,52 @@ const MAX_ROW_HEIGHT = 260;
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
 
-function fixedRows(items: MediaItem[], width: number, target: number): Row[] {
-  const rows: Row[] = [];
-  // Zoom decides a stable column count. Image aspect ratio must not make one
-  // row contain a different number of cards from the next one.
-  const columns = Math.max(1, Math.floor(width / Math.max(100, target)));
-  const height = Math.min(target, MAX_ROW_HEIGHT);
-  for (let start = 0; start < items.length; start += columns) {
-    const current = items.slice(start, start + columns);
+function mediaRatio(item: MediaItem) {
+  const width = Number.isFinite(item.width) && item.width > 0 ? item.width : 4;
+  const height = Number.isFinite(item.height) && item.height > 0 ? item.height : 3;
+  return Math.max(0.12, Math.min(8, width / height));
+}
+
+function justifiedRows(items: MediaItem[], width: number, target: number): Row[] {
+  const maxHeight = Math.min(target, MAX_ROW_HEIGHT);
+  const rawRows: MediaItem[][] = [];
+  let current: MediaItem[] = [];
+  let ratioSum = 0;
+
+  const hasReachedMaxHeight = () => {
     const gaps = GAP * Math.max(0, current.length - 1);
-    const avail = Math.max(width - gaps, 80);
-    rows.push({
-      height,
-      // The final row follows the same rule: its available width is shared
-      // by its remaining cards instead of leaving an empty strip on the right.
-      items: current.map((item) => ({ item, width: avail / current.length })),
-    });
+    return (Math.max(width - gaps, 80) / ratioSum) <= maxHeight;
+  };
+
+  for (const item of items) {
+    current.push(item);
+    ratioSum += mediaRatio(item);
+    // Add enough cards to keep the justified row at or below the height cap.
+    if (hasReachedMaxHeight()) {
+      rawRows.push(current);
+      current = [];
+      ratioSum = 0;
+    }
   }
-  return rows;
+
+  if (current.length) {
+    // A short final row cannot be both full width and under the cap on its
+    // own. Merge it with the preceding row: that increases the item count
+    // while preserving every image's aspect ratio.
+    if (rawRows.length) current = [...rawRows.pop()!, ...current];
+    rawRows.push(current);
+  }
+
+  return rawRows.map((row) => {
+    const gaps = GAP * Math.max(0, row.length - 1);
+    const availableWidth = Math.max(width - gaps, 80);
+    const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
+    const height = availableWidth / totalRatio;
+    return {
+      height,
+      items: row.map((item) => ({ item, width: mediaRatio(item) * height })),
+    };
+  });
 }
 
 function LazyThumbnail({ media, className }: { media: MediaItem; className: string }) {
@@ -1044,7 +1072,7 @@ export function Gallery({
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return fixedRows(block.items, width, state.thumbHeight).map((row, ri) => {
+            return justifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1075,7 +1103,7 @@ export function Gallery({
           }
           const group = state.groups.find((g) => g.id === block.entry.id)!;
           const gi = globalIndex(block.entry);
-          const rows = fixedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight * 0.78);
+          const rows = justifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight * 0.78);
           const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
           const insertY =
             drop?.type === "insert" && drop.axis === "y"
