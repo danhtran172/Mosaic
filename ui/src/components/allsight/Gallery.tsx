@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes,
   ClipboardPaste,
@@ -41,6 +41,7 @@ import { useT } from "@/lib/allsight/i18n";
 import type { MediaItem, OrderEntry } from "@/lib/allsight/types";
 import { cn } from "@/lib/utils";
 import type { ConfirmRequest } from "./ConfirmDialog";
+import type { MediaGroupBy } from "@/lib/allsight/grouping";
 
 const GAP = 8; // 30% tighter than the 12px base grid
 const GROUP_PAD = 8; // 30% tighter than 12px
@@ -49,7 +50,7 @@ const HOLD_MS = 1500;
 const DWELL_MS = 500; // hovering an insertion point this long widens the gap
 const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
-const DEFAULT_ITEMS_PER_ROW = 5;
+const MIN_ITEMS_PER_ROW = 5;
 const MAX_GALLERY_ROW_HEIGHT = 260;
 
 
@@ -64,12 +65,25 @@ function mediaRatio(item: MediaItem) {
 function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
   if (!items.length) return [];
 
-  // A Gallery uses five cards per regular row. The final row keeps its remaining
-  // cards and is still justified across the available width.
+  // Keep at least five cards per regular row, then add more only when needed
+  // to fill a wide Gallery without exceeding the visual max height. A fixed
+  // five-card row plus a height cap leaves a large empty strip for portrait
+  // media whenever Inspector is closed (the usable width is then wider).
   const rows: MediaItem[][] = [];
-  for (let start = 0; start < items.length; start += DEFAULT_ITEMS_PER_ROW) {
-    rows.push(items.slice(start, start + DEFAULT_ITEMS_PER_ROW));
+  let row: MediaItem[] = [];
+  let ratio = 0;
+  for (const item of items) {
+    row.push(item);
+    ratio += mediaRatio(item);
+    const gaps = GAP * (row.length - 1);
+    const fillsAtMaxHeight = ratio * MAX_GALLERY_ROW_HEIGHT + gaps >= width;
+    if (row.length >= MIN_ITEMS_PER_ROW && fillsAtMaxHeight) {
+      rows.push(row);
+      row = [];
+      ratio = 0;
+    }
   }
+  if (row.length) rows.push(row);
 
   return rows.map((row) => {
     const gaps = GAP * (row.length - 1);
@@ -130,18 +144,27 @@ type DropInfo =
 
 export function Gallery({
   entries,
+  visibleMediaIds,
   selected,
   setSelected,
   onOpen,
   onConfirm,
   currentFolderId,
+  layoutKey,
+  groupBy,
 }: {
   entries: OrderEntry[];
+  /** Individual media that pass the current view's hidden/filter rules. */
+  visibleMediaIds: string[];
   selected: string[];
   setSelected: (ids: string[]) => void;
   onOpen: (id: string) => void;
   onConfirm: (r: ConfirmRequest) => void;
   currentFolderId: string | null;
+  /** Changes synchronously whenever a sibling panel changes Gallery width. */
+  layoutKey: string;
+  /** Display-only multi-level grouping selected in the Library header. */
+  groupBy: MediaGroupBy[];
 }) {
   const t = useT();
   const {
@@ -167,6 +190,9 @@ export function Gallery({
 
   const containerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
+  // Start at a normal desktop width. A zero-width flex measurement is common
+  // during Electron's first layout pass and must never shrink the whole grid
+  // to the 320px safety minimum before the real width is available.
   const [width, setWidth] = useState(1000);
   const [drag, setDrag] = useState<OrderEntry | null>(null);
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number } | null>(null);
@@ -190,23 +216,36 @@ export function Gallery({
   const autoScroll = useRef(0);
 
 
+  // Desktop state hydrates asynchronously. On the first render the empty
+  // state has no scroll container, so rerun once media arrives and attach
+  // the observer to the actual Gallery viewport.
   useLayoutEffect(() => {
     // Measure the scrolling viewport, not the content column. A column with
     // only narrow portrait cards is allowed to shrink to its min-content
     // width, which fed ~80px into `justify()` and produced tiny thumbnails.
     const el = containerRef.current;
     if (!el) return;
-    const measure = () => setWidth(Math.max(320, el.clientWidth - 40));
+    const measure = () => {
+      const measured = Math.floor(el.getBoundingClientRect().width);
+      // Preserve the last valid layout until the flex parent has a real size.
+      if (measured <= 40) return;
+      const next = Math.max(320, measured - 40);
+      setWidth((current) => current === next ? current : next);
+    };
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     measure();
-    return () => ro.disconnect();
-  }, []);
+    // A sibling flex item can finish its width transition after the first
+    // layout pass in Chromium. Measure one frame later as well.
+    const frame = window.requestAnimationFrame(measure);
+    return () => { ro.disconnect(); window.cancelAnimationFrame(frame); };
+  }, [entries.length, layoutKey]);
 
   const mediaById = useCallback(
     (id: string) => state.media.find((m) => m.id === id),
     [state.media],
   );
+  const visibleMediaIdSet = useMemo(() => new Set(visibleMediaIds), [visibleMediaIds]);
   const globalIndex = useCallback(
     (entry: OrderEntry) => state.order.findIndex((e) => e.kind === entry.kind && e.id === entry.id),
     [state.order],
@@ -653,11 +692,17 @@ export function Gallery({
     }
   };
 
+  // Radix renders menus and dialogs in portals, but their React events still
+  // bubble through this Gallery. Do not let an action click become a canvas
+  // pointer-down: that starts marquee selection and can replace the selected
+  // image ids before the menu action gets to use them.
+  const stopCanvasPointerDown = (event: React.PointerEvent) => event.stopPropagation();
+
   // ---- context menu ---------------------------------------------------
   const selectionMenu = (ids: string[]) => {
     const hasClipboard = Object.values(clipboard).some((values) => values.length);
     return (
-      <ContextMenuContent className="glass-float w-64 rounded-xl">
+      <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids); setSelected([]); }}>
           <Boxes className="size-4" /> Tạo group từ {ids.length} ảnh đã chọn
         </ContextMenuItem>
@@ -708,7 +753,7 @@ export function Gallery({
     const group = state.groups.find((g) => g.memberIds.includes(m.id));
     const hasClipboard = Object.values(clipboard).some((v) => v.length);
     return (
-      <ContextMenuContent className="glass-float w-64 rounded-xl">
+      <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => onOpen(m.id)}>
           <Maximize2 className="size-4" /> {t("open")}
         </ContextMenuItem>
@@ -831,7 +876,7 @@ export function Gallery({
     const group = state.groups.find((g) => g.id === groupId);
     if (!group) return null;
     return (
-      <ContextMenuContent className="glass-float w-64 rounded-xl">
+      <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => setSelected(group.memberIds)}>
           <Users className="size-4" /> {t("selectGroupImages")}
         </ContextMenuItem>
@@ -993,6 +1038,50 @@ export function Gallery({
   };
 
   // ---- blocks ---------------------------------------------------------
+  const displaySections = useMemo(() => {
+    if (groupBy.length === 0) return [{ entries, label: "" }];
+    const mediaForEntry = (entry: OrderEntry) => entry.kind === "media"
+      ? state.media.filter((media) => media.id === entry.id)
+      : state.groups.find((group) => group.id === entry.id)?.memberIds
+        .map((id) => state.media.find((media) => media.id === id))
+        .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id)) ?? [];
+    // A Group by value is a display facet, rather than a mutually-exclusive
+    // bucket. Return every matching value so a media item can be rendered in
+    // each relevant section while all copies still point at its single ID.
+    const keysFor = (entry: OrderEntry, group: MediaGroupBy) => {
+      const media = mediaForEntry(entry);
+      if (group.kind === "media-source") {
+        const values = [...new Set(media.map((item) => state.sources.find((source) => source.id === item.sourceId)?.name ?? "Unknown source"))];
+        return values.length ? values.sort() : ["Unknown source"];
+      }
+      if (group.kind === "gallery-source") {
+        const values = [...new Set(media.flatMap((item) => state.folders.filter((folder) => folder.mediaIds.includes(item.id)).map((folder) => folder.name)))];
+        return values.length ? values.sort() : ["No Gallery source"];
+      }
+      const values = [...new Set(media.flatMap((item) => item.props[group.propertyId] ?? []))];
+      const property = state.propertyGroups.find((item) => item.id === group.propertyId);
+      return values.length ? values.sort() : [`No ${property?.name ?? "Property"}`];
+    };
+    let sections: Array<{ entries: OrderEntry[]; label: string }> = [{ entries, label: "" }];
+    for (const grouping of groupBy) {
+      sections = sections.flatMap((section) => {
+        const buckets = new Map<string, OrderEntry[]>();
+        section.entries.forEach((entry) => {
+          keysFor(entry, grouping).forEach((key) => {
+            const bucket = buckets.get(key) ?? [];
+            bucket.push(entry);
+            buckets.set(key, bucket);
+          });
+        });
+        return [...buckets.entries()].map(([key, groupedEntries]) => ({
+          entries: groupedEntries,
+          label: section.label ? `${section.label} / ${key}` : key,
+        }));
+      });
+    }
+    return sections;
+  }, [entries, groupBy, state.folders, state.groups, state.media, state.propertyGroups, state.sources, visibleMediaIdSet]);
+
   type Block =
     | {
         kind: "run";
@@ -1000,40 +1089,51 @@ export function Gallery({
         items: MediaItem[];
         badges: (number | undefined)[];
         stacks: (MediaItem[] | undefined)[];
+        section: number;
+        sectionStart: boolean;
+        sectionLabel: string;
       }
-    | { kind: "group"; entry: OrderEntry; items: MediaItem[] };
+    | { kind: "group"; entry: OrderEntry; items: MediaItem[]; section: number; sectionStart: boolean; sectionLabel: string };
 
   const blocks: Block[] = [];
-  const pushRun = (entry: OrderEntry, m: MediaItem, badge?: number, stack?: MediaItem[]) => {
+  const pushRun = (entry: OrderEntry, m: MediaItem, section: number, badge?: number, stack?: MediaItem[]) => {
     const last = blocks[blocks.length - 1];
-    if (last && last.kind === "run") {
+    if (last && last.kind === "run" && last.section === section) {
       last.items.push(m);
       last.entries.push(entry);
       last.badges.push(badge);
       last.stacks.push(stack);
     } else
-      blocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack] });
+      blocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack], section, sectionStart: false, sectionLabel: "" });
   };
 
-  for (const entry of entries) {
+  displaySections.forEach((displaySection, section) => displaySection.entries.forEach((entry) => {
     if (entry.kind === "group") {
       const g = state.groups.find((x) => x.id === entry.id);
-      if (!g) continue;
-      const items = g.memberIds.map(mediaById).filter(Boolean) as MediaItem[];
+      if (!g) return;
+      const items = g.memberIds
+        .map(mediaById)
+        .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id));
       if (g.collapsed) {
-        const cover = (g.coverId ? mediaById(g.coverId) : undefined) ?? items[0];
-        if (!cover) continue;
+        const cover = items.find((media) => media.id === g.coverId) ?? items[0];
+        if (!cover) return;
         const rest = items.filter((m) => m.id !== cover.id);
-        pushRun(entry, cover, g.memberIds.length, [cover, ...rest].slice(0, 4));
+        pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, 4));
       } else {
-        blocks.push({ kind: "group", entry, items });
+        blocks.push({ kind: "group", entry, items, section, sectionStart: false, sectionLabel: "" });
       }
     } else {
       const m = mediaById(entry.id);
-      if (!m) continue;
-      pushRun(entry, m);
+      if (!m) return;
+      pushRun(entry, m, section);
     }
-  }
+  }));
+  const markedSections = new Set<number>();
+  blocks.forEach((block) => {
+    block.sectionStart = groupBy.length > 0 && !markedSections.has(block.section);
+    block.sectionLabel = block.sectionStart ? displaySections[block.section]?.label ?? "" : "";
+    markedSections.add(block.section);
+  });
 
   if (entries.length === 0) {
     return (
@@ -1048,7 +1148,7 @@ export function Gallery({
     <div
       ref={containerRef}
       onPointerDown={onBackgroundPointerDown}
-      className="app-scroll relative flex-1 overflow-y-auto px-5 py-4"
+      className="app-scroll relative min-w-0 flex-1 overflow-y-auto px-5 py-4"
     >
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
@@ -1068,17 +1168,20 @@ export function Gallery({
                       : null
                   : null;
               return (
-                <div key={`${bi}-${ri}`} data-library-row className="relative flex" style={{ gap: GAP }}>
-                  {cells.map(({ item, w, entry, badge, stack }) =>
-                    renderMedia(item, entry, w, row.height, badge, stack),
-                  )}
-                  {groupBar === "before" && (
-                    <span className="pointer-events-none absolute -top-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
-                  )}
-                  {groupBar === "after" && (
-                    <span className="pointer-events-none absolute -bottom-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
-                  )}
-                </div>
+                <Fragment key={`${bi}-${ri}`}>
+                  {block.sectionStart && ri === 0 && <GroupDivider label={block.sectionLabel} />}
+                  <div data-library-row className="relative flex" style={{ gap: GAP }}>
+                    {cells.map(({ item, w, entry, badge, stack }) =>
+                      renderMedia(item, entry, w, row.height, badge, stack),
+                    )}
+                    {groupBar === "before" && (
+                      <span className="pointer-events-none absolute -top-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
+                    )}
+                    {groupBar === "after" && (
+                      <span className="pointer-events-none absolute -bottom-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
+                    )}
+                  </div>
+                </Fragment>
               );
             });
           }
@@ -1103,7 +1206,9 @@ export function Gallery({
                   : null
               : null;
           return (
-            <ContextMenu key={group.id}>
+            <Fragment key={group.id}>
+              {block.sectionStart && <GroupDivider label={block.sectionLabel} />}
+              <ContextMenu>
               <ContextMenuTrigger asChild>
                 <div
                   data-group-id={group.id}
@@ -1137,7 +1242,7 @@ export function Gallery({
                       ))}
                     {group.collapsed && (
                       <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
-                        {t("count", { count: group.memberIds.length })}
+                        {t("count", { count: block.items.length })}
                       </div>
                     )}
                   </div>
@@ -1159,7 +1264,8 @@ export function Gallery({
 
               </ContextMenuTrigger>
               {groupMenu(group.id)}
-            </ContextMenu>
+              </ContextMenu>
+            </Fragment>
           );
         })}
       </div>
@@ -1195,7 +1301,7 @@ export function Gallery({
         </div>
       )}
       <Dialog open={!!addToGalleryFor} onOpenChange={(open) => !open && setAddToGalleryFor(null)}>
-        <DialogContent className="glass-float max-w-md rounded-2xl">
+        <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addToFolder")}</DialogTitle></DialogHeader>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {state.folders.map((folder) => {
@@ -1207,7 +1313,7 @@ export function Gallery({
         </DialogContent>
       </Dialog>
       <Dialog open={!!moveToGalleryFor} onOpenChange={(open) => !open && setMoveToGalleryFor(null)}>
-        <DialogContent className="glass-float max-w-md rounded-2xl">
+        <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">Move to Gallery</DialogTitle></DialogHeader>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {state.folders.filter((folder) => folder.id !== currentFolderId).map((folder) => {
@@ -1226,7 +1332,7 @@ export function Gallery({
         </DialogContent>
       </Dialog>
       <Dialog open={!!addGroupToGalleryFor} onOpenChange={(open) => !open && setAddGroupToGalleryFor(null)}>
-        <DialogContent className="glass-float max-w-md rounded-2xl">
+        <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addGroupToFolder")}</DialogTitle></DialogHeader>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {state.folders.map((folder) => {
@@ -1237,6 +1343,16 @@ export function Gallery({
           </div>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+function GroupDivider({ label }: { label: string }) {
+  return (
+    <div className="flex h-5 items-center gap-2 text-[11px] font-medium text-muted-foreground" aria-label={label}>
+      <span className="h-px w-8 shrink-0 bg-border/70" />
+      <span className="shrink-0">{label}</span>
+      <span className="h-px flex-1 bg-border/70" />
     </div>
   );
 }

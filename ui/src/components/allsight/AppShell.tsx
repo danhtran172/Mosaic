@@ -15,6 +15,7 @@ import { TrashPage } from "./TrashPage";
 import { ExtensionManage } from "./ExtensionManage";
 import { LibraryLocationSetup } from "./ProfileManager";
 import { getInDeckBridge, type InDeckProfile } from "@/lib/indeck/bridge";
+import { mediaGroupById, type MediaGroupBy } from "@/lib/allsight/grouping";
 
 const OTHER_MEDIA_SOURCE_ID = "__indeck-other-media__";
 const DEFAULT_MEDIA_SOURCE_ID = "allsight-web-imports";
@@ -56,9 +57,12 @@ export function AppShell() {
   const [propFilters, setPropFilters] = useState<Record<string, string[]>>({});
   const [galleryFilterIds, setGalleryFilterIds] = useState<string[]>([]);
   const [sourceFilterIds, setSourceFilterIds] = useState<string[]>([]);
+  const [groupBy, setGroupBy] = useState<MediaGroupBy[]>([]);
 
   const [selected, setSelected] = useState<string[]>([]);
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  // Start with the library unobstructed. Inspector remains available from the
+  // header and can still auto-open after the user makes a new selection.
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [lightboxId, setLightboxId] = useState<string | null>(null);
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null);
   const [locked, setLocked] = useState(false);
@@ -84,6 +88,13 @@ export function AppShell() {
   const folder = view.kind === "folder" ? state.folders.find((f) => f.id === view.id) ?? null : null;
   const folderLocked = !!folder?.locked && !unlockedFolders.includes(folder.id);
   const requiresFolderPassword = Boolean(state.password && state.requirePasswordToUnlockGallery);
+
+  // Gallery source only exists for Main Gallery. Do not keep a hidden grouping
+  // active after navigating into an individual Gallery.
+  useEffect(() => {
+    if (view.kind === "all") return;
+    setGroupBy((current) => current.filter((item) => item.kind !== "gallery-source"));
+  }, [view.kind]);
 
   // Unlocking is a session-only state.  A Gallery that is locked again must
   // immediately lose its old session grant; otherwise it can be opened
@@ -173,6 +184,12 @@ export function AppShell() {
       for (const [gid, vals] of Object.entries(propFilters)) {
         if (!vals.length) continue;
         if (folder?.managedGroupIds?.length && !folder.managedGroupIds.includes(gid)) continue;
+        if (folder?.disabledGeneralGroupIds?.includes(gid) || folder?.disabledGalleryGroupIds?.includes(gid)) continue;
+        // In Main Gallery, a Property must not affect media whose only
+        // Gallery owners have explicitly disabled that Property.
+        if (!folder && providers.length > 0 && providers.every((provider) =>
+          (provider.disabledGeneralGroupIds ?? []).includes(gid) || (provider.disabledGalleryGroupIds ?? []).includes(gid),
+        )) continue;
         const own = m.props[gid] ?? [];
         if (!vals.some((v) => own.includes(v))) return false;
       }
@@ -191,6 +208,11 @@ export function AppShell() {
       return true;
     };
   }, [filter, folder, galleryFilterIds, propFilters, query, sourceFilterIds, state, unlockedFolders]);
+
+  // Keep member Media Groups aligned with the current view. The group itself
+  // stays in order when at least one member passes, but Gallery must receive
+  // the individual ids too so it never renders hidden/filtered members.
+  const visibleMediaIds = useMemo(() => state.media.filter(passes).map((media) => media.id), [passes, state.media]);
 
   const entries: OrderEntry[] = useMemo(() => {
     const byId = new Map(state.media.map((m) => [m.id, m]));
@@ -214,12 +236,12 @@ export function AppShell() {
         const g = state.groups.find((x) => x.id === e.id);
         g?.memberIds.forEach((id) => {
           const m = state.media.find((x) => x.id === id);
-          if (m) out.push(m);
+          if (m && passes(m)) out.push(m);
         });
       }
     }
     return out;
-  }, [entries, state.groups, state.media]);
+  }, [entries, passes, state.groups, state.media]);
 
   const lightboxIndex = lightboxId ? flatMedia.findIndex((m) => m.id === lightboxId) : -1;
 
@@ -252,8 +274,18 @@ export function AppShell() {
   const targetKey = inspectorTarget
     ? inspectorTarget.kind === "all" ? "all" : `${inspectorTarget.kind}:${inspectorTarget.id}`
     : null;
+  const previousInspectorTarget = useRef<string | null | undefined>(undefined);
   useEffect(() => {
-    if (targetKey && state.inspectorAutoOpen) setInspectorOpen(true);
+    // The initial “Main Gallery” target is not a user selection. Do not open
+    // Inspector on launch just because it exists.
+    if (previousInspectorTarget.current === undefined) {
+      previousInspectorTarget.current = targetKey;
+      return;
+    }
+    if (targetKey && targetKey !== previousInspectorTarget.current && state.inspectorAutoOpen) {
+      setInspectorOpen(true);
+    }
+    previousInspectorTarget.current = targetKey;
   }, [targetKey, state.inspectorAutoOpen]);
 
   if (locked) {
@@ -302,11 +334,11 @@ export function AppShell() {
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
       <div className="window-titlebar flex h-[18px] shrink-0 items-center border-b border-border/55">
-        <span className="pl-3 text-[11px] font-medium tracking-wide text-muted-foreground">{currentProfile?.name || "InDeck"}</span>
+        <span className="pl-3 text-[11px] font-medium tracking-wide text-muted-foreground">{currentProfile?.name || "Mosaic"}</span>
         <span className="flex-1" />
         <WindowControls />
       </div>
-      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
         <Sidebar view={view} unlockedFolderIds={unlockedFolders} onView={(v) => { setView(v); setSelected([]); }} onConfirm={setConfirmReq} onLock={() => setLocked(true)} onRelockGallery={(id) => { setUnlockedFolders((previous) => previous.filter((item) => item !== id)); if (view.kind === "folder" && view.id === id) setSelected([]); }} onManageTags={() => setTagManagerOpen(true)} onOpenExtensionManage={() => setExtensionManageOpen(true)} onOpenTrash={() => setTrashOpen(true)} />
 
       <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
@@ -338,6 +370,13 @@ export function AppShell() {
           sourceFilterIds={sourceFilterIds}
           onToggleSourceFilter={(id) => setSourceFilterIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id])}
           onClearAdvancedFilters={() => { setPropFilters({}); setGalleryFilterIds([]); setSourceFilterIds([]); }}
+          groupBy={groupBy}
+          onToggleGroupBy={(value) => setGroupBy((current) => {
+            const id = mediaGroupById(value);
+            return current.some((item) => mediaGroupById(item) === id)
+              ? current.filter((item) => mediaGroupById(item) !== id)
+              : [...current, value];
+          })}
         />
 
         {view.kind === "folders" ? (
@@ -374,20 +413,24 @@ export function AppShell() {
           </div>
         ) : (
           <Gallery
+            key={inspectorOpen ? "gallery-with-inspector" : "gallery-without-inspector"}
             entries={entries}
+            visibleMediaIds={visibleMediaIds}
             selected={selected}
             setSelected={setSelected}
             onOpen={setLightboxId}
             onConfirm={setConfirmReq}
             currentFolderId={folder?.id ?? null}
+            layoutKey={inspectorOpen ? "inspector-open" : "inspector-closed"}
+            groupBy={groupBy}
           />
         )}
 
-        <BulkBar selected={selected} onClear={() => setSelected([])} />
+        <BulkBar selected={selected} folder={folder} onClear={() => setSelected([])} />
       </main>
 
       {inspectorOpen && inspectorTarget && (
-        <Inspector target={inspectorTarget} unlockedFolderIds={unlockedFolders} onClose={() => setInspectorOpen(false)} onConfirm={setConfirmReq} />
+        <Inspector target={inspectorTarget} unlockedFolderIds={unlockedFolders} currentFolderId={folder?.id ?? null} onClose={() => setInspectorOpen(false)} onConfirm={setConfirmReq} />
       )}
       </div>
 

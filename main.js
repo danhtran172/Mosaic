@@ -6,11 +6,19 @@ const { execFile } = require('child_process');
 const { pathToFileURL } = require('url');
 const ffmpegPath = require('ffmpeg-static');
 
+// Rebrand the desktop application without moving existing profiles and
+// libraries out of Electron's previous InDeck user-data folder.
+app.setName('Mosaic');
+app.setPath('userData', path.join(app.getPath('appData'), 'InDeck'));
+
 const MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif', '.mp4', '.mov', '.m4v', '.webm', '.avi', '.ts']);
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif']);
 const WEB_IMPORTS_SOURCE_ID = 'allsight-web-imports';
+const PROFILE_MAIN_LIBRARY_SOURCE_ID = 'indeck-profile-main-library';
 const VAULT_BRIDGE_FILE = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'MasterVisionVault', 'indeck-bridge.json');
-const APP_ICON_PATH = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', 'Downloads', 'comic-book.png');
+// Keep branded resources inside the project so packaged/source builds never
+// depend on a user Downloads path.
+const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
 const DEFAULT_PROFILE_ID = 'default';
 const NATIVE_HOST_NAME = 'com.indeck.mastervision';
 const EXTENSION_ID = 'fpbeciobaoekefhhjjenfomhkffmejah';
@@ -19,6 +27,7 @@ const webContentsProfileIds = new Map();
 const profileWatchers = new Map();
 let profileRegistryWriteQueue = Promise.resolve();
 const NATIVE_MESSAGING_MODE = process.argv.some(argument => String(argument).startsWith('chrome-extension://'));
+const NATIVE_HOST_REGISTRATION_MODE = process.argv.includes('--register-native-host');
 let nativeHostInput = Buffer.alloc(0);
 let nativeHostInputEnded = false;
 let nativeHostStarted = false;
@@ -27,7 +36,7 @@ const nativeHostKeepAlive = NATIVE_MESSAGING_MODE ? setInterval(() => {}, 1000) 
 let nativeHostWindow = null;
 function requestedProfileId(argv = process.argv) {
   const argument = argv.find(value => String(value).startsWith('--profile='));
-  return argument ? String(argument).slice('--profile='.length) || DEFAULT_PROFILE_ID : DEFAULT_PROFILE_ID;
+  return argument ? String(argument).slice('--profile='.length) || null : null;
 }
 if (NATIVE_MESSAGING_MODE) {
   // Chrome writes the request immediately after starting the executable. Begin
@@ -51,25 +60,56 @@ function legacyProfile() {
     name: 'Default',
     dataPath: app.getPath('userData'),
     mediaPath: path.join(app.getPath('pictures'), 'InDeckMedia'),
+    lastMediaPath: path.join(app.getPath('pictures'), 'InDeckMedia'),
     isDefault: true,
+    initialized: true,
     createdAt: 0,
   };
 }
 function profileDataPath(profile) { return path.resolve(profile?.dataPath || legacyProfile().dataPath); }
-function profileMediaPath(profile) { return path.resolve(profile?.mediaPath || legacyProfile().mediaPath); }
+function profileMediaPath(profile) {
+  if (profile && !profile.mediaPath) throw new Error('Profile library location has not been configured');
+  return path.resolve(profile?.mediaPath || legacyProfile().mediaPath);
+}
+function isProfileReady(profile) { return Boolean(profile?.initialized && profile?.mediaPath); }
+function profileRecoveryMediaPath(profile) {
+  const candidates = [profile?.lastMediaPath, profile?.mediaPath]
+    .map(value => String(value || '').trim())
+    .filter(value => value && !isRecycleBinPath(value));
+  return candidates[0] || path.join(app.getPath('pictures'), `InDeckMedia_${safeFolderPart(profile?.name || 'Profile')}`);
+}
 function newProfileId() { return `profile-${crypto.randomUUID()}`; }
 function cleanProfileName(value) { return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 80); }
+function comparableProfileName(value) { return cleanProfileName(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'd').toLowerCase(); }
+function profileNameIsAvailable(name, profiles, exceptId = null) { const comparable = comparableProfileName(name); return !profiles.some(profile => profile.id !== exceptId && comparableProfileName(profile.name) === comparable); }
+function restoredProfileName(name, activeProfiles) {
+  const base = cleanProfileName(name) || 'Recovered profile';
+  if (profileNameIsAvailable(base, activeProfiles)) return base;
+  for (let number = 2; number < 10000; number += 1) {
+    const suffix = ` (${number})`;
+    const candidate = `${base.slice(0, Math.max(1, 80 - suffix.length))}${suffix}`;
+    if (profileNameIsAvailable(candidate, activeProfiles)) return candidate;
+  }
+  throw new Error('Could not create a unique recovered profile name');
+}
 async function readProfileRegistry() {
   try {
     const value = JSON.parse(await fs.promises.readFile(profilesRegistryPath(), 'utf8'));
     if (!Array.isArray(value?.profiles) || !value.profiles.length) throw new Error('Invalid profile registry');
     const profiles = value.profiles
-      .filter(profile => profile?.id && profile?.dataPath && profile?.mediaPath)
-      .map(profile => ({ ...profile, id: String(profile.id), name: cleanProfileName(profile.name) || 'Untitled profile' }));
-    if (!profiles.some(profile => profile.id === DEFAULT_PROFILE_ID)) profiles.unshift(legacyProfile());
-    return { version: 1, profiles };
+      .filter(profile => profile?.id && profile?.dataPath)
+      .map(profile => ({
+        ...profile,
+        id: String(profile.id),
+        name: cleanProfileName(profile.name) || 'Untitled profile',
+        initialized: profile.initialized ?? Boolean(profile.mediaPath),
+        lastMediaPath: profile.lastMediaPath || profile.mediaPath || null,
+      }));
+    if (!profiles.length) throw new Error('Invalid profile registry');
+    if (!profiles.some(profile => profile.isDefault)) profiles[0].isDefault = true;
+    return { version: 2, profiles, discardedProfiles: Array.isArray(value.discardedProfiles) ? value.discardedProfiles : [] };
   } catch {
-    const registry = { version: 1, profiles: [legacyProfile()] };
+    const registry = { version: 2, profiles: [legacyProfile()], discardedProfiles: [] };
     await writeProfileRegistry(registry);
     return registry;
   }
@@ -89,6 +129,10 @@ async function profileById(profileId) {
   const registry = await readProfileRegistry();
   return registry.profiles.find(profile => profile.id === String(profileId)) || null;
 }
+async function defaultProfile() {
+  const registry = await readProfileRegistry();
+  return registry.profiles.find(profile => profile.isDefault) || registry.profiles[0] || null;
+}
 async function profileForWebContents(webContents) {
   const profileId = webContentsProfileIds.get(webContents?.id);
   const profile = profileId && await profileById(profileId);
@@ -99,20 +143,122 @@ async function createProfile(name) {
   const profileName = cleanProfileName(name);
   if (!profileName) throw new Error('Profile name is required');
   const registry = await readProfileRegistry();
-  if (registry.profiles.some(profile => profile.name.localeCompare(profileName, undefined, { sensitivity: 'accent' }) === 0)) throw new Error('A profile with this name already exists');
+  if (!profileNameIsAvailable(profileName, registry.profiles)) throw new Error('A profile with this name already exists');
   const id = newProfileId();
   const profile = {
     id,
     name: profileName,
     dataPath: path.join(app.getPath('userData'), 'profiles', id),
-    mediaPath: path.join(app.getPath('pictures'), 'InDeckMedia', 'Profiles', id),
+    mediaPath: null,
+    lastMediaPath: null,
     isDefault: false,
+    initialized: false,
     createdAt: Date.now(),
   };
-  await Promise.all([fs.promises.mkdir(profile.dataPath, { recursive: true }), fs.promises.mkdir(profile.mediaPath, { recursive: true })]);
+  await fs.promises.mkdir(profile.dataPath, { recursive: true });
   registry.profiles.push(profile);
   await writeProfileRegistry(registry);
   return profile;
+}
+function isInDeckLibraryFolder(folder) { return /^indeckmedia(?:_|$)/i.test(path.basename(folder)); }
+function libraryMediaPathForSelection(folder, profile) {
+  const value = String(folder || '').trim();
+  if (!value) throw new Error('Choose a library location');
+  const selected = path.resolve(value);
+  // Selecting an existing InDeckMedia_* explicitly means sharing it. A new
+  // selection always creates a Library named after the profile that owns it.
+  if (isInDeckLibraryFolder(selected)) return selected;
+  return path.join(selected, `InDeckMedia_${safeFolderPart(profile?.name || 'Profile')}`);
+}
+async function libraryLocationStatus(profileId, folder) {
+  const profile = await profileById(profileId);
+  if (!profile) throw new Error('Profile not found');
+  const mediaPath = libraryMediaPathForSelection(folder, profile);
+  const exists = await fs.promises.stat(mediaPath).then(stat => stat.isDirectory()).catch(() => false);
+  const registry = await readProfileRegistry();
+  const sharedWith = registry.profiles
+    .filter(profile => profile.mediaPath && normalizedPath(profile.mediaPath) === normalizedPath(mediaPath))
+    .map(profile => ({ id: profile.id, name: profile.name }));
+  return { mediaPath, exists, sharedWith };
+}
+async function updateProfileInRegistry(profile) {
+  const registry = await readProfileRegistry();
+  const index = registry.profiles.findIndex(item => item.id === profile.id);
+  if (index < 0) throw new Error('Profile not found');
+  registry.profiles[index] = { ...registry.profiles[index], ...profile };
+  await writeProfileRegistry(registry);
+  return registry.profiles[index];
+}
+async function configureProfileLibrary(profileId, folder, useExisting) {
+  const profile = await profileById(profileId);
+  if (!profile) throw new Error('Profile not found');
+  const status = await libraryLocationStatus(profileId, folder);
+  if (status.exists && !useExisting) throw new Error('InDeckMedia already exists here. Confirm that you want to use it.');
+  await fs.promises.mkdir(status.mediaPath, { recursive: true });
+  profile.mediaPath = status.mediaPath;
+  profile.lastMediaPath = status.mediaPath;
+  profile.mediaTracking = await identifyFolder(status.mediaPath);
+  profile.initialized = true;
+  profile.libraryLocationConfiguredAt = Date.now();
+  const stored = await updateProfileInRegistry(profile);
+  await recoverProfileLibrary(stored);
+  return stored;
+}
+async function relocateManagedProfilePaths(profile, previousMediaPath) {
+  if (!previousMediaPath || normalizedPath(previousMediaPath) === normalizedPath(profile.mediaPath)) return false;
+  const data = await readStore(profile);
+  let changed = false;
+  const relocate = value => {
+    if (!value || !isPathInside(previousMediaPath, value)) return value;
+    changed = true;
+    return path.join(profile.mediaPath, path.relative(previousMediaPath, value));
+  };
+  for (const source of data.sources || []) {
+    const before = source.path;
+    source.path = relocate(source.path);
+    if (before !== source.path) source.assets = (source.assets || []).map(asset => ({ ...asset, path: relocate(asset.path) }));
+  }
+  for (const gallery of data.collections || []) gallery.defaultSourcePath = relocate(gallery.defaultSourcePath);
+  if (changed) await writeStore(profile, data);
+  return changed;
+}
+async function trackProfileLibraryLocation(profile) {
+  if (!isProfileReady(profile)) return profile;
+  if (isRecycleBinPath(profile.mediaPath) || isRecycleBinPath(profile.lastMediaPath)) {
+    const recoveredPath = profileRecoveryMediaPath(profile);
+    await fs.promises.mkdir(recoveredPath, { recursive: true });
+    profile.mediaPath = recoveredPath;
+    profile.lastMediaPath = recoveredPath;
+    profile.mediaTracking = await identifyFolder(recoveredPath);
+    return updateProfileInRegistry(profile);
+  }
+  const previousMediaPath = profile.mediaPath;
+  const resolved = await resolveTrackedFolder({ folder: profile.mediaPath || profile.lastMediaPath, tracking: profile.mediaTracking });
+  if (resolved && normalizedPath(resolved) !== normalizedPath(profile.mediaPath)) {
+    profile.mediaPath = resolved;
+    profile.lastMediaPath = resolved;
+    profile.mediaTracking = await identifyFolder(resolved) || profile.mediaTracking;
+    const stored = await updateProfileInRegistry(profile);
+    await relocateManagedProfilePaths(stored, previousMediaPath);
+    return stored;
+  }
+  if (resolved && !profile.mediaTracking) {
+    profile.mediaTracking = await identifyFolder(resolved);
+    profile.lastMediaPath = resolved;
+    return updateProfileInRegistry(profile);
+  }
+  return profile;
+}
+async function recoverProfileLibrary(profile) {
+  if (!isProfileReady(profile)) throw new Error('Choose a Default Library Location before recovering this profile');
+  profile = await ensureProfileLibraryFolders(profile);
+  const data = await readStore(profile);
+  const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data);
+  const mainLibraryChanged = await ensureProfileMainLibrarySource(profile, data);
+  const prunedUnavailable = await reconcileUnavailableSources(profile, data);
+  const repairedDefaults = await ensureDefaultSourcesForExistingGalleries(profile, data);
+  if (defaultSaveChanged || mainLibraryChanged || prunedUnavailable || repairedDefaults) await writeStore(profile, data);
+  return { profile, repairedDefaults, prunedUnavailable, defaultSaveChanged, mainLibraryChanged, mediaPath: profile.mediaPath };
 }
 async function renameProfile(profileId, name) {
   const profileName = cleanProfileName(name);
@@ -120,42 +266,81 @@ async function renameProfile(profileId, name) {
   const registry = await readProfileRegistry();
   const profile = registry.profiles.find(item => item.id === String(profileId));
   if (!profile) throw new Error('Profile not found');
-  if (registry.profiles.some(item => item.id !== profile.id && item.name.localeCompare(profileName, undefined, { sensitivity: 'accent' }) === 0)) throw new Error('A profile with this name already exists');
+  if (!profileNameIsAvailable(profileName, registry.profiles, profile.id)) throw new Error('A profile with this name already exists');
   profile.name = profileName;
   await writeProfileRegistry(registry);
   return profile;
 }
-async function deleteProfile(profileId) {
+async function setDefaultProfile(profileId) {
+  const registry = await readProfileRegistry();
+  const profile = registry.profiles.find(item => item.id === String(profileId));
+  if (!profile) throw new Error('Profile not found');
+  registry.profiles.forEach(item => { item.isDefault = item.id === profile.id; });
+  await writeProfileRegistry(registry);
+  return profile;
+}
+async function deleteProfile(profileId, typedName, replacementDefaultId = null) {
   const id = String(profileId);
-  if (id === DEFAULT_PROFILE_ID) throw new Error('The Default profile cannot be deleted');
   const registry = await readProfileRegistry();
   const profile = registry.profiles.find(item => item.id === id);
   if (!profile) throw new Error('Profile not found');
-  if (profileWindows.has(id)) throw new Error('Close this profile window before deleting it');
-  // Registry removal is intentionally non-destructive: profile data can be
-  // recovered manually until a dedicated trash/retention workflow is added.
+  if (comparableProfileName(typedName) !== comparableProfileName(profile.name)) throw new Error('The confirmation name does not match');
+  if (registry.profiles.length < 2) throw new Error('The last active profile cannot be deleted');
+  let replacement = null;
+  if (profile.isDefault) {
+    replacement = registry.profiles.find(item => item.id === String(replacementDefaultId));
+    if (!replacement || replacement.id === profile.id) throw new Error('Choose another profile to become Default');
+    profile.isDefault = false;
+    replacement.isDefault = true;
+  }
   registry.profiles = registry.profiles.filter(item => item.id !== id);
+  registry.discardedProfiles ||= [];
+  registry.discardedProfiles.unshift({ ...profile, isDefault: false, discardedAt: Date.now() });
+  await writeProfileRegistry(registry);
+  if (replacement) await createWindow(replacement.id);
+  const window = profileWindows.get(id);
+  if (window && !window.isDestroyed()) setTimeout(() => window.close(), 0);
+  return profile;
+}
+async function recoverDiscardedProfile(profileId) {
+  const registry = await readProfileRegistry();
+  const index = registry.discardedProfiles.findIndex(profile => profile.id === String(profileId));
+  if (index < 0) throw new Error('Discarded profile not found');
+  const profile = { ...registry.discardedProfiles[index], discardedAt: undefined, isDefault: false };
+  delete profile.discardedAt;
+  profile.name = restoredProfileName(profile.name, registry.profiles);
+  registry.discardedProfiles.splice(index, 1);
+  if (!registry.profiles.some(item => item.isDefault)) profile.isDefault = true;
+  registry.profiles.push(profile);
   await writeProfileRegistry(registry);
   return profile;
 }
 async function createProfileShortcut(profileId) {
-  if (!app.isPackaged) throw new Error('Profile shortcuts are created by the installed desktop build');
   const profile = await profileById(profileId);
   if (!profile) throw new Error('Profile not found');
-  const fileName = `InDeck - ${safeFolderPart(profile.name)}.lnk`;
+  const fileName = `Mosaic - ${safeFolderPart(profile.name)}.lnk`;
   const shortcutPath = path.join(app.getPath('desktop'), fileName);
-  const options = {
-    target: app.getPath('exe'),
-    args: `--profile=${profile.id}`,
-    description: `Open InDeck profile ${profile.name}`,
-    workingDirectory: path.dirname(app.getPath('exe')),
-  };
+  const options = app.isPackaged
+    ? {
+      target: app.getPath('exe'),
+      args: `--profile=${profile.id}`,
+      description: `Open Mosaic profile ${profile.name}`,
+      workingDirectory: path.dirname(app.getPath('exe')),
+    }
+    : {
+      // Keep the feature testable from the source checkout too. The batch
+      // file rebuilds ui/dist, then forwards the profile argument to Electron.
+      target: process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe',
+      args: `/d /c ""${path.join(__dirname, 'Run MasterVision.bat')}" --profile=${profile.id}"`,
+      description: `Open Mosaic profile ${profile.name}`,
+      workingDirectory: __dirname,
+    };
   if (fs.existsSync(APP_ICON_PATH)) options.icon = APP_ICON_PATH;
   if (!shell.writeShortcutLink(shortcutPath, 'create', options)) throw new Error('Could not create the profile shortcut');
   return shortcutPath;
 }
 
-if (!NATIVE_MESSAGING_MODE && !app.requestSingleInstanceLock()) app.quit();
+if (!NATIVE_MESSAGING_MODE && !NATIVE_HOST_REGISTRATION_MODE && !app.requestSingleInstanceLock()) app.quit();
 app.on('second-instance', (_event, argv) => {
   if (NATIVE_MESSAGING_MODE) return;
   createWindow(requestedProfileId(argv)).catch(error => console.error('Could not open profile window:', error.message));
@@ -245,6 +430,15 @@ function createVideoThumbnail(asset, target) {
 }
 async function createThumbnail(profile, asset) {
   if (!asset?.id || !['image', 'video'].includes(asset.type)) return null;
+  // Do not reveal a stale thumbnail for a deleted file. The cache is not a
+  // source of truth: paths in Windows Recycle Bin, InDeck Discards, or paths
+  // that no longer exist are permanently ineligible.
+  if (!asset.vault) {
+    const assetPath = String(asset.path || '');
+    if (!assetPath || isRecycleBinPath(assetPath) || isInDeckDiscardPath(profile, assetPath)) return null;
+    const exists = await fs.promises.stat(assetPath).then(stat => stat.isFile()).catch(() => false);
+    if (!exists) return null;
+  }
   const target = thumbnailPath(profile, asset);
   const temporary = `${target}.${process.pid}.${Date.now()}.tmp.png`;
   try {
@@ -293,6 +487,12 @@ async function createThumbnails(profile, assets) {
 }
 
 function normalizeFolder(value) { return path.resolve(String(value || '')).replace(/[\\/]+$/, '').toLowerCase(); }
+// A deleted directory retains its NTFS id while it is in the Windows Recycle
+// Bin. It is no longer a valid Media Source and must not be treated as a
+// renamed folder by the tracking resolver.
+function isRecycleBinPath(value) {
+  return /(?:^|[\\/])\$recycle\.bin(?:[\\/]|$)/i.test(String(value || ''));
+}
 function assetIdFor(source, relativePath) {
   const sourceKey = source?.id || normalizeFolder(source?.path);
   return crypto.createHash('sha1').update(`source:${sourceKey}\0${relativePath.replace(/\\/g, '/')}`).digest('hex');
@@ -314,23 +514,27 @@ async function identifyFolder(folder) {
 }
 async function resolveTrackedFolder(record) {
   const saved = String(record?.folder || record?.path || '');
+  const fallback = saved && !isRecycleBinPath(saved) ? path.resolve(saved) : null;
   if (saved) {
-    try { if ((await fs.promises.stat(saved)).isDirectory()) return path.resolve(saved); }
+    try { if ((await fs.promises.stat(saved)).isDirectory() && !isRecycleBinPath(saved)) return path.resolve(saved); }
     catch { /* A rename or Vault ACL can make the saved path unavailable. */ }
   }
   const volume = String(record?.tracking?.volume || record?.volume || '');
   const fileId = String(record?.tracking?.fileId || record?.fileId || record?.file_id || '');
-  if (!volume || !fileId) return saved ? path.resolve(saved) : null;
+  if (!volume || !fileId) return fallback;
   const result = await runFileCommand('fsutil', ['file', 'queryfilenamebyid', volume, fileId]);
-  if (result.error) return saved ? path.resolve(saved) : null;
+  if (result.error) return fallback;
   const lines = result.stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   for (const line of lines.reverse()) {
     const absolute = line.match(/(?:\\\\\?\\)?([A-Za-z]:\\[^\r\n]+)$/);
-    if (absolute) return path.resolve(absolute[1]);
+    if (absolute && !isRecycleBinPath(absolute[1])) return path.resolve(absolute[1]);
     const relative = line.match(/(\\[^\r\n]+)$/);
-    if (relative) return path.resolve(`${volume}${relative[1]}`);
+    if (relative) {
+      const candidate = `${volume}${relative[1]}`;
+      if (!isRecycleBinPath(candidate)) return path.resolve(candidate);
+    }
   }
-  return saved ? path.resolve(saved) : null;
+  return fallback;
 }
 function bridgeTracking(bridge) {
   const volume = String(bridge?.volume || '');
@@ -364,7 +568,7 @@ function vaultFileUrl(bridge, fileId) {
 }
 async function scanVaultDirectory(folder, bridge, source) {
   const response = await fetch(`${bridge.endpoint}/v1/files?token=${encodeURIComponent(bridge.token)}`);
-  if (!response.ok) throw new Error('Vault is unavailable or InDeck is not authorized');
+  if (!response.ok) throw new Error('Vault is unavailable or Mosaic is not authorized');
   const document = await response.json();
   return (document.files || [])
     .filter(entry => MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase()))
@@ -382,6 +586,9 @@ async function scanVaultDirectory(folder, bridge, source) {
     .sort((a, b) => b.modified - a.modified);
 }
 async function scanDirectory(folder, source) {
+  // A folder in the Windows Recycle Bin is deleted content, not a renamed
+  // source. Never walk it, even when its NTFS id is still queryable.
+  if (!folder || isRecycleBinPath(folder)) return [];
   const results = [];
   const pendingDirectories = [folder];
   while (pendingDirectories.length) {
@@ -390,6 +597,7 @@ async function scanDirectory(folder, source) {
     try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { continue; }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
+      if (isRecycleBinPath(fullPath)) continue;
       if (entry.isDirectory()) { pendingDirectories.push(fullPath); continue; }
       if (!entry.isFile() || !MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
       try {
@@ -409,8 +617,11 @@ async function resolveSource(source) {
 }
 async function scanSource(profile, source) {
   const normalized = typeof source === 'string' ? { path: source, id: normalizeFolder(source) } : source;
+  if (!normalized?.path || isRecycleBinPath(normalized.path) || isInDeckDiscardPath(profile, normalized.path)) {
+    return { folder: null, tracking: null, vaultBridgeId: null, vault: false, assets: [] };
+  }
   const resolved = await resolveSource(normalized);
-  if (!resolved.folder) return { ...resolved, assets: [] };
+  if (!resolved.folder || isRecycleBinPath(resolved.folder) || isInDeckDiscardPath(profile, resolved.folder)) return { ...resolved, assets: [] };
   const tracking = resolved.tracking || await identifyFolder(resolved.folder);
   const bridge = resolved.vault ? await vaultBridgeForSource({ ...normalized, vaultBridgeId: resolved.vaultBridgeId, tracking }) : null;
   const assets = bridge ? await scanVaultDirectory(resolved.folder, bridge, normalized) : await scanDirectory(resolved.folder, normalized);
@@ -419,11 +630,155 @@ async function scanSource(profile, source) {
   return result;
 }
 
+function removeLibraryAssetReferences(data, assetIds) {
+  if (!assetIds.size) return false;
+  let changed = false;
+  for (const gallery of [...(data.collections || []), ...(data.discardedGalleries || [])]) {
+    for (const field of ['items', 'discardedIds', 'manualItemIds', 'extensionItemIds']) {
+      if (!Array.isArray(gallery[field])) continue;
+      const next = gallery[field].map(String).filter(id => !assetIds.has(id));
+      if (next.length !== gallery[field].length) { gallery[field] = next; changed = true; }
+    }
+    if (assetIds.has(String(gallery.coverId))) { delete gallery.coverId; changed = true; }
+  }
+  for (const group of data.libraryGroups || []) {
+    if (!Array.isArray(group.assets)) continue;
+    const next = group.assets.map(String).filter(id => !assetIds.has(id));
+    if (next.length !== group.assets.length) { group.assets = next; changed = true; }
+  }
+  for (const id of assetIds) {
+    if (data.assetMeta?.[id]) { delete data.assetMeta[id]; changed = true; }
+  }
+  return changed;
+}
+
+async function reconcileUnavailableSources(profile, data) {
+  const missingSourceIds = new Set();
+  const missingAssetIds = new Set();
+  let changed = false;
+  for (const source of data.sources || []) {
+    const sourcePath = String(source.path || '');
+    // Vault sources are remote; their availability is handled by the Vault
+    // bridge rather than local filesystem checks.
+    if (source.vaultBridgeId) continue;
+    const sourceAvailable = sourcePath && !isRecycleBinPath(sourcePath) && !isInDeckDiscardPath(profile, sourcePath)
+      && await fs.promises.stat(sourcePath).then(stat => stat.isDirectory()).catch(() => false);
+    if (!sourceAvailable) {
+      missingSourceIds.add(String(source.id));
+      for (const asset of source.assets || []) missingAssetIds.add(String(asset.id));
+      changed = true;
+      continue;
+    }
+    const keptAssets = [];
+    for (const asset of source.assets || []) {
+      const assetPath = String(asset.path || '');
+      const exists = assetPath && !isRecycleBinPath(assetPath) && !isInDeckDiscardPath(profile, assetPath)
+        && await fs.promises.stat(assetPath).then(stat => stat.isFile()).catch(() => false);
+      if (exists) keptAssets.push(asset);
+      else { missingAssetIds.add(String(asset.id)); changed = true; }
+    }
+    if (keptAssets.length !== (source.assets || []).length) source.assets = keptAssets;
+  }
+  if (missingSourceIds.size) {
+    data.sources = (data.sources || []).filter(source => !missingSourceIds.has(String(source.id)));
+    data.librarySourceIds = (data.librarySourceIds || []).map(String).filter(id => !missingSourceIds.has(id));
+    data.mainSourceIds = (data.mainSourceIds || []).map(String).filter(id => !missingSourceIds.has(id));
+    for (const gallery of [...(data.collections || []), ...(data.discardedGalleries || [])]) {
+      const before = gallery.sourceIds || [];
+      gallery.sourceIds = before.map(String).filter(id => !missingSourceIds.has(id));
+      if (gallery.sourceIds.length !== before.length) changed = true;
+      if (gallery.defaultSourceId && missingSourceIds.has(String(gallery.defaultSourceId))) {
+        delete gallery.defaultSourceId;
+        delete gallery.defaultSourcePath;
+        changed = true;
+      }
+    }
+  }
+  return removeLibraryAssetReferences(data, missingAssetIds) || changed;
+}
+
 function indeckMediaPath(profile) { return profileMediaPath(profile); }
+async function ensureProfileLibraryFolders(profile) {
+  profile = await trackProfileLibraryLocation(profile);
+  const desiredPath = profileRecoveryMediaPath(profile);
+  const exists = await fs.promises.stat(desiredPath).then(stat => stat.isDirectory()).catch(() => false);
+  if (!exists) {
+    await fs.promises.mkdir(desiredPath, { recursive: true });
+    profile.mediaPath = desiredPath;
+    profile.lastMediaPath = desiredPath;
+    profile.mediaTracking = await identifyFolder(desiredPath);
+    profile = await updateProfileInRegistry(profile);
+  }
+  await Promise.all([
+    fs.promises.mkdir(indeckMediaPath(profile), { recursive: true }),
+    fs.promises.mkdir(extensionImportsPath(profile), { recursive: true }),
+    fs.promises.mkdir(discardsPath(profile), { recursive: true }),
+  ]);
+  return profile;
+}
+async function ensureProfileDefaultSaveSource(profile, data) {
+  const folder = extensionImportsPath(profile);
+  data.sources ||= [];
+  let source = data.sources.find(item => String(item.id) === WEB_IMPORTS_SOURCE_ID)
+    || data.sources.find(item => normalizedPath(item.path) === normalizedPath(folder));
+  let changed = false;
+  if (!source) {
+    source = { id: WEB_IMPORTS_SOURCE_ID, name: 'DefaultSave', path: folder, assets: [] };
+    data.sources.push(source);
+    changed = true;
+  }
+  if (source.path !== folder) { source.path = folder; changed = true; }
+  if (source.name !== 'DefaultSave') { source.name = 'DefaultSave'; changed = true; }
+  const scanned = await scanDirectoryKeepingKnownIds(folder, source);
+  if (JSON.stringify(source.assets || []) !== JSON.stringify(scanned)) { source.assets = scanned; changed = true; }
+  return changed;
+}
+async function ensureProfileMainLibrarySource(profile, data) {
+  const root = indeckMediaPath(profile);
+  data.sources ||= [];
+  // Main Gallery is the All Media view in the current UI. Register the
+  // profile's InDeckMedia root as its managed source so every file placed in
+  // the Library is visible there immediately, including first-run profiles.
+  let source = data.sources.find(item => String(item.id) === PROFILE_MAIN_LIBRARY_SOURCE_ID)
+    || data.sources.find(item => normalizedPath(item.path) === normalizedPath(root));
+  let changed = false;
+  if (!source) {
+    source = { id: PROFILE_MAIN_LIBRARY_SOURCE_ID, name: 'InDeckMedia', path: root, assets: [] };
+    data.sources.push(source);
+    changed = true;
+  }
+  if (source.path !== root) { source.path = root; changed = true; }
+  if (!source.name) { source.name = 'InDeckMedia'; changed = true; }
+  const managedChildFolders = [
+    extensionImportsPath(profile),
+    // Discards is InDeck's trash. It must never be surfaced through the root
+    // Main Gallery source after a Gallery/source has been removed.
+    discardsPath(profile),
+    ...(data.collections || []).map(gallery => gallery.defaultSourcePath).filter(Boolean),
+    ...data.sources.filter(item => item !== source).map(item => item.path).filter(folder => folder && isPathInside(root, folder)),
+  ];
+  // The root source owns user-managed media. InDeck-managed child sources
+  // remain represented by their own source, preventing duplicate cards in
+  // Main Gallery when DefaultSave or a Gallery Default Source is populated.
+  const scanned = (await scanDirectoryKeepingKnownIds(root, source)).filter(asset =>
+    !managedChildFolders.some(folder => normalizedPath(folder) !== normalizedPath(root) && isPathInside(folder, asset.path)),
+  );
+  if (JSON.stringify(source.assets || []) !== JSON.stringify(scanned)) { source.assets = scanned; changed = true; }
+  data.librarySourceIds ||= [];
+  if (!data.librarySourceIds.includes(source.id)) { data.librarySourceIds.push(source.id); changed = true; }
+  return changed;
+}
 function extensionImportsPath(profile) { return path.join(indeckMediaPath(profile), 'DefaultSave'); }
 function previousExtensionImportsPath(profile) { return path.join(indeckMediaPath(profile), 'Extension', 'Default Save'); }
 function discardsPath(profile) { return path.join(indeckMediaPath(profile), 'Discards'); }
 const DISCARDS_SOURCE_ID = 'indeck-discards';
+function isInDeckDiscardPath(profile, value) {
+  const candidate = String(value || '').trim();
+  return Boolean(candidate) && (
+    normalizedPath(candidate) === normalizedPath(discardsPath(profile))
+    || isPathInside(discardsPath(profile), candidate)
+  );
+}
 function legacyExtensionImportsPath(profile) { return path.join(profileMediaPath(profile) === legacyProfile().mediaPath ? app.getPath('pictures') : indeckMediaPath(profile), 'AllSight Web Imports'); }
 function normalizedPath(value) { return path.resolve(String(value || '')).replace(/[\\/]+$/, '').toLowerCase(); }
 function safeFolderPart(value) {
@@ -558,10 +913,13 @@ async function migrateInDeckMedia(profile, data) {
   return changed;
 }
 async function ensureGalleryDefaultSource(profile, data, gallery, preferredPath) {
+  profile = await ensureProfileLibraryFolders(profile);
   const id = String(gallery.defaultSourceId || galleryDefaultSourceId(gallery.id));
   const existing = (data.sources || []).find(source => String(source.id) === id);
   const current = existing?.path || gallery.defaultSourcePath;
-  const target = preferredPath || await availableGalleryDefaultSourcePath(profile, data, gallery, current);
+  // Recovery recreates a missing managed folder at its recorded location. Do
+  // not silently move a Gallery that already has a valid/default path.
+  const target = preferredPath || current || await availableGalleryDefaultSourcePath(profile, data, gallery, current);
   if (current && normalizedPath(current) !== normalizedPath(target)) await moveDirectoryIfNeeded(current, target);
   await fs.promises.mkdir(target, { recursive: true });
   const source = existing || { id, name: 'Default Source', path: target, assets: [] };
@@ -578,20 +936,29 @@ async function ensureGalleryDefaultSource(profile, data, gallery, preferredPath)
   for (const asset of source.assets) if (!discarded.has(String(asset.id)) && !gallery.items.includes(asset.id)) gallery.items.push(asset.id);
   return source;
 }
-async function ensureDefaultSourcesForExistingGalleries(profile, data) {
+async function disconnectMissingGalleryDefaultSources(data) {
   let changed = false;
   for (const gallery of data.collections || []) {
-    const before = JSON.stringify({
-      defaultSourceId: gallery.defaultSourceId,
-      defaultSourcePath: gallery.defaultSourcePath,
-      sourceIds: gallery.sourceIds || [],
-    });
-    await ensureGalleryDefaultSource(profile, data, gallery);
-    if (before !== JSON.stringify({
-      defaultSourceId: gallery.defaultSourceId,
-      defaultSourcePath: gallery.defaultSourcePath,
-      sourceIds: gallery.sourceIds || [],
-    })) changed = true;
+    const sourceId = gallery.defaultSourceId ? String(gallery.defaultSourceId) : null;
+    if (!sourceId) continue;
+    const source = (data.sources || []).find(item => String(item.id) === sourceId);
+    const sourcePath = source?.path || gallery.defaultSourcePath;
+    const exists = sourcePath && await fs.promises.stat(sourcePath).then(stat => stat.isDirectory()).catch(() => false);
+    if (exists) continue;
+
+    // A manually deleted Default Source is a real disconnect. Do not recreate
+    // it at startup; an explicit Extension save may create and reconnect it.
+    const assetIds = new Set((source?.assets || []).map(asset => String(asset.id)));
+    data.sources = (data.sources || []).filter(item => String(item.id) !== sourceId);
+    gallery.sourceIds = (gallery.sourceIds || []).map(String).filter(id => id !== sourceId);
+    for (const field of ['items', 'discardedIds', 'manualItemIds', 'extensionItemIds']) {
+      if (Array.isArray(gallery[field])) gallery[field] = gallery[field].map(String).filter(id => !assetIds.has(id));
+    }
+    if (assetIds.has(String(gallery.coverId))) delete gallery.coverId;
+    delete gallery.defaultSourceId;
+    delete gallery.defaultSourcePath;
+    for (const assetId of assetIds) delete data.assetMeta?.[assetId];
+    changed = true;
   }
   return changed;
 }
@@ -704,10 +1071,11 @@ function setExtensionGallerySlots(profile, data, galleryIds) {
   return extensionGalleryConfig(profile, data);
 }
 async function importWebImage(profile, sourceUrl, galleryId = null) {
+  profile = await ensureProfileLibraryFolders(profile);
   let url;
   try { url = new URL(sourceUrl); } catch { throw new Error('Invalid image URL'); }
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Only web image URLs are supported');
-  const response = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'InDeck Web Importer' } });
+  const response = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'Mosaic Web Importer' } });
   if (!response.ok) throw new Error(`Download failed (${response.status})`);
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.startsWith('image/')) throw new Error('The dropped item is not an image');
@@ -724,6 +1092,13 @@ async function importWebImage(profile, sourceUrl, galleryId = null) {
   const base = safeImportName(path.basename(url.pathname, path.extname(url.pathname)));
   const target = path.join(directory, `${base}-${Date.now()}${extensionFor(contentType, url.href)}`);
   await fs.promises.writeFile(target, bytes);
+  // Never tell the extension that an import succeeded until the bytes are
+  // observable on disk. This also catches a vanished/recycled Library root
+  // between directory creation and the actual write.
+  const savedFile = await fs.promises.stat(target).catch(() => null);
+  if (!savedFile?.isFile() || savedFile.size !== bytes.length) {
+    throw new Error('The image could not be confirmed in the Library');
+  }
   // Reuse the Gallery default source when a slot is selected. Otherwise use
   // the standalone Default Save source shared by the extension.
   let source = gallerySource || data.sources?.find(item => isExtensionImportSource(profile, item));
@@ -769,19 +1144,28 @@ async function importWebImage(profile, sourceUrl, galleryId = null) {
   }
   await writeStore(profile, data);
   broadcast(profile.id, 'media:imported', { asset, sourceId: source.id, galleryId: gallery?.id || null });
-  return { asset, galleryId: gallery?.id || null };
+  return { asset, galleryId: gallery?.id || null, saved: true };
 }
 function nativeHostManifestPath() { return path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'InDeck', 'native-messaging', `${NATIVE_HOST_NAME}.json`); }
+function nativeHostLauncherPath() { return path.join(path.dirname(nativeHostManifestPath()), `${NATIVE_HOST_NAME}.cmd`); }
+async function nativeHostExecutablePath() {
+  if (app.isPackaged) return app.getPath('exe');
+  const hostScript = path.join(__dirname, 'extension', 'native-host.js');
+  if (!fs.existsSync(hostScript)) throw new Error('Native messaging worker was not found');
+  // Electron's GUI runtime does not expose Chrome's binary stdin reliably in
+  // a source checkout. A small Node worker keeps this protocol headless.
+  const launcher = nativeHostLauncherPath();
+  const content = `@echo off\r\nnode.exe "${hostScript}" %*\r\n`;
+  await fs.promises.mkdir(path.dirname(launcher), { recursive: true });
+  await fs.promises.writeFile(launcher, content, 'utf8');
+  return launcher;
+}
 async function registerNativeMessagingHost() {
-  // Chrome invokes the installed application executable directly. Development
-  // Electron binaries require an extra project argument, so registration is
-  // deferred until a packaged build is installed.
-  if (!app.isPackaged) return { installed: false, reason: 'development-build' };
   const manifestPath = nativeHostManifestPath();
   const manifest = {
     name: NATIVE_HOST_NAME,
-    description: 'InDeck profile-aware media importer',
-    path: app.getPath('exe'),
+    description: 'Mosaic profile-aware media importer',
+    path: await nativeHostExecutablePath(),
     type: 'stdio',
     allowed_origins: [`chrome-extension://${EXTENSION_ID}/`],
   };
@@ -802,26 +1186,35 @@ async function handleNativeMessage(message) {
   const type = String(message?.type || '');
   if (type === 'profiles:list') {
     const registry = await readProfileRegistry();
-    return { ok: true, profiles: registry.profiles.map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) })) };
+    return { ok: true, profiles: registry.profiles.filter(isProfileReady).map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) })) };
   }
   if (type === 'profile:config') {
-    const profile = await profileById(message.profileId);
+    let profile = await profileById(message.profileId);
     if (!profile) throw new Error('The selected profile no longer exists');
+    if (!isProfileReady(profile)) throw new Error('Finish Default Library Location setup before using this profile in the extension');
+    profile = await ensureProfileLibraryFolders(profile);
     return { ok: true, profile: { id: profile.id, name: profile.name }, ...extensionGalleryConfig(profile, await readStore(profile)) };
   }
   if (type === 'profile:slots') {
-    const profile = await profileById(message.profileId);
+    let profile = await profileById(message.profileId);
     if (!profile) throw new Error('The selected profile no longer exists');
+    if (!isProfileReady(profile)) throw new Error('Finish Default Library Location setup before using this profile in the extension');
+    profile = await ensureProfileLibraryFolders(profile);
     const data = await readStore(profile);
     const config = setExtensionGallerySlots(profile, data, message.galleryIds);
     await writeStore(profile, data);
     return { ok: true, profile: { id: profile.id, name: profile.name }, ...config };
   }
   if (type === 'media:import') {
-    const profile = await profileById(message.profileId);
+    let profile = await profileById(message.profileId);
     if (!profile) throw new Error('The selected profile no longer exists');
+    if (!isProfileReady(profile)) throw new Error('Finish Default Library Location setup before using this profile in the extension');
+    // Native Messaging may receive an import while the desktop window is
+    // closed. Recover the selected profile's Library graph before writing so
+    // a deleted InDeckMedia root cannot turn into a false success response.
+    profile = (await recoverProfileLibrary(profile)).profile;
     const imported = await importWebImage(profile, message.url, message.galleryId);
-    return { ok: true, asset: { id: imported.asset.id, name: imported.asset.name }, profileId: profile.id, galleryId: imported.galleryId };
+    return { ok: true, saved: imported.saved === true, asset: { id: imported.asset.id, name: imported.asset.name }, profileId: profile.id, galleryId: imported.galleryId };
   }
   throw new Error('Unsupported native message');
 }
@@ -873,7 +1266,7 @@ function watchFolders(profile, webContents, folders) {
   const key = String(profile.id);
   stopFolderWatchers(key);
   const watchers = new Map();
-  [...new Set(folders.filter(Boolean))].forEach(folder => {
+  [...new Set(folders.filter(folder => folder && !isRecycleBinPath(folder) && !isInDeckDiscardPath(profile, folder)))].forEach(folder => {
     try {
       const record = { watcher: null, timer: null };
       record.watcher = fs.watch(folder, { recursive: true }, () => {
@@ -891,7 +1284,10 @@ function watchFolders(profile, webContents, folders) {
 }
 
 function rendererEntry() {
-  const defaultUiDirectory = path.join(process.env.USERPROFILE || 'C:\\Users\\Admin', 'Downloads', 'InDeck', 'dist');
+  // The React/Lovable UI ships with the desktop app instead of living in a
+  // separate Downloads folder.  INDECK_UI_DIR remains an explicit development
+  // override only.
+  const defaultUiDirectory = path.join(__dirname, 'ui', 'dist');
   const uiDirectory = String(process.env.INDECK_UI_DIR || defaultUiDirectory).trim();
   const candidate = uiDirectory && path.resolve(uiDirectory, 'index.html');
   return candidate && fs.existsSync(candidate) ? candidate : path.join(__dirname, 'index.html');
@@ -901,17 +1297,22 @@ function focusWindow(window) {
   window.show();
   window.focus();
 }
-async function createWindow(profileId = DEFAULT_PROFILE_ID) {
-  const profile = await profileById(profileId);
+async function createWindow(profileId = null) {
+  let profile = profileId ? await profileById(profileId) : await defaultProfile();
   if (!profile) throw new Error('Profile not found');
+  if (isProfileReady(profile)) profile = await trackProfileLibraryLocation(profile);
   const existing = profileWindows.get(profile.id);
   if (existing && !existing.isDestroyed()) { focusWindow(existing); return existing; }
   const window = new BrowserWindow({
     width: 1480, height: 920, minWidth: 1050, minHeight: 700,
-    title: `InDeck — ${profile.name}`, titleBarStyle: 'hidden', backgroundColor: '#111217',
+    title: `Mosaic — ${profile.name}`, titleBarStyle: 'hidden', backgroundColor: '#111217',
     icon: fs.existsSync(APP_ICON_PATH) ? APP_ICON_PATH : undefined,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true }
   });
+  // BrowserWindow.webContents is destroyed before the `closed` event runs.
+  // Keep the stable id now so the cleanup handler never touches a destroyed
+  // Electron object when the custom Close button is used.
+  const webContentsId = window.webContents.id;
   window.webContents.on('did-fail-load', (_, errorCode, errorDescription, validatedURL) => {
     console.error('[InDeck renderer load failed]', errorCode, errorDescription, validatedURL);
   });
@@ -922,53 +1323,105 @@ async function createWindow(profileId = DEFAULT_PROFILE_ID) {
     console.error('[InDeck renderer process gone]', details.reason, details.exitCode);
   });
   window.on('closed', () => {
-    webContentsProfileIds.delete(window.webContents.id);
+    webContentsProfileIds.delete(webContentsId);
     if (profileWindows.get(profile.id) === window) {
       profileWindows.delete(profile.id);
       stopFolderWatchers(profile.id);
     }
   });
   profileWindows.set(profile.id, window);
-  webContentsProfileIds.set(window.webContents.id, profile.id);
+  webContentsProfileIds.set(webContentsId, profile.id);
   window.loadFile(rendererEntry());
   return window;
 }
 
 app.whenReady().then(async () => {
+  if (NATIVE_HOST_REGISTRATION_MODE) {
+    try {
+      const registration = await registerNativeMessagingHost();
+      console.log(`Native messaging host registered: ${registration.manifestPath}`);
+    } catch (error) {
+      console.error('Could not register native messaging host:', error.message);
+      process.exitCode = 1;
+    } finally {
+      app.quit();
+    }
+    return;
+  }
   if (NATIVE_MESSAGING_MODE) {
     startNativeMessagingHost();
     return;
   }
-  const defaultProfile = await profileById(DEFAULT_PROFILE_ID);
-  const library = await readStore(defaultProfile);
-  const migrated = await migrateInDeckMedia(defaultProfile, library);
-  const sanitized = sanitizeExtensionGalleryMembership(defaultProfile, library);
-  const connectedDefaults = await ensureDefaultSourcesForExistingGalleries(defaultProfile, library);
-  if (migrated || sanitized || connectedDefaults) await writeStore(defaultProfile, library);
+  let currentDefaultProfile = await defaultProfile();
+  if (isProfileReady(currentDefaultProfile)) {
+    currentDefaultProfile = await trackProfileLibraryLocation(currentDefaultProfile);
+    const library = await readStore(currentDefaultProfile);
+    const migrated = await migrateInDeckMedia(currentDefaultProfile, library);
+    const sanitized = sanitizeExtensionGalleryMembership(currentDefaultProfile, library);
+    const prunedUnavailable = await reconcileUnavailableSources(currentDefaultProfile, library);
+    const disconnectedDefaults = await disconnectMissingGalleryDefaultSources(library);
+    if (migrated || sanitized || prunedUnavailable || disconnectedDefaults) await writeStore(currentDefaultProfile, library);
+  }
   registerNativeMessagingHost().catch(error => console.error('Could not register native messaging host:', error.message));
-  ipcMain.handle('store:read', async event => readStore(await profileForWebContents(event.sender)));
-  ipcMain.handle('store:write', async (event, value) => writeStore(await profileForWebContents(event.sender), value));
+  async function readReconciledStore(profile) {
+    const data = await readStore(profile);
+    // DefaultSave is the permanent Main Gallery destination for extension
+    // imports. Re-index it on every renderer snapshot so a file that has
+    // already reached the folder cannot be invisible just because an older
+    // state write omitted its source record.
+    const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data);
+    const prunedUnavailable = await reconcileUnavailableSources(profile, data);
+    const disconnectedDefaults = await disconnectMissingGalleryDefaultSources(data);
+    if (defaultSaveChanged || prunedUnavailable || disconnectedDefaults) await writeStore(profile, data);
+    return data;
+  }
+  ipcMain.handle('store:read', async event => readReconciledStore(await profileForWebContents(event.sender)));
+  ipcMain.handle('store:write', async (event, value) => {
+    const profile = await profileForWebContents(event.sender);
+    const data = value && typeof value === 'object' ? value : {};
+    // A renderer may hold an old snapshot while a file/source is deleted.
+    // Reconcile before every write so stale UI state can never resurrect it.
+    await reconcileUnavailableSources(profile, data);
+    await disconnectMissingGalleryDefaultSources(data);
+    return writeStore(profile, data);
+  });
   // New renderers consume a versioned snapshot instead of treating browser
   // storage as a library. Keep store:* temporarily for the legacy renderer.
-  ipcMain.handle('library:snapshot', async event => ({ version: 1, library: await readStore(await profileForWebContents(event.sender)) }));
-  ipcMain.handle('profiles:list', async () => (await readProfileRegistry()).profiles.map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) })));
+  ipcMain.handle('library:snapshot', async event => {
+    const profile = await profileForWebContents(event.sender);
+    return { version: 1, library: await readReconciledStore(profile) };
+  });
+  ipcMain.handle('profiles:list', async () => (await readProfileRegistry()).profiles.map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, lastMediaPath: profile.lastMediaPath || null })));
+  ipcMain.handle('profiles:discarded-list', async () => (await readProfileRegistry()).discardedProfiles.map(profile => ({ id: profile.id, name: profile.name, initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, discardedAt: profile.discardedAt || null })));
   ipcMain.handle('profiles:current', async event => {
     const profile = await profileForWebContents(event.sender);
-    return { id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) };
+    return { id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, lastMediaPath: profile.lastMediaPath || null };
   });
   ipcMain.handle('profiles:create', async (_, name) => {
     const profile = await createProfile(name);
-    return { id: profile.id, name: profile.name, isDefault: false };
+    return { id: profile.id, name: profile.name, isDefault: false, initialized: false };
   });
   ipcMain.handle('profiles:rename', async (_, profileId, name) => {
     const profile = await renameProfile(profileId, name);
     const window = profileWindows.get(profile.id);
-    if (window && !window.isDestroyed()) window.setTitle(`InDeck — ${profile.name}`);
-    return { id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) };
+    if (window && !window.isDestroyed()) window.setTitle(`Mosaic — ${profile.name}`);
+    return { id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile) };
   });
-  ipcMain.handle('profiles:delete', async (_, profileId) => {
-    const profile = await deleteProfile(profileId);
+  ipcMain.handle('profiles:set-default', async (_, profileId) => {
+    const profile = await setDefaultProfile(profileId);
+    return { id: profile.id, name: profile.name, isDefault: true, initialized: isProfileReady(profile) };
+  });
+  ipcMain.handle('profiles:delete', async (_, profileId, typedName, replacementDefaultId) => {
+    const profile = await deleteProfile(profileId, typedName, replacementDefaultId);
     return { id: profile.id };
+  });
+  ipcMain.handle('profiles:recover', async (_, profileId) => recoverDiscardedProfile(profileId));
+  ipcMain.handle('profiles:library-location-status', async (_, profileId, folder) => libraryLocationStatus(profileId, folder));
+  ipcMain.handle('profiles:configure-library', async (_, profileId, folder, useExisting) => configureProfileLibrary(profileId, folder, Boolean(useExisting)));
+  ipcMain.handle('profiles:recover-library', async (_, profileId) => {
+    const profile = await profileById(profileId);
+    if (!profile) throw new Error('Profile not found');
+    return recoverProfileLibrary(profile);
   });
   ipcMain.handle('profiles:open', async (_, profileId) => {
     const window = await createWindow(profileId);
@@ -989,7 +1442,8 @@ app.whenReady().then(async () => {
     return result.canceled ? null : result.filePaths[0];
   });
   ipcMain.handle('gallery:default-source:ensure', async (event, payload = {}) => {
-    const profile = await profileForWebContents(event.sender);
+    let profile = await profileForWebContents(event.sender);
+    profile = await ensureProfileLibraryFolders(profile);
     const galleryId = String(payload.galleryId || '');
     const galleryName = String(payload.galleryName || 'Untitled Gallery');
     if (!galleryId) throw new Error('Gallery id is required');
@@ -1047,8 +1501,8 @@ app.whenReady().then(async () => {
   });
   if (!NATIVE_MESSAGING_MODE) {
     await createWindow(requestedProfileId());
-    app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(DEFAULT_PROFILE_ID); });
+    app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   }
 });
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => { if (!NATIVE_MESSAGING_MODE && process.platform !== 'darwin') app.quit(); });
 app.on('before-quit', stopFolderWatchers);

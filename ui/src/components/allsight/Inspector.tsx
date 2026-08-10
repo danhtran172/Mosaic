@@ -15,11 +15,13 @@ export type InspectorTarget = { kind: "all" } | { kind: "media"; id: string } | 
 export function Inspector({
   target,
   unlockedFolderIds,
+  currentFolderId,
   onClose,
   onConfirm,
 }: {
   target: InspectorTarget | null;
   unlockedFolderIds: string[];
+  currentFolderId?: string | null;
   onClose: () => void;
   onConfirm: (request: ConfirmRequest) => void;
 }) {
@@ -27,7 +29,7 @@ export function Inspector({
   const { state, setInspectorAutoOpen } = useAllsight();
 
   return (
-    <aside className="glass-panel app-scroll static flex h-full w-80 min-h-0 shrink-0 flex-col overflow-y-auto rounded-none border-y-0 border-r-0">
+    <aside className="glass-panel app-scroll static flex h-full w-80 min-h-0 shrink-0 basis-80 flex-col overflow-y-auto rounded-none border-y-0 border-r-0">
       <div className="flex items-center justify-between px-4 py-3">
         <h2 className="font-display text-sm font-semibold tracking-tight">{t("inspector")}</h2>
         <button
@@ -43,7 +45,7 @@ export function Inspector({
         {target?.kind === "folder" ? (
           <FolderPanel folderId={target.id} unlockedFolderIds={unlockedFolderIds} onConfirm={onConfirm} />
         ) : target?.kind === "media" ? (
-          <MediaPanel mediaId={target.id} />
+          <MediaPanel mediaId={target.id} currentFolderId={currentFolderId} />
         ) : target?.kind === "all" ? (
           <MainGalleryPanel onConfirm={onConfirm} />
         ) : (
@@ -176,7 +178,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
             disabled={addingSource}
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
-              if (!bridge) { setSourceMessage("This is available only in the InDeck desktop app."); return; }
+              if (!bridge) { setSourceMessage("This is available only in the Mosaic desktop app."); return; }
               const path = await bridge.pickFolder();
               if (!path) return;
               setAddingSource(true);
@@ -331,7 +333,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             disabled={addingSource}
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
-              if (!bridge) { setSourceMessage("Chỉ có thể thêm folder trong ứng dụng InDeck."); return; }
+              if (!bridge) { setSourceMessage("Chỉ có thể thêm folder trong ứng dụng Mosaic."); return; }
               const path = await bridge.pickFolder();
               if (!path) return;
               setAddingSource(true);
@@ -399,7 +401,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
   );
 }
 
-function MediaPanel({ mediaId }: { mediaId: string }) {
+function MediaPanel({ mediaId, currentFolderId }: { mediaId: string; currentFolderId?: string | null }) {
   const t = useT();
   const {
     state,
@@ -417,6 +419,23 @@ function MediaPanel({ mediaId }: { mediaId: string }) {
   // not the friendly label such as "Default Source".
   const source = sourceEntry ? { ...sourceEntry, name: sourceEntry.path || sourceEntry.name } : undefined;
   const memberFolders = state.folders.filter((f) => f.mediaIds.includes(media.id));
+  const contextFolder = currentFolderId ? state.folders.find((folder) => folder.id === currentFolderId) : null;
+  const editablePropertyGroups = state.propertyGroups.filter((group) => {
+    if (!contextFolder) {
+      return !memberFolders.length || !memberFolders.every((folder) =>
+        (folder.disabledGeneralGroupIds ?? []).includes(group.id) || (folder.disabledGalleryGroupIds ?? []).includes(group.id),
+      );
+    }
+    if (group.id.startsWith(`exclusive:${contextFolder.id}:`)) return true;
+    if (group.id.startsWith("exclusive:")) return false;
+    if (group.id.startsWith("gallery-group:")) {
+      const inherited = state.galleryGroups.some((galleryGroup) =>
+        galleryGroup.folderIds.includes(contextFolder.id) && (galleryGroup.propertyGroupIds ?? []).includes(group.id),
+      );
+      return inherited && !(contextFolder.disabledGalleryGroupIds ?? []).includes(group.id);
+    }
+    return !(contextFolder.disabledGeneralGroupIds ?? []).includes(group.id);
+  });
 
   return (
     <div className="space-y-5 px-4 pb-8">
@@ -452,7 +471,7 @@ function MediaPanel({ mediaId }: { mediaId: string }) {
         {t("favorite")}
       </button>
 
-      {state.propertyGroups.map((g) => (
+      {editablePropertyGroups.map((g) => (
         <section key={g.id} className="space-y-2">
           <div className="flex items-center justify-between">
             <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">

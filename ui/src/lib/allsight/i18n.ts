@@ -2,7 +2,7 @@ import { createContext, useContext } from "react";
 import type { Language } from "./types";
 
 const en = {
-  brand: "InDeck",
+  brand: "Mosaic",
   manageTags: "Manage tags",
   library: "Library",
   allMedia: "All media",
@@ -152,7 +152,7 @@ const en = {
 type Dict = typeof en;
 
 const vi: Dict = {
-  brand: "InDeck",
+  brand: "Mosaic",
   manageTags: "Quản lý thẻ",
   library: "Thư viện",
   allMedia: "Tất cả media",

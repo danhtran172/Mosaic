@@ -65,8 +65,47 @@ function GalleryNav({ folder, active, onClick }: { folder: PersonalFolder; activ
 function Empty({ text }: { text: string }) { return <div className="grid min-h-72 place-items-center rounded-2xl border border-dashed border-border text-sm text-muted-foreground">{text}</div>; }
 
 function PropertyEditor({ group, usage, onRename, onDelete, onAddValue, onRenameValue, onDeleteValue }: { group: PropertyGroup; usage: (value: string) => number; onRename: (name: string) => void; onDelete: () => void; onAddValue: (value: string) => void; onRenameValue: (from: string, to: string) => void; onDeleteValue: (value: string) => void }) {
-  const [draft, setDraft] = useState(""); const [editing, setEditing] = useState<{ value: string; draft: string } | null>(null);
-  return <section className="space-y-4"><div className="flex items-center gap-2"><h2 className="font-display text-xl font-semibold">{group.name}</h2><span className="text-sm text-muted-foreground">{group.values.length} tags</span><button onClick={() => { const name = window.prompt("Rename Property Group", group.name); if (name?.trim()) onRename(name.trim()); }} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent"><Pencil className="size-3.5" /></button><button onClick={onDelete} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="size-3.5" /></button></div><div className="flex max-w-md gap-2"><input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && draft.trim()) { onAddValue(draft.trim()); setDraft(""); } }} placeholder="New tag" className="min-w-0 flex-1 rounded-lg border border-border bg-background/50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" /><button onClick={() => { if (draft.trim()) { onAddValue(draft.trim()); setDraft(""); } }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground">Add</button></div><ul className="glass-panel divide-y divide-border/60 overflow-hidden rounded-xl">{group.values.map((value) => <li key={value} className="group flex items-center gap-3 px-4 py-2.5">{editing?.value === value ? <input autoFocus value={editing.draft} onChange={(event) => setEditing({ value, draft: event.target.value })} onBlur={() => { if (editing.draft.trim() && editing.draft !== value) onRenameValue(value, editing.draft.trim()); setEditing(null); }} onKeyDown={(event) => event.key === "Enter" && (event.target as HTMLInputElement).blur()} className="flex-1 rounded border border-border bg-background/50 px-2 py-1 text-sm" /> : <span className="flex-1 text-sm">{value}</span>}<span className="text-xs text-muted-foreground">{usage(value)}</span><button onClick={() => setEditing({ value, draft: value })} className="opacity-0 group-hover:opacity-100"><Pencil className="size-3.5" /></button><button onClick={() => onDeleteValue(value)} className="opacity-0 group-hover:opacity-100"><Trash2 className="size-3.5 text-destructive" /></button></li>)}{!group.values.length && <li className="px-4 py-6 text-center text-sm text-muted-foreground">No tags yet.</li>}</ul></section>;
+  const [draft, setDraft] = useState("");
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState<{ value: string; draft: string } | null>(null);
+  const commitName = () => {
+    const next = editingName?.trim();
+    if (next && next !== group.name) onRename(next);
+    setEditingName(null);
+  };
+  const commitValue = () => {
+    if (!editingValue) return;
+    const next = editingValue.draft.trim();
+    if (next && next !== editingValue.value) onRenameValue(editingValue.value, next);
+    setEditingValue(null);
+  };
+  const addValue = () => {
+    const next = draft.trim();
+    if (!next) return;
+    onAddValue(next);
+    setDraft("");
+  };
+  return <section className="space-y-4">
+    <div className="flex items-center gap-2">
+      {editingName !== null ? <input autoFocus value={editingName} onChange={(event) => setEditingName(event.target.value)} onBlur={commitName} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") setEditingName(null); }} className="min-w-0 rounded-md border border-border bg-background/50 px-2 py-1 font-display text-xl font-semibold outline-none focus:ring-2 focus:ring-ring" /> : <h2 className="font-display text-xl font-semibold">{group.name}</h2>}
+      <span className="text-sm text-muted-foreground">{group.values.length} tags</span>
+      <button type="button" title="Rename Property" onClick={() => setEditingName(group.name)} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent"><Pencil className="size-3.5" /></button>
+      <button type="button" onClick={onDelete} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="size-3.5" /></button>
+    </div>
+    <div className="flex max-w-md gap-2">
+      <input value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") addValue(); }} placeholder="New tag" className="min-w-0 flex-1 rounded-lg border border-border bg-background/50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" />
+      <button type="button" onClick={addValue} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground">Add</button>
+    </div>
+    <ul className="glass-panel divide-y divide-border/60 overflow-hidden rounded-xl">
+      {group.values.map((value) => <li key={value} className="group flex items-center gap-3 px-4 py-2.5">
+        {editingValue?.value === value ? <input autoFocus value={editingValue.draft} onChange={(event) => setEditingValue({ value, draft: event.target.value })} onBlur={commitValue} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") setEditingValue(null); }} className="flex-1 rounded border border-border bg-background/50 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-ring" /> : <span className="flex-1 text-sm">{value}</span>}
+        <span className="text-xs text-muted-foreground">{usage(value)}</span>
+        <button type="button" title="Rename tag" onClick={() => setEditingValue({ value, draft: value })} className="grid size-7 place-items-center rounded-md text-muted-foreground opacity-70 hover:bg-accent hover:text-foreground group-hover:opacity-100"><Pencil className="size-3.5" /></button>
+        <button type="button" title="Delete tag" onClick={() => onDeleteValue(value)} className="grid size-7 place-items-center rounded-md text-muted-foreground opacity-70 hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"><Trash2 className="size-3.5" /></button>
+      </li>)}
+      {!group.values.length && <li className="px-4 py-6 text-center text-sm text-muted-foreground">No tags yet.</li>}
+    </ul>
+  </section>;
 }
 
 function AccessCard({ group, disabled, onToggle }: { group: PropertyGroup; disabled: boolean; onToggle: () => void }) { return <div className={cn("flex min-w-0 items-center gap-2 rounded-xl border px-3 py-2.5", disabled ? "border-border/55 bg-secondary/20 text-muted-foreground" : "border-primary/25 bg-primary/5")}><span className="min-w-0 flex-1 truncate text-sm font-medium">{group.name}</span><button onClick={onToggle} title={disabled ? "Enable for this Gallery" : "Disable for this Gallery"} className="grid size-7 place-items-center rounded-lg hover:bg-background/60">{disabled ? <EyeOff className="size-4" /> : <Eye className="size-4 text-primary" />}</button></div>; }

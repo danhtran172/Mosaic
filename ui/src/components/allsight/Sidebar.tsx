@@ -452,7 +452,7 @@ export function Sidebar({
           className="flex min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none"
         >
           <span className="grid size-7 shrink-0 place-items-center overflow-hidden rounded-lg bg-primary/85 text-primary-foreground">
-            <img src={appIcon} alt="InDeck" className="size-full object-cover" />
+            <img src={appIcon} alt="Mosaic" className="size-full object-cover" />
           </span>
           {!collapsed && (
             <span className="truncate font-display text-lg font-semibold tracking-tight">{t("brand")}</span>
@@ -556,11 +556,11 @@ export function Sidebar({
         <button
           type="button"
           onClick={onOpenExtensionManage}
-          title="InDeck Extention"
+          title="Mosaic Extention"
           className={cn(itemBase, collapsed && "justify-center px-0", "hover:bg-accent/60")}
         >
           <HardDriveDownload className="size-4 shrink-0 text-muted-foreground" />
-          {!collapsed && "InDeck Extention"}
+          {!collapsed && "Mosaic Extention"}
         </button>
         <button
           type="button"
@@ -844,7 +844,7 @@ export function Sidebar({
                             <p className="truncate text-sm font-medium">{media.name}</p>
                             <div className="flex gap-2">
                               <button onClick={(event) => { event.stopPropagation(); restoreFromFolderTrash(gallery.id, media.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
-                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(media.id); }} title="Bỏ ảnh khỏi InDeck (không xóa file nguồn)" className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
+                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(media.id); }} title="Bỏ ảnh khỏi Mosaic (không xóa file nguồn)" className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
                             </div>
                           </div>
                         </div>

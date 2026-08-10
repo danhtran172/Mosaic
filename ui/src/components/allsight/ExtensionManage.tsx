@@ -39,9 +39,9 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
           <ArrowLeft className="size-4" /> Back to library
         </button>
         <div>
-          <h1 className="font-display text-lg font-semibold">InDeck Extention Manage</h1>
+          <h1 className="font-display text-lg font-semibold">Mosaic Extention Manage</h1>
           <p className="text-xs text-muted-foreground">
-            Set the four Gallery targets used by InDeck Extention.
+            Set the four Gallery targets used by Mosaic Extention.
           </p>
         </div>
       </header>

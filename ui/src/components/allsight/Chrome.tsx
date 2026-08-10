@@ -20,6 +20,7 @@ import {
   Maximize2,
   Minimize2,
   Minus,
+  Group,
 } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -33,6 +34,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
 import type { FilterKind, PersonalFolder } from "@/lib/allsight/types";
+import { mediaGroupById, type MediaGroupBy } from "@/lib/allsight/grouping";
 
 const OTHER_MEDIA_SOURCE_ID = "__indeck-other-media__";
 import { cn } from "@/lib/utils";
@@ -76,6 +78,8 @@ export function Header({
   sourceFilterIds,
   onToggleSourceFilter,
   onClearAdvancedFilters,
+  groupBy,
+  onToggleGroupBy,
 }: {
   title: string;
   subtitle?: string | undefined;
@@ -98,6 +102,8 @@ export function Header({
   sourceFilterIds: string[];
   onToggleSourceFilter: (id: string) => void;
   onClearAdvancedFilters: () => void;
+  groupBy: MediaGroupBy[];
+  onToggleGroupBy: (groupBy: MediaGroupBy) => void;
 }) {
   const t = useT();
   const { state, setThumbHeight } = useAllsight();
@@ -160,6 +166,15 @@ export function Header({
             sourceFilterIds={sourceFilterIds}
             onToggleSource={onToggleSourceFilter}
             onClearAll={onClearAdvancedFilters}
+          />
+        )}
+
+        {showFilters && (
+          <GroupByPopover
+            groupBy={groupBy}
+            onToggle={onToggleGroupBy}
+            viewKind={viewKind}
+            folder={folder}
           />
         )}
 
@@ -246,6 +261,67 @@ export function WindowControls() {
   );
 }
 
+function GroupByPopover({
+  groupBy,
+  onToggle,
+  viewKind,
+  folder,
+}: {
+  groupBy: MediaGroupBy[];
+  onToggle: (groupBy: MediaGroupBy) => void;
+  viewKind: "all" | "folders" | "folder";
+  folder: PersonalFolder | null;
+}) {
+  const { state } = useAllsight();
+  const properties = state.propertyGroups.filter((property) => {
+    if (!folder) return !property.id.startsWith("exclusive:") && !property.id.startsWith("gallery-group:");
+    if (property.id.startsWith(`exclusive:${folder.id}:`)) return true;
+    if (property.id.startsWith("exclusive:")) return false;
+    if (property.id.startsWith("gallery-group:")) return (folder.managedGroupIds ?? []).includes(property.id) && !(folder.disabledGalleryGroupIds ?? []).includes(property.id);
+    return !(folder.disabledGeneralGroupIds ?? []).includes(property.id);
+  });
+  const selectedIndex = (value: MediaGroupBy) => groupBy.findIndex((item) => mediaGroupById(item) === mediaGroupById(value));
+  const item = (label: string, value: MediaGroupBy) => {
+    const index = selectedIndex(value);
+    const enabled = index >= 0;
+    return (
+      <button
+        key={mediaGroupById(value)}
+        type="button"
+        onClick={() => onToggle(value)}
+        className={cn("flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-accent", enabled && "bg-primary/15 text-foreground")}
+      >
+        <span className={cn("grid size-4 place-items-center rounded border", enabled ? "border-primary bg-primary text-primary-foreground" : "border-border")}>{enabled ? <span className="text-[10px] font-semibold">{index + 1}</span> : null}</span>
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+      </button>
+    );
+  };
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          aria-label="Group by"
+          title="Group by"
+          className={cn(iconBtn, "flex h-8 w-auto items-center justify-center gap-1.5 px-2.5 text-xs font-medium", groupBy.length > 0 && "bg-primary/20 text-foreground")}
+        >
+          <Group className="size-4" />
+          {groupBy.length > 0 && <span className="tabular-nums">{groupBy.length}</span>}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="glass-float w-64 rounded-2xl p-2">
+        <p className="px-2.5 py-1.5 text-xs font-semibold">Group by</p>
+        <p className="px-2.5 pb-2 text-[11px] text-muted-foreground">Chọn nhiều mục để tạo nhóm lồng nhau theo thứ tự đã chọn.</p>
+        <div className="app-scroll max-h-72 space-y-1 overflow-auto pr-1">
+          {item("Media source", { kind: "media-source" })}
+          {viewKind === "all" && item("Gallery source", { kind: "gallery-source" })}
+          {properties.length > 0 && <div className="mt-2 border-t border-border/60 pt-2"><p className="px-2.5 pb-1 text-[11px] font-medium text-muted-foreground">Property</p>{properties.map((property) => item(property.name, { kind: "property", propertyId: property.id }))}</div>}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 function FilterPopover({
   propFilters,
   onToggle,
@@ -276,6 +352,7 @@ function FilterPopover({
 
   const groups = state.propertyGroups
     .filter((g) => !folder?.managedGroupIds?.length || folder.managedGroupIds.includes(g.id))
+    .filter((g) => !folder?.disabledGeneralGroupIds?.includes(g.id) && !folder?.disabledGalleryGroupIds?.includes(g.id))
     .map((g) => ({ ...g, values: g.values.filter((v) => !q || v.toLowerCase().includes(q)) }))
     .filter((g) => g.values.length > 0);
   const managedSources = state.sources.filter((source) =>
@@ -382,18 +459,42 @@ function FilterPopover({
 
 export function BulkBar({
   selected,
+  folder,
   onClear,
 }: {
   selected: string[];
+  folder: PersonalFolder | null;
   onClear: () => void;
 }) {
   const t = useT();
+  const { state, addPropValue } = useAllsight();
+  const inherited = state.galleryGroups
+    .filter((galleryGroup) => !!folder && galleryGroup.folderIds.includes(folder.id))
+    .flatMap((galleryGroup) => galleryGroup.propertyGroupIds ?? []);
+  const availableProperties = state.propertyGroups.filter((group) => {
+    if (!folder) return !group.id.startsWith("exclusive:") && !group.id.startsWith("gallery-group:");
+    if (group.id.startsWith(`exclusive:${folder.id}:`)) return true;
+    if (group.id.startsWith("exclusive:")) return false;
+    if (group.id.startsWith("gallery-group:")) return inherited.includes(group.id) && !(folder.disabledGalleryGroupIds ?? []).includes(group.id);
+    return !(folder.disabledGeneralGroupIds ?? []).includes(group.id);
+  });
   if (selected.length < 2) return null;
 
   return (
     <div className="glass-float pointer-events-auto absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-2xl px-2.5 py-2">
       <span className="px-2 text-xs font-medium">{t("itemsSelected", { count: selected.length })}</span>
       <span className="h-5 w-px bg-border" />
+      {availableProperties.map((group) => (
+        <PropertyPicker
+          key={group.id}
+          label={`Add ${group.name}`}
+          align="center"
+          options={group.values.map((value) => ({ id: value, label: value }))}
+          onSelect={(value) => addPropValue(selected, group.id, value)}
+          onCreate={(value) => addPropValue(selected, group.id, value)}
+          trigger={<button type="button" className="glass-btn inline-flex h-8 max-w-32 items-center gap-1.5 rounded-xl px-2 text-xs font-medium"><Tag className="size-3.5 shrink-0" /><span className="truncate">{group.name}</span></button>}
+        />
+      ))}
       <button onClick={onClear} aria-label={t("clearSelection")} className={iconBtn}>
         <X className="size-4" />
       </button>

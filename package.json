@@ -2,9 +2,11 @@
   "name": "master-vision",
   "version": "1.0.0",
   "description": "A private visual library desktop app",
-  "productName": "InDeck",
+  "productName": "Mosaic",
   "main": "main.js",
   "scripts": {
+    "build:ui": "npm --prefix ui run build",
+    "prestart": "npm run build:ui",
     "start": "electron .",
     "dev": "electron ."
   },

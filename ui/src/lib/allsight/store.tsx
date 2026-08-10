@@ -153,10 +153,10 @@ function libraryToState(library: Record<string, any>): AllsightState {
         ? String(gallery.coverId)
         : (gallery.itemOrder === "newest-first" ? storedMediaIds.at(-1) : storedMediaIds[0]) ?? null,
       locked: Boolean(gallery.locked),
-      managedGroupIds: [
+      managedGroupIds: [...new Set([
         ...(gallery.generalTagGroupIds ?? groups.map((group: Record<string, any>) => group.id)),
         ...(gallery.exclusiveTagGroups ?? []).filter((group: Record<string, any>) => group.enabled !== false).map((group: Record<string, any>) => `exclusive:${gallery.id}:${group.id}`),
-      ].map(String),
+      ].map(String))],
       disabledGeneralGroupIds: Array.isArray(gallery.disabledGeneralPropertyIds)
         ? gallery.disabledGeneralPropertyIds.map(String)
         : [],
@@ -303,9 +303,13 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
       discardedIds: [...new Set(folder.discardedMediaIds ?? [])],
       coverId: folder.coverId ?? undefined,
       locked: folder.locked,
-      defaultTags: folder.autoTags.theme ?? [],
-      defaultPersons: folder.autoTags.character ?? [],
-      autoTagGroups: Object.fromEntries(Object.entries(folder.autoTags).filter(([id]) => id !== "theme" && id !== "character")),
+      // A disabled Property must no longer auto-tag files on the backend. The
+      // filter also cleans up old profile data created before this rule.
+      defaultTags: (folder.disabledGeneralGroupIds ?? []).includes("theme") ? [] : (folder.autoTags.theme ?? []),
+      defaultPersons: (folder.disabledGeneralGroupIds ?? []).includes("character") ? [] : (folder.autoTags.character ?? []),
+      autoTagGroups: Object.fromEntries(Object.entries(folder.autoTags)
+        .filter(([id]) => id !== "theme" && id !== "character" && !(folder.disabledGeneralGroupIds ?? []).includes(id) && !(folder.disabledGalleryGroupIds ?? []).includes(id))
+        .map(([id, values]) => [id.startsWith("exclusive:") ? id.split(":").at(-1)! : id, values])),
       generalTagGroupIds: state.propertyGroups
         .filter((group) => !group.id.startsWith("exclusive:") && !group.id.startsWith("gallery-group:") && !(folder.disabledGeneralGroupIds ?? []).includes(group.id))
         .map((group) => group.id),
@@ -748,7 +752,16 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           return { ...s, media: [...s.media, copy], order };
         }),
       addPropertyGroup: (name) =>
-        set((s) => ({ ...s, propertyGroups: [...s.propertyGroups, { id: uid("pg"), name, values: [] }] })),
+        set((s) => {
+          const id = uid("pg");
+          return {
+            ...s,
+            propertyGroups: [...s.propertyGroups, { id, name, values: [] }],
+            // General Properties are shared application-wide and immediately
+            // available to every Gallery unless that Gallery disabled them.
+            folders: s.folders.map((folder) => ({ ...folder, managedGroupIds: [...new Set([...(folder.managedGroupIds ?? []), id])] })),
+          };
+        }),
       renamePropertyGroup: (id, name) =>
         set((s) => ({
           ...s,
@@ -760,6 +773,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           propertyGroups: s.propertyGroups.filter((g) => g.id !== id),
           folders: s.folders.map((folder) => ({
             ...folder,
+            managedGroupIds: (folder.managedGroupIds ?? []).filter((groupId) => groupId !== id),
             autoTags: Object.fromEntries(Object.entries(folder.autoTags).filter(([groupId]) => groupId !== id)),
             disabledGeneralGroupIds: (folder.disabledGeneralGroupIds ?? []).filter((groupId) => groupId !== id),
             disabledGalleryGroupIds: (folder.disabledGalleryGroupIds ?? []).filter((groupId) => groupId !== id),
@@ -796,7 +810,8 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       addExclusivePropertyGroup: (folderId, name) =>
         set((s) => {
           if (folderId !== "main" && !s.folders.some((folder) => folder.id === folderId)) return s;
-          return { ...s, propertyGroups: [...s.propertyGroups, { id: `exclusive:${folderId}:${uid("pg")}`, name, values: [] }] };
+          const id = `exclusive:${folderId}:${uid("pg")}`;
+          return { ...s, propertyGroups: [...s.propertyGroups, { id, name, values: [] }] };
         }),
       addGalleryGroupProperty: (galleryGroupId, name) =>
         set((s) => {
@@ -815,7 +830,16 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             if (folder.id !== folderId || propertyId.startsWith(`exclusive:${folderId}:`)) return folder;
             const field = propertyId.startsWith("gallery-group:") ? "disabledGalleryGroupIds" : "disabledGeneralGroupIds";
             const disabled = folder[field] ?? [];
-            return { ...folder, [field]: disabled.includes(propertyId) ? disabled.filter((id) => id !== propertyId) : [...disabled, propertyId] };
+            const disabling = !disabled.includes(propertyId);
+            return {
+              ...folder,
+              [field]: disabling ? [...disabled, propertyId] : disabled.filter((id) => id !== propertyId),
+              // Disable is semantic, not merely visual: do not keep applying
+              // this Gallery's previous automatic tags to new media.
+              autoTags: disabling
+                ? Object.fromEntries(Object.entries(folder.autoTags).filter(([id]) => id !== propertyId))
+                : folder.autoTags,
+            };
           }),
         })),
       deletePropertyValue: (groupId, value) =>

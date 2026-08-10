@@ -10,7 +10,7 @@ async function ensureClipboardDocument() {
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
     reasons: ['CLIPBOARD'],
-    justification: 'Copy an image dropped onto the InDeck Extension copy target.'
+    justification: 'Copy an image dropped onto the Mosaic Extension copy target.'
   }).catch(error => {
     if (!/single offscreen document/i.test(String(error?.message || error))) throw error;
   });
@@ -47,8 +47,8 @@ function nativeRequest(message) {
   return new Promise(resolve => {
     chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, response => {
       const error = chrome.runtime.lastError;
-      if (error) return resolve({ ok: false, error: `${error.message}. Open InDeck once after installing it, then reload this extension.` });
-      resolve(response || { ok: false, error: 'InDeck did not return a response.' });
+      if (error) return resolve({ ok: false, error: `${error.message}. Open Mosaic once after installing it, then reload this extension.` });
+      resolve(response || { ok: false, error: 'Mosaic did not return a response.' });
     });
   });
 }
@@ -60,7 +60,9 @@ async function saveToInDeck(url, galleryId = null) {
   const profileId = await selectedProfileId();
   if (!profileId) return { ok: false, error: 'Chọn profile trong Extension Settings trước khi lưu.' };
   const result = await nativeRequest({ type: 'media:import', profileId, url, galleryId });
-  return result.ok ? { ok: true, name: result.asset?.name, galleryId: result.galleryId || null } : result;
+  if (!result.ok) return result;
+  if (result.saved !== true) return { ok: false, error: 'Ảnh chưa được xác nhận là đã lưu vào Library.' };
+  return { ok: true, saved: true, name: result.asset?.name, galleryId: result.galleryId || null };
 }
 async function extensionConfig() {
   const profileId = await selectedProfileId();
@@ -92,7 +94,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: 'save-image-to-indeck', title: 'Save image to InDeck', contexts: ['image'] });
+  chrome.contextMenus.create({ id: 'save-image-to-indeck', title: 'Save image to Mosaic', contexts: ['image'] });
 });
 chrome.runtime.onClicked?.addListener(() => chrome.runtime.openOptionsPage());
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {

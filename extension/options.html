@@ -3,20 +3,25 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>InDeck Extension Settings</title>
-    <style>
-      body{max-width:680px;margin:48px auto;padding:0 24px;background:#121416;color:#edf0ea;font:15px/1.5 system-ui,sans-serif}main{padding:28px;border:1px solid #343a34;border-radius:12px;background:#1a1d1a}h1{margin:0 0 8px;font-size:24px}p{color:#b5bcb1}label{display:block;margin:24px 0 8px;font-weight:700}select,button{box-sizing:border-box;border-radius:7px;font:inherit}select{width:100%;padding:10px;background:#101210;color:#edf0ea;border:1px solid #4c5548}button{margin-top:14px;padding:10px 15px;border:0;background:#c6ff59;color:#172000;font-weight:800;cursor:pointer}#status{min-height:24px;margin:16px 0 0;color:#c7cec4}.error{color:#ffb4ac!important}.hint{font-size:13px}
-    </style>
+    <title>Mosaic Extension Settings</title>
+    <link rel="stylesheet" href="options.css">
   </head>
   <body>
-    <main>
-      <h1>InDeck Extension</h1>
-      <p>Chọn profile đích. Mọi media về sau sẽ tự lưu vào profile này, kể cả khi không có cửa sổ InDeck nào đang mở.</p>
-      <label for="profile">Profile</label>
-      <select id="profile" disabled><option>Đang tải profiles…</option></select>
-      <button id="save" disabled>Lưu lựa chọn</button>
-      <p id="status" role="status"></p>
-      <p class="hint">Tạo, đổi tên hoặc xoá profile trong InDeck → Settings → Profiles.</p>
+    <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+    <main class="glass-panel">
+      <header>
+        <span class="brand-mark" aria-hidden="true">I</span>
+        <div><p class="eyebrow">MOSAIC EXTENSION</p><h1>Profile đích</h1></div>
+        <span id="connection" class="connection" data-state="loading">Đang kiểm tra</span>
+      </header>
+      <p class="intro">Media bạn lưu từ web sẽ luôn vào profile này — kể cả khi không có cửa sổ Mosaic nào đang mở.</p>
+      <section class="selection-card">
+        <label for="profile">Lưu media vào Profile</label>
+        <select id="profile" disabled><option>Đang tải profile…</option></select>
+        <div class="actions"><button id="save" disabled>Lưu lựa chọn</button><button id="refresh" class="secondary" type="button">Thử lại</button></div>
+      </section>
+      <p id="status" role="status" aria-live="polite"></p>
+      <aside class="hint"><span aria-hidden="true">✦</span><p>Chỉ profile đã chọn <b>Default Library Location</b> mới xuất hiện tại đây. Tạo hoặc quản lý profile trong <b>Mosaic → Settings → Quản lý Profile</b>.</p></aside>
     </main>
     <script src="options.js"></script>
   </body>
