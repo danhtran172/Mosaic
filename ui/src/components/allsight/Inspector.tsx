@@ -130,19 +130,19 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
   return (
     <div className="space-y-4 px-4 pb-8">
       <div className="space-y-1">
-        <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Gallery Sources</h3>
-        <p className="text-xs leading-relaxed text-muted-foreground">Ẩn Gallery khỏi Main Gallery. Media vẫn hiện nếu nó còn thuộc Gallery khác.</p>
-        <p className="text-xs text-muted-foreground">{hiddenCountLabel} media sẽ bị ẩn</p>
+        <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">{t("gallerySources")}</h3>
+        <p className="text-xs leading-relaxed text-muted-foreground">{t("gallerySourcesHint")}</p>
+        <p className="text-xs text-muted-foreground">{t("hiddenMediaCount", { count: hiddenCountLabel })}</p>
       </div>
       <button
         type="button"
         role="switch"
         aria-checked={state.ignoreMediaSourcesWhenExcluded}
-        title="Khi bật, Gallery bị ẩn sẽ ẩn media đó khỏi Main Gallery dù media vẫn thuộc Media Sources của Main Gallery."
+        title={t("gallerySourcesHint")}
         onClick={toggleIgnoreMediaSourcesWhenExcluded}
         className="glass-btn flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left"
       >
-        <span className="min-w-0 flex-1 text-sm font-medium">Ignore Media Sources</span>
+        <span className="min-w-0 flex-1 text-sm font-medium">{t("ignoreMediaSources")}</span>
         <span className={cn("relative h-5 w-9 shrink-0 rounded-full border transition-colors", state.ignoreMediaSourcesWhenExcluded ? "border-primary/70 bg-primary/80" : "border-border bg-secondary/65")}>
           <span className={cn("absolute top-0.5 size-3.5 rounded-full bg-white shadow-sm transition-transform", state.ignoreMediaSourcesWhenExcluded ? "translate-x-[18px]" : "translate-x-0.5")} />
         </span>
@@ -161,7 +161,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           const off = state.excludeOtherMedia;
           return <button onClick={toggleExcludeOtherMedia} className="glass-btn flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm">
             {off ? <EyeOff className="size-4 text-muted-foreground" /> : <Eye className="size-4 text-primary" />}
-            <span className="min-w-0 flex-1 truncate">Khác</span>
+            <span className="min-w-0 flex-1 truncate">{t("other")}</span>
             <span className="text-[11px] text-muted-foreground">{otherCount}</span>
           </button>;
         })()}
@@ -170,28 +170,28 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
       <section className="space-y-2.5 border-t border-border/50 pt-4">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Media Sources</h3>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Folders managed directly by Main Gallery.</p>
+            <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">{t("mediaSources")}</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t("mediaSourcesHint")}</p>
           </div>
           <button
             type="button"
             disabled={addingSource}
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
-              if (!bridge) { setSourceMessage("This is available only in the Mosaic desktop app."); return; }
+              if (!bridge) { setSourceMessage(t("onlyDesktopApp")); return; }
               const path = await bridge.pickFolder();
               if (!path) return;
               setAddingSource(true);
               setSourceMessage("");
               const result = await attachMainSource(path);
               setAddingSource(false);
-              if (result === "exists") setSourceMessage("This folder is already a Main Gallery Media Source.");
-              if (result === "unavailable") setSourceMessage("This folder could not be read.");
+              if (result === "exists") setSourceMessage(t("sourceAlreadyAdded"));
+              if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
             })()}
             className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
           >
             <FolderPlus className="size-3.5" />
-            {addingSource ? "Adding…" : "Add folder"}
+            {addingSource ? t("adding") : t("addFolder")}
           </button>
         </div>
         <div className="overflow-hidden rounded-xl border border-border/65 bg-background/25">
@@ -201,7 +201,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
             const count = state.media.filter((media) => isDefaultMedia(media.id)).length;
             return <div className="flex min-w-0 items-center gap-2.5 border-b border-border/55 px-2.5 py-2.5">
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><HardDrive className="size-4" /></span>
-              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">Default Source</span><span className="block truncate text-[11px] text-muted-foreground" title={source?.path}>{source?.path ?? "—"}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{count} media</span></span>
+              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{t("defaultSource")}</span><span className="block truncate text-[11px] text-muted-foreground" title={source?.path}>{source?.path ?? "—"}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{t("mediaCount", { count })}</span></span>
             </div>;
           })()}
           {state.mainSourceIds.map((sourceId) => {
@@ -210,11 +210,11 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
             const count = state.media.filter((media) => media.sourceId === source.id).length;
             return <div key={source.id} className="flex min-w-0 items-center gap-2.5 border-b border-border/55 px-2.5 py-2.5 last:border-b-0">
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><HardDrive className="size-4" /></span>
-              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{source.name}</span><span className="block truncate text-[11px] text-muted-foreground" title={source.path}>{source.path}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{count} media</span></span>
+              <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{source.name}</span><span className="block truncate text-[11px] text-muted-foreground" title={source.path}>{source.path}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{t("mediaCount", { count })}</span></span>
               <button type="button" title="Remove source from Main Gallery" onClick={() => onConfirm({ title: "Remove Media Source?", description: `Remove “${source.name}” from Main Gallery. The folder and its original files are kept.`, confirmLabel: "Remove source", onConfirm: () => detachMainSource(source.id) })} className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"><Trash2 className="size-3.5" /></button>
             </div>;
           })}
-          {state.mainSourceIds.length === 0 && <div className="px-3 py-4 text-center text-xs text-muted-foreground">No direct Media Sources.</div>}
+          {state.mainSourceIds.length === 0 && <div className="px-3 py-4 text-center text-xs text-muted-foreground">{t("noDirectMediaSources")}</div>}
         </div>
         {sourceMessage && <p className="text-xs text-muted-foreground">{sourceMessage}</p>}
       </section>
@@ -325,8 +325,8 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
       <section className="space-y-2.5 border-t border-border/50 pt-4">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Media Sources</h3>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Folder gốc của media trong Gallery này.</p>
+            <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">{t("mediaSources")}</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t("galleryMediaSourcesHint")}</p>
           </div>
           <button
             type="button"
@@ -346,7 +346,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
           >
             <FolderPlus className="size-3.5" />
-            {addingSource ? "Đang thêm…" : "Thêm folder"}
+            {addingSource ? t("adding") : t("addFolder")}
           </button>
         </div>
 
@@ -385,14 +385,14 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             <div className="flex min-w-0 items-center gap-2.5 px-2.5 py-2.5">
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><Folder className="size-4" /></span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium">Khác</span>
+                <span className="block truncate text-sm font-medium">{t("other")}</span>
                 <span className="block truncate text-[11px] text-muted-foreground">Media được thêm vào Gallery nhưng không thuộc Media Source.</span>
                 <span className="mt-0.5 block text-[11px] text-muted-foreground">{otherMedia.length} media</span>
               </span>
             </div>
           )}
           {(folder.sourceIds ?? []).length === 0 && otherMedia.length === 0 && (
-            <div className="px-3 py-4 text-center text-xs text-muted-foreground">Chưa có Media Source. Thêm một hoặc nhiều folder.</div>
+            <div className="px-3 py-4 text-center text-xs text-muted-foreground">{t("noMediaSources")}</div>
           )}
         </div>
         {sourceMessage && <p className="text-xs text-muted-foreground">{sourceMessage}</p>}

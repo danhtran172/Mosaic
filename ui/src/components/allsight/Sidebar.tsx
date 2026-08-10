@@ -556,11 +556,11 @@ export function Sidebar({
         <button
           type="button"
           onClick={onOpenExtensionManage}
-          title="Mosaic Extention"
+          title={t("extensionManager")}
           className={cn(itemBase, collapsed && "justify-center px-0", "hover:bg-accent/60")}
         >
           <HardDriveDownload className="size-4 shrink-0 text-muted-foreground" />
-          {!collapsed && "Mosaic Extention"}
+          {!collapsed && t("extensionManager")}
         </button>
         <button
           type="button"

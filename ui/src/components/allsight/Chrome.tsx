@@ -225,6 +225,7 @@ export function Header({
 }
 
 export function WindowControls() {
+  const t = useT();
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -235,24 +236,24 @@ export function WindowControls() {
     <div className="flex h-full shrink-0 overflow-hidden border-l border-border/55">
       <button
         onClick={() => { void getInDeckBridge()?.minimizeWindow(); }}
-        title="Thu nhỏ cửa sổ"
-        aria-label="Thu nhỏ cửa sổ"
+        title={t("minimizeWindow")}
+        aria-label={t("minimizeWindow")}
         className="grid h-full w-11 place-items-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
       >
         <Minus className="size-4" />
       </button>
       <button
         onClick={() => { void getInDeckBridge()?.toggleMaximizeWindow().then(setIsMaximized); }}
-        title={isMaximized ? "Khôi phục kích thước cửa sổ" : "Phóng to cửa sổ"}
-        aria-label={isMaximized ? "Khôi phục kích thước cửa sổ" : "Phóng to cửa sổ"}
+        title={isMaximized ? t("restoreWindow") : t("maximizeWindow")}
+        aria-label={isMaximized ? t("restoreWindow") : t("maximizeWindow")}
         className="grid h-full w-11 place-items-center border-l border-border/55 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
       >
         {isMaximized ? <Minimize2 className="size-3" /> : <Maximize2 className="size-3" />}
       </button>
       <button
         onClick={() => { void getInDeckBridge()?.closeWindow(); }}
-        title="Đóng cửa sổ"
-        aria-label="Đóng cửa sổ"
+        title={t("closeWindow")}
+        aria-label={t("closeWindow")}
         className="grid h-full w-11 place-items-center border-l border-border/55 text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
       >
         <X className="size-4" />
@@ -272,6 +273,7 @@ function GroupByPopover({
   viewKind: "all" | "folders" | "folder";
   folder: PersonalFolder | null;
 }) {
+  const t = useT();
   const { state } = useAllsight();
   const properties = state.propertyGroups.filter((property) => {
     if (!folder) return !property.id.startsWith("exclusive:") && !property.id.startsWith("gallery-group:");
@@ -301,8 +303,8 @@ function GroupByPopover({
     <Popover>
       <PopoverTrigger asChild>
         <button
-          aria-label="Group by"
-          title="Group by"
+          aria-label={t("groupBy")}
+          title={t("groupBy")}
           className={cn(iconBtn, "flex h-8 w-auto items-center justify-center gap-1.5 px-2.5 text-xs font-medium", groupBy.length > 0 && "bg-primary/20 text-foreground")}
         >
           <Group className="size-4" />
@@ -310,12 +312,12 @@ function GroupByPopover({
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="glass-float w-64 rounded-2xl p-2">
-        <p className="px-2.5 py-1.5 text-xs font-semibold">Group by</p>
-        <p className="px-2.5 pb-2 text-[11px] text-muted-foreground">Chọn nhiều mục để tạo nhóm lồng nhau theo thứ tự đã chọn.</p>
+        <p className="px-2.5 py-1.5 text-xs font-semibold">{t("groupBy")}</p>
+        <p className="px-2.5 pb-2 text-[11px] text-muted-foreground">{t("groupByHint")}</p>
         <div className="app-scroll max-h-72 space-y-1 overflow-auto pr-1">
-          {item("Media source", { kind: "media-source" })}
-          {viewKind === "all" && item("Gallery source", { kind: "gallery-source" })}
-          {properties.length > 0 && <div className="mt-2 border-t border-border/60 pt-2"><p className="px-2.5 pb-1 text-[11px] font-medium text-muted-foreground">Property</p>{properties.map((property) => item(property.name, { kind: "property", propertyId: property.id }))}</div>}
+          {item(t("mediaSource"), { kind: "media-source" })}
+          {viewKind === "all" && item(t("gallerySource"), { kind: "gallery-source" })}
+          {properties.length > 0 && <div className="mt-2 border-t border-border/60 pt-2"><p className="px-2.5 pb-1 text-[11px] font-medium text-muted-foreground">{t("property")}</p>{properties.map((property) => item(property.name, { kind: "property", propertyId: property.id }))}</div>}
         </div>
       </PopoverContent>
     </Popover>

@@ -1,4 +1,5 @@
 const { app, BrowserWindow, dialog, ipcMain, clipboard, nativeImage, shell } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -35,9 +36,31 @@ let nativeHostStarted = false;
 let nativeHostHandling = Promise.resolve();
 const nativeHostKeepAlive = NATIVE_MESSAGING_MODE ? setInterval(() => {}, 1000) : null;
 let nativeHostWindow = null;
+let autoUpdaterConfigured = false;
 function requestedProfileId(argv = process.argv) {
   const argument = argv.find(value => String(value).startsWith('--profile='));
   return argument ? String(argument).slice('--profile='.length) || null : null;
+}
+function broadcastUpdateStatus(status) {
+  BrowserWindow.getAllWindows().forEach(window => {
+    if (!window.isDestroyed()) window.webContents.send('update:status', status);
+  });
+}
+function configureAutoUpdater() {
+  if (!app.isPackaged || autoUpdaterConfigured) return;
+  autoUpdaterConfigured = true;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+  autoUpdater.on('checking-for-update', () => broadcastUpdateStatus({ state: 'checking' }));
+  autoUpdater.on('update-available', info => broadcastUpdateStatus({ state: 'available', version: info.version }));
+  autoUpdater.on('update-not-available', () => broadcastUpdateStatus({ state: 'idle' }));
+  autoUpdater.on('download-progress', progress => broadcastUpdateStatus({ state: 'downloading', percent: Math.round(progress.percent) }));
+  autoUpdater.on('update-downloaded', info => broadcastUpdateStatus({ state: 'ready', version: info.version }));
+  autoUpdater.on('error', error => {
+    console.warn('[Mosaic updater]', error.message);
+    broadcastUpdateStatus({ state: 'error' });
+  });
+  setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 4000);
 }
 if (NATIVE_MESSAGING_MODE) {
   // Chrome writes the request immediately after starting the executable. Begin
@@ -1409,6 +1432,7 @@ app.whenReady().then(async () => {
     if (migrated || sanitized || prunedUnavailable || disconnectedDefaults) await writeStore(currentDefaultProfile, library);
   }
   registerNativeMessagingHost().catch(error => console.error('Could not register native messaging host:', error.message));
+  configureAutoUpdater();
   async function readReconciledStore(profile) {
     const data = await readStore(profile);
     // DefaultSave is the permanent Main Gallery destination for extension
@@ -1476,6 +1500,19 @@ app.whenReady().then(async () => {
   ipcMain.handle('profiles:create-shortcut', async (_, profileId) => createProfileShortcut(profileId));
   ipcMain.handle('extension:browsers', async () => detectBrowsers());
   ipcMain.handle('extension:install', async (_, browserId) => openExtensionInstall(browserId));
+  ipcMain.handle('update:check', async () => {
+    if (!app.isPackaged) return { state: 'development' };
+    await autoUpdater.checkForUpdates();
+    return { state: 'checking' };
+  });
+  ipcMain.handle('update:download', async () => {
+    if (!app.isPackaged) throw new Error('Updates are available only in an installed build');
+    await autoUpdater.downloadUpdate();
+    return { state: 'downloading' };
+  });
+  ipcMain.handle('update:install', () => {
+    if (app.isPackaged) autoUpdater.quitAndInstall(false, true);
+  });
   ipcMain.handle('window:minimize', event => BrowserWindow.fromWebContents(event.sender)?.minimize());
   ipcMain.handle('window:is-maximized', event => Boolean(BrowserWindow.fromWebContents(event.sender)?.isMaximized()));
   ipcMain.handle('window:toggle-maximize', event => {

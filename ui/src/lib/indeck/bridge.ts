@@ -32,6 +32,12 @@ export type DetectedBrowser = {
   path: string | null;
 };
 
+export type UpdateStatus = {
+  state: "idle" | "checking" | "available" | "downloading" | "ready" | "error" | "development";
+  version?: string;
+  percent?: number;
+};
+
 export type InDeckBridge = {
   readLibrarySnapshot: () => Promise<InDeckSnapshot>;
   writeStore: (value: unknown) => Promise<void>;
@@ -50,6 +56,10 @@ export type InDeckBridge = {
   createProfileShortcut: (profileId: string) => Promise<string>;
   detectBrowsers: () => Promise<DetectedBrowser[]>;
   openExtensionInstall: (browserId: DetectedBrowser["id"]) => Promise<{ opened: boolean; storeUrl: string }>;
+  checkForUpdates: () => Promise<UpdateStatus>;
+  downloadUpdate: () => Promise<UpdateStatus>;
+  installUpdate: () => Promise<void>;
+  onUpdateStatus: (callback: (status: UpdateStatus) => void) => () => void;
   minimizeWindow: () => Promise<void>;
   isWindowMaximized: () => Promise<boolean>;
   toggleMaximizeWindow: () => Promise<boolean>;

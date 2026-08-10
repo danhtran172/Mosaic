@@ -14,7 +14,7 @@ import { TagManager } from "./TagManager";
 import { TrashPage } from "./TrashPage";
 import { ExtensionManage } from "./ExtensionManage";
 import { LibraryLocationSetup } from "./ProfileManager";
-import { getInDeckBridge, type InDeckProfile } from "@/lib/indeck/bridge";
+import { getInDeckBridge, type InDeckProfile, type UpdateStatus } from "@/lib/indeck/bridge";
 import { mediaGroupById, type MediaGroupBy } from "@/lib/allsight/grouping";
 
 const OTHER_MEDIA_SOURCE_ID = "__indeck-other-media__";
@@ -75,7 +75,16 @@ export function AppShell() {
   const [trashOpen, setTrashOpen] = useState(false);
   const [extensionManageOpen, setExtensionManageOpen] = useState(false);
   const [currentProfile, setCurrentProfile] = useState<InDeckProfile | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ state: "idle" });
   const previousFolderLocks = useRef(new Map<string, boolean>());
+
+  useEffect(() => {
+    const bridge = getInDeckBridge();
+    if (!bridge) return;
+    const unsubscribe = bridge.onUpdateStatus(setUpdateStatus);
+    void bridge.checkForUpdates().catch(() => setUpdateStatus({ state: "error" }));
+    return unsubscribe;
+  }, []);
 
   const refreshCurrentProfile = useCallback(async () => {
     const bridge = getInDeckBridge();
@@ -427,6 +436,18 @@ export function AppShell() {
         )}
 
         <BulkBar selected={selected} folder={folder} onClear={() => setSelected([])} />
+        {updateStatus.state !== "idle" && updateStatus.state !== "checking" && updateStatus.state !== "development" && (
+          <div className="glass-float absolute right-5 bottom-5 z-50 flex max-w-sm items-center gap-3 rounded-xl px-3 py-2.5 text-sm shadow-xl">
+            <span className="min-w-0 flex-1">
+              {updateStatus.state === "available" && t("updateAvailable", { version: updateStatus.version ?? "" })}
+              {updateStatus.state === "downloading" && t("downloadingUpdate", { percent: updateStatus.percent ?? 0 })}
+              {updateStatus.state === "ready" && t("updateAvailable", { version: updateStatus.version ?? "" })}
+              {updateStatus.state === "error" && t("updateFailed")}
+            </span>
+            {updateStatus.state === "available" && <button onClick={() => void getInDeckBridge()?.downloadUpdate()} className="rounded-lg bg-primary px-2.5 py-1.5 text-xs font-medium text-primary-foreground">{t("downloadUpdate")}</button>}
+            {updateStatus.state === "ready" && <button onClick={() => void getInDeckBridge()?.installUpdate()} className="rounded-lg bg-primary px-2.5 py-1.5 text-xs font-medium text-primary-foreground">{t("restartToUpdate")}</button>}
+          </div>
+        )}
       </main>
 
       {inspectorOpen && inspectorTarget && (

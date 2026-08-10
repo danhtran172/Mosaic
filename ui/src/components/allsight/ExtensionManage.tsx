@@ -4,8 +4,10 @@ import { useAllsight } from "@/lib/allsight/store";
 import { cn } from "@/lib/utils";
 import { LockOverlay } from "./LockOverlay";
 import { getInDeckBridge, type DetectedBrowser } from "@/lib/indeck/bridge";
+import { useT } from "@/lib/allsight/i18n";
 
 export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => void; unlockedFolderIds: string[] }) {
+  const t = useT();
   const { state, setExtensionGallerySlots } = useAllsight();
   const [query, setQuery] = useState("");
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -20,9 +22,9 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
       setBrowsers(await bridge.detectBrowsers());
       setBrowserMessage("");
     } catch {
-      setBrowserMessage("Không thể kiểm tra browser trên thiết bị này.");
+      setBrowserMessage(t("browserCheckFailed"));
     }
-  }, []);
+  }, [t]);
   useEffect(() => { void refreshBrowsers(); }, [refreshBrowsers]);
   const galleries = useMemo(
     () =>
@@ -51,12 +53,12 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
           onClick={onBack}
           className="glass-btn inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium"
         >
-          <ArrowLeft className="size-4" /> Back to library
+          <ArrowLeft className="size-4" /> {t("backToLibrary")}
         </button>
         <div>
-          <h1 className="font-display text-lg font-semibold">Mosaic Extention Manage</h1>
+          <h1 className="font-display text-lg font-semibold">{t("extensionManager")}</h1>
           <p className="text-xs text-muted-foreground">
-            Set the four Gallery targets used by Mosaic Extention.
+            {t("extensionManagerHint")}
           </p>
         </div>
       </header>
@@ -64,31 +66,31 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
         <section className="glass-panel rounded-2xl p-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <h2 className="flex items-center gap-2 font-display text-base font-semibold"><Globe2 className="size-4 text-primary" /> Cài Mosaic Extension</h2>
-              <p className="mt-1 text-xs text-muted-foreground">Mosaic phát hiện browser đã cài và mở trang Store tương ứng. Browser sẽ luôn yêu cầu bạn xác nhận cài Extension.</p>
+              <h2 className="flex items-center gap-2 font-display text-base font-semibold"><Globe2 className="size-4 text-primary" /> {t("installExtension")}</h2>
+              <p className="mt-1 text-xs text-muted-foreground">{t("installExtensionHint")}</p>
             </div>
-            <button onClick={() => void refreshBrowsers()} className="glass-btn inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"><RefreshCw className="size-3.5" /> Kiểm tra lại</button>
+            <button onClick={() => void refreshBrowsers()} className="glass-btn inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"><RefreshCw className="size-3.5" /> {t("refresh")}</button>
           </div>
           <div className="mt-3 grid gap-2 sm:grid-cols-3">
             {browsers.map((browser) => (
               <div key={browser.id} className="flex items-center gap-3 rounded-xl border border-border/65 bg-background/35 px-3 py-2.5">
                 <span className={cn("grid size-8 place-items-center rounded-lg", browser.installed ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground")}><Globe2 className="size-4" /></span>
-                <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{browser.name}</p><p className="text-[11px] text-muted-foreground">{browser.installed ? "Đã phát hiện" : "Chưa cài"}</p></div>
+                <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{browser.name}</p><p className="text-[11px] text-muted-foreground">{browser.installed ? t("detected") : t("notInstalled")}</p></div>
                 <button
                   disabled={!browser.installed || openingBrowser === browser.id}
                   onClick={() => void (async () => {
                     const bridge = getInDeckBridge();
                     if (!bridge) return;
                     setOpeningBrowser(browser.id);
-                    try { await bridge.openExtensionInstall(browser.id); setBrowserMessage(`Đã mở Store cho ${browser.name}.`); }
-                    catch { setBrowserMessage(`Không thể mở Store cho ${browser.name}.`); }
+                    try { await bridge.openExtensionInstall(browser.id); setBrowserMessage(t("browserStoreOpened", { browser: browser.name })); }
+                    catch { setBrowserMessage(t("browserStoreOpenFailed", { browser: browser.name })); }
                     finally { setOpeningBrowser(null); }
                   })()}
                   className="glass-btn inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs disabled:cursor-not-allowed disabled:opacity-40"
-                ><ExternalLink className="size-3" /> Cài</button>
+                ><ExternalLink className="size-3" /> {t("install")}</button>
               </div>
             ))}
-            {!browsers.length && <p className="text-xs text-muted-foreground">Đang kiểm tra Google Chrome, Microsoft Edge và Brave…</p>}
+            {!browsers.length && <p className="text-xs text-muted-foreground">{t("checkingBrowsers")}</p>}
           </div>
           {browserMessage && <p className="mt-2 text-xs text-muted-foreground">{browserMessage}</p>}
         </section>
@@ -99,7 +101,7 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search Gallery"
+                placeholder={t("searchGalleries")}
                 className="min-w-0 flex-1 bg-transparent text-sm outline-none"
               />
             </label>
@@ -141,10 +143,9 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
           </section>
           <section className="flex min-w-0 flex-1 flex-col p-5">
             <div>
-              <h2 className="font-display text-lg font-semibold">Extension Gallery slots</h2>
+              <h2 className="font-display text-lg font-semibold">{t("extensionGallerySlots")}</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Drag a Gallery from the left into a slot. The active Gallery is the one currently
-                being dragged.
+                {t("extensionGallerySlotsHint")}
               </p>
             </div>
             <div className="mt-5 grid min-h-0 flex-1 grid-cols-1 grid-rows-4 gap-3">
@@ -190,12 +191,12 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
                       </span>
                     )}
                     <div className="relative min-w-0">
-                      <span className="text-xs text-muted-foreground">Slot {index + 1}</span>
+                      <span className="text-xs text-muted-foreground">{t("slot", { number: index + 1 })}</span>
                       <p className="truncate text-sm font-semibold">
-                        {gallery?.name ?? "Drop Gallery here"}
+                        {gallery?.name ?? t("dropGalleryHere")}
                       </p>
                       <p className="mt-1 text-xs text-muted-foreground">
-                        {gallery ? "Images dropped here are saved and added to this Gallery." : ""}
+                        {gallery ? t("droppedImagesSaved") : ""}
                       </p>
                     </div>
                     {gallery && (

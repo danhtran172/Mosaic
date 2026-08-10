@@ -19,6 +19,14 @@ contextBridge.exposeInMainWorld('vision', {
   createProfileShortcut: profileId => ipcRenderer.invoke('profiles:create-shortcut', profileId),
   detectBrowsers: () => ipcRenderer.invoke('extension:browsers'),
   openExtensionInstall: browserId => ipcRenderer.invoke('extension:install', browserId),
+  checkForUpdates: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  onUpdateStatus: callback => {
+    const listener = (_, status) => callback(status);
+    ipcRenderer.on('update:status', listener);
+    return () => ipcRenderer.removeListener('update:status', listener);
+  },
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   isWindowMaximized: () => ipcRenderer.invoke('window:is-maximized'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
