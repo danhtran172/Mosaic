@@ -22,6 +22,7 @@ const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
 const DEFAULT_PROFILE_ID = 'default';
 const NATIVE_HOST_NAME = 'com.indeck.mastervision';
 const EXTENSION_ID = 'fpbeciobaoekefhhjjenfomhkffmejah';
+const EXTENSION_STORE_URL = `https://chromewebstore.google.com/detail/${EXTENSION_ID}`;
 const profileWindows = new Map();
 const webContentsProfileIds = new Map();
 const profileWatchers = new Map();
@@ -499,6 +500,44 @@ function assetIdFor(source, relativePath) {
 }
 function runFileCommand(command, args) {
   return new Promise(resolve => execFile(command, args, { windowsHide: true }, (error, stdout) => resolve({ error, stdout: String(stdout || '') })));
+}
+async function registryApplicationPath(executable) {
+  const keys = [
+    `HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${executable}`,
+    `HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${executable}`,
+    `HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${executable}`,
+  ];
+  for (const key of keys) {
+    const result = await runFileCommand('reg', ['query', key, '/ve']);
+    const found = result.stdout.match(/REG_SZ\s+(.+)$/m)?.[1]?.trim().replace(/^"|"$/g, '');
+    if (found && fs.existsSync(found)) return found;
+  }
+  return null;
+}
+async function detectBrowsers() {
+  const programFiles = [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA].filter(Boolean);
+  const definitions = [
+    { id: 'chrome', name: 'Google Chrome', executable: 'chrome.exe', folders: ['Google\\Chrome\\Application\\chrome.exe'] },
+    { id: 'edge', name: 'Microsoft Edge', executable: 'msedge.exe', folders: ['Microsoft\\Edge\\Application\\msedge.exe'] },
+    { id: 'brave', name: 'Brave', executable: 'brave.exe', folders: ['BraveSoftware\\Brave-Browser\\Application\\brave.exe'] },
+  ];
+  return Promise.all(definitions.map(async (browser) => {
+    const registryPath = await registryApplicationPath(browser.executable);
+    const knownPath = registryPath || programFiles
+      .flatMap(folder => browser.folders.map(relative => path.join(folder, relative)))
+      .find(candidate => fs.existsSync(candidate)) || null;
+    return { id: browser.id, name: browser.name, installed: Boolean(knownPath), path: knownPath };
+  }));
+}
+async function openExtensionInstall(browserId) {
+  const browser = (await detectBrowsers()).find(item => item.id === String(browserId));
+  if (!browser?.installed) throw new Error('Browser is not installed');
+  // Chromium browsers require the user to approve the store installation. The
+  // app deliberately opens the official page instead of changing browser
+  // profiles or policies behind the user’s back.
+  const launched = await runFileCommand(browser.path, [EXTENSION_STORE_URL]);
+  if (launched.error) await shell.openExternal(EXTENSION_STORE_URL);
+  return { opened: true, storeUrl: EXTENSION_STORE_URL };
 }
 function fileIdFromOutput(output) {
   const matches = String(output).match(/0x[0-9a-f]+/gi);
@@ -1171,10 +1210,17 @@ async function registerNativeMessagingHost() {
   };
   await fs.promises.mkdir(path.dirname(manifestPath), { recursive: true });
   await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-  const key = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`;
-  const result = await runFileCommand('reg', ['add', key, '/ve', '/t', 'REG_SZ', '/d', manifestPath, '/f']);
-  if (result.error) throw new Error('Could not register the Chrome native messaging host');
-  return { installed: true, manifestPath };
+  const registryKeys = [
+    `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
+    `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
+    `HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
+  ];
+  const registrations = await Promise.all(registryKeys.map(async key => {
+    const result = await runFileCommand('reg', ['add', key, '/ve', '/t', 'REG_SZ', '/d', manifestPath, '/f']);
+    return { key, installed: !result.error };
+  }));
+  if (!registrations.some(item => item.installed)) throw new Error('Could not register the native messaging host');
+  return { installed: true, manifestPath, registrations };
 }
 function writeNativeMessage(value) {
   const payload = Buffer.from(JSON.stringify(value), 'utf8');
@@ -1428,6 +1474,8 @@ app.whenReady().then(async () => {
     return { id: String(profileId), focused: !window.isDestroyed() };
   });
   ipcMain.handle('profiles:create-shortcut', async (_, profileId) => createProfileShortcut(profileId));
+  ipcMain.handle('extension:browsers', async () => detectBrowsers());
+  ipcMain.handle('extension:install', async (_, browserId) => openExtensionInstall(browserId));
   ipcMain.handle('window:minimize', event => BrowserWindow.fromWebContents(event.sender)?.minimize());
   ipcMain.handle('window:is-maximized', event => Boolean(BrowserWindow.fromWebContents(event.sender)?.isMaximized()));
   ipcMain.handle('window:toggle-maximize', event => {

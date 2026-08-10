@@ -1,14 +1,29 @@
-import { useMemo, useState } from "react";
-import { ArrowLeft, Folder, Lock, Search, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { ArrowLeft, ExternalLink, Folder, Globe2, Lock, RefreshCw, Search, X } from "lucide-react";
 import { useAllsight } from "@/lib/allsight/store";
 import { cn } from "@/lib/utils";
 import { LockOverlay } from "./LockOverlay";
+import { getInDeckBridge, type DetectedBrowser } from "@/lib/indeck/bridge";
 
 export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => void; unlockedFolderIds: string[] }) {
   const { state, setExtensionGallerySlots } = useAllsight();
   const [query, setQuery] = useState("");
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [over, setOver] = useState<number | null>(null);
+  const [browsers, setBrowsers] = useState<DetectedBrowser[]>([]);
+  const [browserMessage, setBrowserMessage] = useState("");
+  const [openingBrowser, setOpeningBrowser] = useState<string | null>(null);
+  const refreshBrowsers = useCallback(async () => {
+    const bridge = getInDeckBridge();
+    if (!bridge) return;
+    try {
+      setBrowsers(await bridge.detectBrowsers());
+      setBrowserMessage("");
+    } catch {
+      setBrowserMessage("Không thể kiểm tra browser trên thiết bị này.");
+    }
+  }, []);
+  useEffect(() => { void refreshBrowsers(); }, [refreshBrowsers]);
   const galleries = useMemo(
     () =>
       state.folders.filter((folder) =>
@@ -45,7 +60,38 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
           </p>
         </div>
       </header>
-      <main className="flex min-h-0 flex-1 p-4">
+      <main className="flex min-h-0 flex-1 flex-col gap-4 p-4">
+        <section className="glass-panel rounded-2xl p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="flex items-center gap-2 font-display text-base font-semibold"><Globe2 className="size-4 text-primary" /> Cài Mosaic Extension</h2>
+              <p className="mt-1 text-xs text-muted-foreground">Mosaic phát hiện browser đã cài và mở trang Store tương ứng. Browser sẽ luôn yêu cầu bạn xác nhận cài Extension.</p>
+            </div>
+            <button onClick={() => void refreshBrowsers()} className="glass-btn inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"><RefreshCw className="size-3.5" /> Kiểm tra lại</button>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-3">
+            {browsers.map((browser) => (
+              <div key={browser.id} className="flex items-center gap-3 rounded-xl border border-border/65 bg-background/35 px-3 py-2.5">
+                <span className={cn("grid size-8 place-items-center rounded-lg", browser.installed ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground")}><Globe2 className="size-4" /></span>
+                <div className="min-w-0 flex-1"><p className="truncate text-sm font-medium">{browser.name}</p><p className="text-[11px] text-muted-foreground">{browser.installed ? "Đã phát hiện" : "Chưa cài"}</p></div>
+                <button
+                  disabled={!browser.installed || openingBrowser === browser.id}
+                  onClick={() => void (async () => {
+                    const bridge = getInDeckBridge();
+                    if (!bridge) return;
+                    setOpeningBrowser(browser.id);
+                    try { await bridge.openExtensionInstall(browser.id); setBrowserMessage(`Đã mở Store cho ${browser.name}.`); }
+                    catch { setBrowserMessage(`Không thể mở Store cho ${browser.name}.`); }
+                    finally { setOpeningBrowser(null); }
+                  })()}
+                  className="glass-btn inline-flex h-8 items-center gap-1 rounded-lg px-2 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                ><ExternalLink className="size-3" /> Cài</button>
+              </div>
+            ))}
+            {!browsers.length && <p className="text-xs text-muted-foreground">Đang kiểm tra Google Chrome, Microsoft Edge và Brave…</p>}
+          </div>
+          {browserMessage && <p className="mt-2 text-xs text-muted-foreground">{browserMessage}</p>}
+        </section>
         <div className="flex min-h-0 w-full overflow-hidden rounded-2xl border border-border/65 bg-secondary/15">
           <section className="flex w-[32%] min-w-72 flex-col border-r border-border/65 p-4">
             <label className="flex items-center gap-2 rounded-lg border border-border/70 bg-background/45 px-2.5 py-2">

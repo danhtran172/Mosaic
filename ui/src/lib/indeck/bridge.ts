@@ -25,6 +25,13 @@ export type InDeckLibraryLocationStatus = {
   sharedWith: Array<{ id: string; name: string }>;
 };
 
+export type DetectedBrowser = {
+  id: "chrome" | "edge" | "brave";
+  name: string;
+  installed: boolean;
+  path: string | null;
+};
+
 export type InDeckBridge = {
   readLibrarySnapshot: () => Promise<InDeckSnapshot>;
   writeStore: (value: unknown) => Promise<void>;
@@ -41,6 +48,8 @@ export type InDeckBridge = {
   recoverProfileLibrary: (profileId: string) => Promise<{ mediaPath: string; repairedDefaults: boolean }>;
   openProfile: (profileId: string) => Promise<{ id: string; focused: boolean }>;
   createProfileShortcut: (profileId: string) => Promise<string>;
+  detectBrowsers: () => Promise<DetectedBrowser[]>;
+  openExtensionInstall: (browserId: DetectedBrowser["id"]) => Promise<{ opened: boolean; storeUrl: string }>;
   minimizeWindow: () => Promise<void>;
   isWindowMaximized: () => Promise<boolean>;
   toggleMaximizeWindow: () => Promise<boolean>;

@@ -8,12 +8,57 @@
     "build:ui": "npm --prefix ui run build",
     "prestart": "npm run build:ui",
     "start": "electron .",
-    "dev": "electron ."
+    "dev": "electron .",
+    "package:extension": "node scripts/package-extension.cjs",
+    "dist:win": "npm run build:ui && npm run package:extension && electron-builder --win nsis --x64"
   },
   "devDependencies": {
-    "electron": "^32.2.7"
+    "electron": "^32.2.7",
+    "electron-builder": "^26.0.12"
   },
   "dependencies": {
     "ffmpeg-static": "^5.3.0"
+  },
+  "build": {
+    "appId": "com.danhtran.mosaic",
+    "productName": "Mosaic",
+    "artifactName": "Mosaic-Setup-${version}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "ui/dist/**/*",
+      "assets/**/*",
+      "node_modules/**/*",
+      "!.tmp-video-thumb-test/**",
+      "!release/**"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "assets/app-icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "uninstallDisplayName": "Mosaic",
+      "include": "build/installer.nsh"
+    }
   }
 }

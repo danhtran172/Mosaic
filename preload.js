@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('vision', {
   recoverProfileLibrary: profileId => ipcRenderer.invoke('profiles:recover-library', profileId),
   openProfile: profileId => ipcRenderer.invoke('profiles:open', profileId),
   createProfileShortcut: profileId => ipcRenderer.invoke('profiles:create-shortcut', profileId),
+  detectBrowsers: () => ipcRenderer.invoke('extension:browsers'),
+  openExtensionInstall: browserId => ipcRenderer.invoke('extension:install', browserId),
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   isWindowMaximized: () => ipcRenderer.invoke('window:is-maximized'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
