@@ -50,6 +50,7 @@ const DWELL_MS = 500; // hovering an insertion point this long widens the gap
 const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
 const DEFAULT_ITEMS_PER_ROW = 5;
+const MAX_GALLERY_ROW_HEIGHT = 260;
 
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
@@ -74,7 +75,7 @@ function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
     const gaps = GAP * (row.length - 1);
     const availableWidth = Math.max(width - gaps, 80);
     const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
-    const height = availableWidth / totalRatio;
+    const height = Math.min(availableWidth / totalRatio, MAX_GALLERY_ROW_HEIGHT);
     return {
       height,
       items: row.map((item) => ({ item, width: mediaRatio(item) * height })),
