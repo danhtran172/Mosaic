@@ -5,7 +5,7 @@ import { Chip, PropertyPicker } from "./PropertyPicker";
 /** Edit the auto-tags of a personal folder across every property group. */
 export function AutoTagEditor({ folderId }: { folderId: string }) {
   const t = useT();
-  const { state, updateFolder } = useAllsight();
+  const { state, updateFolder, createPropertyValue } = useAllsight();
   const folder = state.folders.find((f) => f.id === folderId);
   if (!folder) return null;
 
@@ -36,7 +36,7 @@ export function AutoTagEditor({ folderId }: { folderId: string }) {
                 align="end"
                 options={g.values.filter((v) => !current.includes(v)).map((v) => ({ id: v, label: v }))}
                 onSelect={(v) => setValues(g.id, Array.from(new Set([...current, v])))}
-                onCreate={(v) => setValues(g.id, Array.from(new Set([...current, v])))}
+                onCreate={(v) => { createPropertyValue(g.id, v); setValues(g.id, Array.from(new Set([...current, v]))); }}
               />
             </div>
             <div className="flex flex-wrap gap-1.5">

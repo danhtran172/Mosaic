@@ -1,4 +1,7 @@
-const NATIVE_HOST_NAME = 'com.indeck.mastervision';
+// A single extension can talk to either the installed Mosaic app or MosaicTest.
+// The stored preference only makes the successful host the first attempt;
+// every request still falls back to the other compatible host.
+const NATIVE_HOST_NAMES = ['com.mosaic.app', 'com.mosaictest.app', 'com.indeck.mastervision'];
 const OFFSCREEN_URL = 'offscreen.html';
 let offscreenReady = false;
 
@@ -10,7 +13,7 @@ async function ensureClipboardDocument() {
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_URL,
     reasons: ['CLIPBOARD'],
-    justification: 'Copy an image dropped onto the Mosaic Extension copy target.'
+    justification: 'Copy an image dropped onto the Mosaic Extension copy target.',
   }).catch(error => {
     if (!/single offscreen document/i.test(String(error?.message || error))) throw error;
   });
@@ -26,49 +29,58 @@ function bytesToDataUrl(bytes, mime) {
 async function fetchImageData(url) {
   try {
     const response = await fetch(url);
-    if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('The dropped item is not an image');
+    if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) throw new Error('The dropped item is not an image.');
     const bytes = await response.arrayBuffer();
-    if (bytes.byteLength > 25 * 1024 * 1024) throw new Error('Image is too large to copy');
+    if (bytes.byteLength > 25 * 1024 * 1024) throw new Error('The image is too large to copy.');
     return { ok: true, dataUrl: bytesToDataUrl(bytes, response.headers.get('content-type').split(';')[0]) };
   } catch (error) { return { ok: false, error: error.message }; }
 }
 async function copyImageToClipboard({ url, dataUrl }) {
   try {
     const imageData = dataUrl || (await fetchImageData(url)).dataUrl;
-    if (!imageData) throw new Error('Không thể đọc dữ liệu ảnh.');
+    if (!imageData) throw new Error('Image data could not be read.');
     await ensureClipboardDocument();
     const result = await chrome.runtime.sendMessage({ type: 'offscreen-copy-image', dataUrl: imageData });
-    if (!result?.ok) throw new Error(result?.error || 'Không thể copy ảnh.');
+    if (!result?.ok) throw new Error(result?.error || 'The image could not be copied.');
     return { ok: true };
-  } catch (error) { return { ok: false, error: error.message || 'Không thể copy ảnh.' }; }
+  } catch (error) { return { ok: false, error: error.message || 'The image could not be copied.' }; }
 }
 
-function nativeRequest(message) {
+function requestFromHost(hostName, message) {
   return new Promise(resolve => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, response => {
+    chrome.runtime.sendNativeMessage(hostName, message, response => {
       const error = chrome.runtime.lastError;
-      if (error) return resolve({ ok: false, error: `${error.message}. Open Mosaic once after installing it, then reload this extension.` });
-      resolve(response || { ok: false, error: 'Mosaic did not return a response.' });
+      resolve(error ? { ok: false, error: error.message } : response || { ok: false, error: 'Mosaic did not return a response.' });
     });
   });
 }
-async function selectedProfileId() {
-  const value = await chrome.storage.local.get('indeckProfileId');
-  return value.indeckProfileId || null;
+async function nativeRequest(message, preferredHost = null) {
+  const hosts = [...new Set([preferredHost, ...NATIVE_HOST_NAMES].filter(Boolean))];
+  let lastError = 'The Mosaic Native Messaging Host is not available.';
+  for (const hostName of hosts) {
+    const response = await requestFromHost(hostName, message);
+    if (response?.ok) return { ...response, hostName };
+    lastError = response?.error || lastError;
+  }
+  return { ok: false, error: `${lastError}. Open Mosaic once after installing it, then reload this extension.` };
 }
-async function saveToInDeck(url, galleryId = null) {
-  const profileId = await selectedProfileId();
-  if (!profileId) return { ok: false, error: 'Chọn profile trong Extension Settings trước khi lưu.' };
-  const result = await nativeRequest({ type: 'media:import', profileId, url, galleryId });
+async function selectedProfile() {
+  const value = await chrome.storage.local.get(['indeckProfileId', 'mosaicProfileHost']);
+  return { id: value.indeckProfileId || null, hostName: value.mosaicProfileHost || null };
+}
+async function saveToMosaic(url, galleryId = null) {
+  const profile = await selectedProfile();
+  if (!profile.id) return { ok: false, error: 'Choose a profile in Extension Settings before saving.' };
+  const result = await nativeRequest({ type: 'media:import', profileId: profile.id, url, galleryId }, profile.hostName);
   if (!result.ok) return result;
-  if (result.saved !== true) return { ok: false, error: 'Ảnh chưa được xác nhận là đã lưu vào Library.' };
+  if (result.saved !== true) return { ok: false, error: 'The image was not confirmed in the Library.' };
   return { ok: true, saved: true, name: result.asset?.name, galleryId: result.galleryId || null };
 }
 async function extensionConfig() {
-  const profileId = await selectedProfileId();
-  if (!profileId) return { ok: false, error: 'Chọn profile trong Extension Settings trước.' };
-  const result = await nativeRequest({ type: 'profile:config', profileId });
-  if (result.ok) await chrome.storage.local.set({ indeckExtensionConfig: result });
+  const profile = await selectedProfile();
+  if (!profile.id) return { ok: false, error: 'Choose a profile in Extension Settings first.' };
+  const result = await nativeRequest({ type: 'profile:config', profileId: profile.id }, profile.hostName);
+  if (result.ok) await chrome.storage.local.set({ indeckExtensionConfig: result, mosaicProfileHost: result.hostName });
   return result;
 }
 async function setGallerySlot(index, galleryId) {
@@ -76,15 +88,16 @@ async function setGallerySlot(index, galleryId) {
   if (!current.ok) return current;
   const slots = [...(current.slots || [])];
   const gallery = (current.galleries || []).find(item => item.id === galleryId);
-  if (!gallery) return { ok: false, error: 'Gallery không còn khả dụng.' };
+  if (!gallery) return { ok: false, error: 'This Gallery is no longer available.' };
   const existing = slots.findIndex(item => item.id === galleryId);
   if (existing >= 0) slots.splice(existing, 1);
   slots[index] = gallery;
-  return nativeRequest({ type: 'profile:slots', profileId: await selectedProfileId(), galleryIds: slots.map(item => item?.id || null) });
+  const profile = await selectedProfile();
+  return nativeRequest({ type: 'profile:slots', profileId: profile.id, galleryIds: slots.map(item => item?.id || null) }, current.hostName || profile.hostName);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type === 'save-image' && message.url) saveToInDeck(message.url, message.galleryId).then(sendResponse);
+  if (message?.type === 'save-image' && message.url) saveToMosaic(message.url, message.galleryId).then(sendResponse);
   else if (message?.type === 'copy-image') copyImageToClipboard(message).then(sendResponse);
   else if (message?.type === 'get-extension-config') extensionConfig().then(sendResponse);
   else if (message?.type === 'set-gallery-slot') setGallerySlot(Number(message.index), message.galleryId).then(sendResponse);
@@ -94,11 +107,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({ id: 'save-image-to-indeck', title: 'Save image to Mosaic', contexts: ['image'] });
+  chrome.contextMenus.create({ id: 'save-image-to-mosaic', title: 'Save image to Mosaic', contexts: ['image'] });
 });
 chrome.runtime.onClicked?.addListener(() => chrome.runtime.openOptionsPage());
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'save-image-to-indeck') return;
-  const result = await saveToInDeck(info.srcUrl);
-  if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: 'web-extention-result', ...result });
+  if (info.menuItemId !== 'save-image-to-mosaic') return;
+  const result = await saveToMosaic(info.srcUrl);
+  if (tab?.id) chrome.tabs.sendMessage(tab.id, { type: 'mosaic-extension-result', ...result });
 });

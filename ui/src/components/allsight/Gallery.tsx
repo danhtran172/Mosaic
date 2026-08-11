@@ -19,6 +19,7 @@ import {
   Maximize2,
   Minimize2,
   Play,
+  Search,
   Tag,
   Trash2,
   Ungroup,
@@ -50,8 +51,6 @@ const HOLD_MS = 1500;
 const DWELL_MS = 500; // hovering an insertion point this long widens the gap
 const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
-const MIN_ITEMS_PER_ROW = 5;
-const MAX_GALLERY_ROW_HEIGHT = 260;
 
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
@@ -62,8 +61,13 @@ function mediaRatio(item: MediaItem) {
   return Math.max(0.12, Math.min(8, width / height));
 }
 
-function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
+function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: number): Row[] {
   if (!items.length) return [];
+  const maxHeight = Math.max(100, Math.min(400, targetHeight));
+  // At 175%/200% the old fixed five-card minimum kept the calculated row
+  // height below the selected value, making zoom-in appear broken. Fewer
+  // cards are allowed as the requested thumbnail height grows.
+  const minItemsPerRow = Math.max(1, Math.min(5, Math.floor(width / (maxHeight * 1.25))));
 
   // Keep at least five cards per regular row, then add more only when needed
   // to fill a wide Gallery without exceeding the visual max height. A fixed
@@ -76,8 +80,8 @@ function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
     row.push(item);
     ratio += mediaRatio(item);
     const gaps = GAP * (row.length - 1);
-    const fillsAtMaxHeight = ratio * MAX_GALLERY_ROW_HEIGHT + gaps >= width;
-    if (row.length >= MIN_ITEMS_PER_ROW && fillsAtMaxHeight) {
+    const fillsAtMaxHeight = ratio * maxHeight + gaps >= width;
+    if (row.length >= minItemsPerRow && fillsAtMaxHeight) {
       rows.push(row);
       row = [];
       ratio = 0;
@@ -89,7 +93,7 @@ function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
     const gaps = GAP * (row.length - 1);
     const availableWidth = Math.max(width - gaps, 80);
     const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
-    const height = Math.min(availableWidth / totalRatio, MAX_GALLERY_ROW_HEIGHT);
+    const height = Math.min(availableWidth / totalRatio, maxHeight);
     return {
       height,
       items: row.map((item) => ({ item, width: mediaRatio(item) * height })),
@@ -97,7 +101,7 @@ function equalJustifiedRows(items: MediaItem[], width: number): Row[] {
   });
 }
 
-function LazyThumbnail({ media, className }: { media: MediaItem; className: string }) {
+function LazyThumbnail({ media, className, priority = false }: { media: MediaItem; className: string; priority?: boolean }) {
   const { setMediaDimensions, setMediaPreview } = useAllsight();
   const target = useRef<HTMLSpanElement>(null);
 
@@ -106,9 +110,13 @@ function LazyThumbnail({ media, className }: { media: MediaItem; className: stri
     const bridge = getInDeckBridge();
     if (!bridge) return;
     let active = true;
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      observer.disconnect();
+    const requestId = priority ? `gallery:${media.id}:${media.modified}:${crypto.randomUUID()}` : undefined;
+    const load = () => {
+      // A virtual Gallery card can be unmounted while its thumbnail request is
+      // in flight.  `active` makes that request cancellable from the UI's
+      // point of view: its result is never committed once the card is gone.
+      // The main-process thumbnail pool remains bounded, so fast scrolling
+      // cannot create an unbounded amount of native image work.
       void bridge.ensureThumbnails([{
         id: media.id,
         path: media.path,
@@ -116,13 +124,25 @@ function LazyThumbnail({ media, className }: { media: MediaItem; className: stri
         modified: media.modified,
         vault: media.vault,
         contentUrl: media.contentUrl,
-      }]).then((urls) => {
+      }], requestId).then((urls) => {
         if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!);
       });
+    };
+    if (priority) {
+      load();
+      return () => {
+        active = false;
+        if (requestId) void bridge.cancelThumbnails(requestId);
+      };
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      load();
     }, { rootMargin: "600px 0px" });
     observer.observe(target.current);
-    return () => { active = false; observer.disconnect(); };
-  }, [media, setMediaPreview]);
+    return () => { active = false; observer.disconnect(); if (requestId) void bridge.cancelThumbnails(requestId); };
+  }, [media, priority, setMediaPreview]);
 
   if (media.url) return (
     <img
@@ -194,6 +214,9 @@ export function Gallery({
   // during Electron's first layout pass and must never shrink the whole grid
   // to the 320px safety minimum before the real width is available.
   const [width, setWidth] = useState(1000);
+  const [viewportHeight, setViewportHeight] = useState(700);
+  const [scrollTop, setScrollTop] = useState(0);
+  const scrollDirection = useRef<"up" | "down">("down");
   const [drag, setDrag] = useState<OrderEntry | null>(null);
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number } | null>(null);
   const [drop, setDrop] = useState<DropInfo>(null);
@@ -207,6 +230,17 @@ export function Gallery({
   const [addToGalleryFor, setAddToGalleryFor] = useState<string | null>(null);
   const [moveToGalleryFor, setMoveToGalleryFor] = useState<string | null>(null);
   const [addGroupToGalleryFor, setAddGroupToGalleryFor] = useState<string[] | null>(null);
+  const [galleryPickerQuery, setGalleryPickerQuery] = useState("");
+
+  const galleryPickerFolders = useMemo(() => {
+    const needle = galleryPickerQuery.trim().toLowerCase();
+    return state.folders.filter((folder) => !needle || folder.name.toLowerCase().includes(needle));
+  }, [galleryPickerQuery, state.folders]);
+  const galleryCover = (folderId: string) => {
+    const folder = state.folders.find((item) => item.id === folderId);
+    const media = state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0]));
+    return media?.url || (media?.type === "image" ? media.originalUrl || media.contentUrl || null : null);
+  };
 
   const pointerStart = useRef<{ x: number; y: number; entry: OrderEntry } | null>(null);
   const holdRef = useRef<{ key: string; start: number } | null>(null);
@@ -231,6 +265,8 @@ export function Gallery({
       if (measured <= 40) return;
       const next = Math.max(320, measured - 40);
       setWidth((current) => current === next ? current : next);
+      const nextHeight = Math.max(1, Math.floor(el.clientHeight));
+      setViewportHeight((current) => current === nextHeight ? current : nextHeight);
     };
     const ro = new ResizeObserver(measure);
     ro.observe(el);
@@ -706,7 +742,7 @@ export function Gallery({
         <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids); setSelected([]); }}>
           <Boxes className="size-4" /> Tạo group từ {ids.length} ảnh đã chọn
         </ContextMenuItem>
-        <ContextMenuItem className={menuItem} onSelect={() => setAddGroupToGalleryFor(ids)}>
+        <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(ids); }}>
           <FolderPlus className="size-4" /> Thêm {ids.length} ảnh vào Gallery
         </ContextMenuItem>
         {hasClipboard && (
@@ -721,7 +757,7 @@ export function Gallery({
             <ClipboardPaste className="size-4" /> Dán tag vào ảnh đã chọn
           </ContextMenuItem>
         )}
-        {currentFolderId && (
+        {currentFolderId ? (
           <>
             <ContextMenuSeparator />
             <ContextMenuItem
@@ -736,6 +772,20 @@ export function Gallery({
               })}
             >
               <EyeOff className="size-4" /> Ẩn {ids.length} ảnh khỏi Gallery
+            </ContextMenuItem>
+          </>
+        ) : (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              className={cn(menuItem, "text-destructive")}
+              onSelect={() => onConfirm({
+                title: `Ẩn ${ids.length} media khỏi Main Gallery?`,
+                description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
+                onConfirm: () => { hideMedia(ids); setSelected([]); },
+              })}
+            >
+              <EyeOff className="size-4" /> Ẩn {ids.length} media khỏi Main Gallery
             </ContextMenuItem>
           </>
         )}
@@ -828,7 +878,7 @@ export function Gallery({
             <ImageIcon className="size-4" /> {t("setFolderCover")}
           </ContextMenuItem>
         )}
-        <ContextMenuItem className={menuItem} onSelect={() => setAddToGalleryFor(m.id)}>
+        <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddToGalleryFor(m.id); }}>
           <FolderPlus className="size-4" /> {t("addToFolder")}
         </ContextMenuItem>
         {currentFolderId && (
@@ -849,15 +899,27 @@ export function Gallery({
             <EyeOff className="size-4" /> Ẩn ảnh khỏi Gallery
           </ContextMenuItem>
         )}
+        {!currentFolderId && (
+          <ContextMenuItem
+            className={cn(menuItem, "text-destructive")}
+            onSelect={() => onConfirm({
+              title: "Ẩn media khỏi Main Gallery?",
+              description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
+              onConfirm: () => hideMedia([m.id]),
+            })}
+          >
+            <EyeOff className="size-4" /> Ẩn media khỏi Main Gallery
+          </ContextMenuItem>
+        )}
         <ContextMenuItem
           className={cn(menuItem, "text-destructive")}
           onSelect={() => onConfirm({
-            title: "Xóa file ảnh",
-            description: "Xóa file gốc khỏi Folder nguồn. Thao tác này không thể hoàn tác.",
+            title: "Đưa file vào Thùng rác máy tính?",
+            description: "File gốc sẽ được chuyển vào Recycle Bin của Windows để có thể khôi phục.",
             onConfirm: () => {
               const bridge = getInDeckBridge();
               if (!bridge) return;
-              void bridge.permanentDelete({
+              void bridge.trashMedia({
                 id: m.id,
                 path: m.path,
                 vault: m.vault,
@@ -866,7 +928,7 @@ export function Gallery({
             },
           })}
         >
-          <Trash2 className="size-4" /> Xóa file ảnh
+          <Trash2 className="size-4" /> Đưa file vào Thùng rác máy tính
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -880,7 +942,7 @@ export function Gallery({
         <ContextMenuItem className={menuItem} onSelect={() => setSelected(group.memberIds)}>
           <Users className="size-4" /> {t("selectGroupImages")}
         </ContextMenuItem>
-        <ContextMenuItem className={menuItem} onSelect={() => setAddGroupToGalleryFor(group.memberIds)}>
+        <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(group.memberIds); }}>
           <FolderPlus className="size-4" /> {t("addGroupToFolder")}
         </ContextMenuItem>
         <ContextMenuItem
@@ -913,6 +975,7 @@ export function Gallery({
     badge?: number,
     stack?: MediaItem[],
     inGroupId?: string,
+    priorityThumbnail = false,
   ) => {
     const isSelected = selected.includes(m.id);
     const holding =
@@ -981,7 +1044,7 @@ export function Gallery({
                 />
               </div>
             ) : (
-              <LazyThumbnail media={m} className="size-full object-fill" />
+              <LazyThumbnail media={m} className="size-full object-fill" priority={priorityThumbnail} />
             )}
             {m.type === "video" && !stack && (
               <span className="glass-panel absolute top-1.5 left-1.5 grid size-6 place-items-center rounded-full">
@@ -1135,6 +1198,61 @@ export function Gallery({
     markedSections.add(block.section);
   });
 
+  // Large libraries used to build every justified row and every card at
+  // once.  Even though thumbnails were lazy, thousands of DOM nodes, menus,
+  // and event handlers still made opening and scrolling a Gallery janky.
+  // Keep the rich justified/group layout for ordinary Galleries, and switch
+  // to a windowed responsive grid for large ones.  The grid deliberately
+  // works with rows (not individual cards) so the number of mounted nodes is
+  // stable while scrolling and there are no blank strips at row boundaries.
+  type VirtualCell = {
+    item: MediaItem;
+    entry: OrderEntry;
+    badge?: number;
+    stack?: MediaItem[];
+    inGroupId?: string;
+    sectionLabel?: string;
+  };
+  const virtualCells: VirtualCell[] = [];
+  blocks.forEach((block) => {
+    let sectionLabel = block.sectionStart ? block.sectionLabel : undefined;
+    if (block.kind === "run") {
+      block.items.forEach((item, index) => {
+        virtualCells.push({
+          item,
+          entry: block.entries[index] ?? { kind: "media", id: item.id },
+          badge: block.badges[index],
+          stack: block.stacks[index],
+          sectionLabel,
+        });
+        sectionLabel = undefined;
+      });
+      return;
+    }
+    block.items.forEach((item) => {
+      virtualCells.push({
+        item,
+        entry: { kind: "media", id: item.id },
+        inGroupId: block.entry.id,
+        sectionLabel,
+      });
+      sectionLabel = undefined;
+    });
+  });
+  const shouldVirtualize = virtualCells.length > 160;
+  const virtualCardHeight = Math.max(100, Math.min(400, state.thumbHeight));
+  const virtualColumns = Math.max(1, Math.floor((width + GAP) / (virtualCardHeight * 1.25 + GAP)));
+  const virtualCardWidth = Math.max(80, (width - GAP * (virtualColumns - 1)) / virtualColumns);
+  const virtualRowHeight = virtualCardHeight + GAP;
+  const virtualRowCount = Math.ceil(virtualCells.length / virtualColumns);
+  // Two full screens on either side give thumbnail loading enough lead time
+  // without allowing a scroll fling to mount the entire Gallery.
+  const virtualScreenRows = Math.max(2, Math.ceil(viewportHeight / virtualRowHeight));
+  const virtualBehind = scrollDirection.current === "down" ? virtualScreenRows : virtualScreenRows * 2;
+  const virtualAhead = scrollDirection.current === "down" ? virtualScreenRows * 2 : virtualScreenRows;
+  const virtualFirstRow = Math.max(0, Math.floor(scrollTop / virtualRowHeight) - virtualBehind);
+  const virtualLastRow = Math.min(virtualRowCount, Math.ceil((scrollTop + viewportHeight) / virtualRowHeight) + virtualAhead);
+
   if (entries.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-16 text-center">
@@ -1148,12 +1266,51 @@ export function Gallery({
     <div
       ref={containerRef}
       onPointerDown={onBackgroundPointerDown}
+      onScroll={(event) => {
+        const next = event.currentTarget.scrollTop;
+        scrollDirection.current = next < scrollTop ? "up" : "down";
+        setScrollTop(next);
+      }}
       className="app-scroll relative min-w-0 flex-1 overflow-y-auto px-5 py-4"
     >
+      {shouldVirtualize ? (
+        <div ref={innerRef} className="relative w-full min-w-0" style={{ height: Math.max(0, virtualRowCount * virtualRowHeight - GAP) }}>
+          {Array.from({ length: Math.max(0, virtualLastRow - virtualFirstRow) }, (_, offset) => {
+            const rowIndex = virtualFirstRow + offset;
+            const cells = virtualCells.slice(rowIndex * virtualColumns, (rowIndex + 1) * virtualColumns);
+            const sectionLabel = cells.find((cell) => cell.sectionLabel)?.sectionLabel;
+            return (
+              <Fragment key={`virtual-${rowIndex}`}>
+                {sectionLabel && (
+                  <div className="absolute right-0 left-0" style={{ top: rowIndex * virtualRowHeight }}>
+                    <GroupDivider label={sectionLabel} />
+                  </div>
+                )}
+                <div
+                  data-library-row
+                  className="absolute right-0 left-0 flex"
+                  style={{ top: rowIndex * virtualRowHeight + (sectionLabel ? 28 : 0), gap: GAP, height: virtualCardHeight }}
+                >
+                  {cells.map((cell) => renderMedia(
+                    cell.item,
+                    cell.entry,
+                    virtualCardWidth,
+                    Math.max(72, virtualCardHeight - (sectionLabel ? 28 : 0)),
+                    cell.badge,
+                    cell.stack,
+                    cell.inGroupId,
+                    true,
+                  ))}
+                </div>
+              </Fragment>
+            );
+          })}
+        </div>
+      ) : (
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return equalJustifiedRows(block.items, width).map((row, ri) => {
+            return equalJustifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1187,7 +1344,7 @@ export function Gallery({
           }
           const group = state.groups.find((g) => g.id === block.entry.id)!;
           const gi = globalIndex(block.entry);
-          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100));
+          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight);
           const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
           const insertY =
             drop?.type === "insert" && drop.axis === "y"
@@ -1269,6 +1426,7 @@ export function Gallery({
           );
         })}
       </div>
+      )}
 
       {libraryRail && (
         <span
@@ -1303,12 +1461,15 @@ export function Gallery({
       <Dialog open={!!addToGalleryFor} onOpenChange={(open) => !open && setAddToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addToFolder")}</DialogTitle></DialogHeader>
+          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder="Tìm Gallery" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
           <div className="max-h-72 space-y-1 overflow-y-auto">
-            {state.folders.map((folder) => {
+            {galleryPickerFolders.map((folder) => {
               const alreadyAdded = !!addToGalleryFor && folder.mediaIds.includes(addToGalleryFor);
-              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}><Folder className="size-4 text-muted-foreground" /><span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">Đã thêm</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
+              const cover = galleryCover(folder.id);
+              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">Đã thêm</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
             })}
             {state.folders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Chưa có Gallery.</p>}
+            {state.folders.length > 0 && galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy Gallery.</p>}
           </div>
         </DialogContent>
       </Dialog>
@@ -1334,12 +1495,15 @@ export function Gallery({
       <Dialog open={!!addGroupToGalleryFor} onOpenChange={(open) => !open && setAddGroupToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addGroupToFolder")}</DialogTitle></DialogHeader>
+          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder="Tìm Gallery" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
           <div className="max-h-72 space-y-1 overflow-y-auto">
-            {state.folders.map((folder) => {
+            {galleryPickerFolders.map((folder) => {
               const mediaIds = addGroupToGalleryFor ?? [];
               const alreadyAdded = mediaIds.length > 0 && mediaIds.every((id) => folder.mediaIds.includes(id));
-              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (mediaIds.length) addToFolder(folder.id, mediaIds); setAddGroupToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}><Folder className="size-4 text-muted-foreground" /><span className="flex-1 truncate">{folder.name}</span><FolderPlus className="size-4 text-muted-foreground" /></button>;
+              const cover = galleryCover(folder.id);
+              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (mediaIds.length) addToFolder(folder.id, mediaIds); setAddGroupToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span><FolderPlus className="size-4 text-muted-foreground" /></button>;
             })}
+            {galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy Gallery.</p>}
           </div>
         </DialogContent>
       </Dialog>

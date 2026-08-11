@@ -39,6 +39,7 @@ export type UpdateStatus = {
 };
 
 export type InDeckBridge = {
+  getAppDisplayName: () => Promise<string>;
   readLibrarySnapshot: () => Promise<InDeckSnapshot>;
   writeStore: (value: unknown) => Promise<void>;
   listProfiles: () => Promise<InDeckProfile[]>;
@@ -70,14 +71,17 @@ export type InDeckBridge = {
   scanFolder: (source: unknown) => Promise<unknown>;
   cachedSource: (source: unknown) => Promise<unknown>;
   resolveSource: (source: unknown) => Promise<unknown>;
-  ensureThumbnails: (assets: unknown[]) => Promise<Record<string, string>>;
+  ensureThumbnails: (assets: unknown[], requestId?: string) => Promise<Record<string, string>>;
+  cancelThumbnails: (requestId: string) => Promise<void>;
+  syncMediaLocations: () => Promise<{ moved: unknown[]; skipped: unknown[]; conflicts: unknown[] }>;
   watchSources: (folders: string[]) => Promise<unknown>;
+  refreshSources: (folders: string[]) => Promise<unknown>;
   onFolderChanged: (callback: (folder: string) => void) => () => void;
   onMediaImported: (callback: (payload: unknown) => void) => () => void;
   copyImage: (asset: unknown) => Promise<boolean>;
   showInFolder: (asset: unknown) => Promise<boolean>;
   openWithDefaultApp: (asset: unknown) => Promise<boolean>;
-  permanentDelete: (asset: unknown) => Promise<boolean>;
+  trashMedia: (asset: unknown) => Promise<boolean>;
 };
 
 declare global {

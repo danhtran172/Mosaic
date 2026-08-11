@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('vision', {
+  getAppDisplayName: () => ipcRenderer.invoke('app:display-name'),
   readStore: () => ipcRenderer.invoke('store:read'),
   writeStore: value => ipcRenderer.invoke('store:write', value),
   readLibrarySnapshot: () => ipcRenderer.invoke('library:snapshot'),
@@ -38,9 +39,11 @@ contextBridge.exposeInMainWorld('vision', {
   cachedSource: source => ipcRenderer.invoke('source:catalog', source),
   removeCachedSource: sourceId => ipcRenderer.invoke('source:catalog-remove', sourceId),
   resolveSource: source => ipcRenderer.invoke('source:resolve', source),
-  ensureThumbnails: assets => ipcRenderer.invoke('thumbnails:ensure', assets),
+  ensureThumbnails: (assets, requestId) => ipcRenderer.invoke('thumbnails:ensure', assets, requestId),
+  cancelThumbnails: requestId => ipcRenderer.invoke('thumbnails:cancel', requestId),
   listVaultBridges: () => ipcRenderer.invoke('vault:bridges'),
-  syncMediaLocations: entries => ipcRenderer.invoke('media:sync-locations', entries),
+  syncMediaLocations: () => ipcRenderer.invoke('media:sync-locations'),
+  refreshSources: folders => ipcRenderer.invoke('sources:refresh', folders),
   watchSources: folders => ipcRenderer.invoke('sources:watch', folders),
   onFolderChanged: callback => {
     const listener = (_, folder) => callback(folder);
@@ -55,5 +58,5 @@ contextBridge.exposeInMainWorld('vision', {
   copyImage: asset => ipcRenderer.invoke('image:copy', asset),
   showInFolder: asset => ipcRenderer.invoke('image:show-in-folder', asset),
   openWithDefaultApp: asset => ipcRenderer.invoke('media:open-default', asset),
-  permanentDelete: asset => ipcRenderer.invoke('media:permanent-delete', asset)
+  trashMedia: asset => ipcRenderer.invoke('media:trash', asset)
 });

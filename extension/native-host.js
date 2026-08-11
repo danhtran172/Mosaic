@@ -5,7 +5,11 @@ const path = require('path');
 const crypto = require('crypto');
 
 const WEB_IMPORTS_SOURCE_ID = 'allsight-web-imports';
-const registryPath = path.join(process.env.APPDATA || process.env.USERPROFILE || '.', 'InDeck', 'profiles.json');
+const registryPaths = [
+  path.join(process.env.APPDATA || process.env.USERPROFILE || '.', 'Mosaic', 'profiles.json'),
+  // Source builds before the Mosaic rename stored profile data here.
+  path.join(process.env.APPDATA || process.env.USERPROFILE || '.', 'InDeck', 'profiles.json'),
+];
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif']);
 
 const ready = profile => Boolean(profile?.initialized && profile?.mediaPath);
@@ -17,12 +21,21 @@ function writeJson(file, value) {
   fs.writeFileSync(temp, JSON.stringify(value, null, 2));
   fs.renameSync(temp, file);
 }
+function registryPath() { return registryPaths.find(file => fs.existsSync(file)) || registryPaths[0]; }
 function registry() {
-  const value = readJson(registryPath, { profiles: [] });
+  const value = readJson(registryPath(), { profiles: [] });
   value.profiles = Array.isArray(value.profiles) ? value.profiles : [];
   return value;
 }
 function profiles() { return registry().profiles; }
+function profileAvailability(profile) {
+  if (!ready(profile)) return { available: false, reason: 'Default Library Location has not been configured.' };
+  let reachable = false;
+  try { reachable = fs.statSync(profile.mediaPath).isDirectory(); } catch { /* unavailable source */ }
+  return reachable
+    ? { available: true, reason: null }
+    : { available: false, reason: 'Mosaic cannot access this profile’s Library location.' };
+}
 function profileById(id) { return profiles().find(profile => String(profile.id) === String(id)); }
 function readLibrary(profile) { return readJson(path.join(profile.dataPath, 'library.json'), { sources: [], collections: [], assetMeta: {} }); }
 function writeLibrary(profile, data) { writeJson(path.join(profile.dataPath, 'library.json'), data); }
@@ -56,7 +69,7 @@ function recoverProfile(profile) {
   fs.mkdirSync(mediaPath, { recursive: true });
   fs.mkdirSync(defaultSave(stored), { recursive: true });
   fs.mkdirSync(discards(stored), { recursive: true });
-  if (changed) writeJson(registryPath, value);
+  if (changed) writeJson(registryPath(), value);
   return stored;
 }
 
@@ -171,7 +184,18 @@ async function importImage(profile, sourceUrl, galleryId) {
 }
 
 async function handle(message) {
-  if (message?.type === 'profiles:list') return { ok: true, profiles: profiles().filter(ready).map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) })) };
+  if (message?.type === 'profiles:list') return {
+    ok: true,
+    profiles: profiles()
+      .slice()
+      .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      .map(profile => ({
+        id: profile.id,
+        name: profile.name,
+        isDefault: Boolean(profile.isDefault),
+        ...profileAvailability(profile),
+      })),
+  };
   let profile = profileById(message?.profileId);
   if (!profile) throw new Error('The selected profile no longer exists');
   if (!ready(profile)) throw new Error('Finish Default Library Location setup before using this profile');

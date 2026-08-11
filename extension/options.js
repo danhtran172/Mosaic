@@ -1,55 +1,88 @@
-const NATIVE_HOST_NAME = 'com.indeck.mastervision';
+const NATIVE_HOST_NAMES = ['com.mosaic.app', 'com.mosaictest.app', 'com.indeck.mastervision'];
 const select = document.querySelector('#profile');
 const save = document.querySelector('#save');
 const status = document.querySelector('#status');
 const refresh = document.querySelector('#refresh');
 const connection = document.querySelector('#connection');
 
-function nativeRequest(message) {
+function requestFromHost(hostName, message) {
   return new Promise(resolve => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, response => {
+    chrome.runtime.sendNativeMessage(hostName, message, response => {
       const error = chrome.runtime.lastError;
       resolve(error ? { ok: false, error: error.message } : response || { ok: false, error: 'Mosaic did not return a response.' });
     });
   });
 }
+async function nativeRequest(message, preferredHost = null) {
+  const hosts = [...new Set([preferredHost, ...NATIVE_HOST_NAMES].filter(Boolean))];
+  let lastError = 'The Mosaic Native Messaging Host is not available.';
+  for (const hostName of hosts) {
+    const response = await requestFromHost(hostName, message);
+    if (response?.ok) return { ...response, hostName };
+    lastError = response?.error || lastError;
+  }
+  return { ok: false, error: lastError };
+}
 function setStatus(message, error = false) {
   status.textContent = message;
   status.classList.toggle('error', error);
-  connection.textContent = error ? 'Chưa kết nối' : 'Đã kết nối';
+  connection.textContent = error ? 'Not connected' : 'Connected';
   connection.dataset.state = error ? 'error' : 'ready';
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
 }
+function profileLabel(profile) {
+  const suffix = profile.isDefault ? ' (Default)' : '';
+  return `${profile.name}${suffix}${profile.available ? '' : ` — unavailable: ${profile.reason || 'Mosaic cannot access this profile.'}`}`;
+}
+function renderProfiles(profiles, selectedId) {
+  if (!profiles.length) {
+    select.innerHTML = '<option>No profiles found</option>';
+    select.disabled = true;
+    save.disabled = true;
+    return null;
+  }
+  select.innerHTML = profiles.map(profile => `<option value="${escapeHtml(profile.id)}"${profile.available ? '' : ' disabled'}>${escapeHtml(profileLabel(profile))}</option>`).join('');
+  const selected = profiles.find(profile => profile.id === selectedId && profile.available)
+    || profiles.find(profile => profile.available)
+    || null;
+  select.value = selected?.id || '';
+  select.disabled = !selected;
+  save.disabled = !selected;
+  return selected;
+}
 async function loadProfiles() {
   select.disabled = true;
   save.disabled = true;
   refresh.disabled = true;
-  connection.textContent = 'Đang kiểm tra';
+  connection.textContent = 'Checking';
   connection.dataset.state = 'loading';
-  const result = await nativeRequest({ type: 'profiles:list' });
+  const stored = await chrome.storage.local.get(['indeckProfileId', 'mosaicProfileHost', 'mosaicExtensionProfiles']);
+  const result = await nativeRequest({ type: 'profiles:list' }, stored.mosaicProfileHost);
   refresh.disabled = false;
   if (!result.ok) {
-    select.innerHTML = '<option>Không thể kết nối Mosaic</option>';
-    setStatus(result.error || 'Không thể kết nối Native Messaging Host.', true);
+    const cached = Array.isArray(stored.mosaicExtensionProfiles) ? stored.mosaicExtensionProfiles.map(profile => ({
+      ...profile,
+      available: false,
+      reason: 'Mosaic is not connected.',
+    })) : [];
+    renderProfiles(cached, stored.indeckProfileId);
+    setStatus(cached.length ? 'Mosaic is not connected. Cached profiles are shown but cannot be selected.' : result.error || 'Could not connect to Mosaic.', true);
     return;
   }
-  const saved = await chrome.storage.local.get('indeckProfileId');
-  if (!result.profiles.length) {
-    select.innerHTML = '<option>Chưa có profile sẵn sàng</option>';
-    setStatus('Hãy hoàn tất Default Library Location cho ít nhất một profile trong Mosaic.', true);
-    return;
-  }
-  select.innerHTML = result.profiles.map(profile => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name)}${profile.isDefault ? ' (Default)' : ''}</option>`).join('');
-  select.value = result.profiles.some(profile => profile.id === saved.indeckProfileId) ? saved.indeckProfileId : result.profiles[0]?.id || '';
-  select.disabled = !select.value;
-  save.disabled = !select.value;
-  setStatus(saved.indeckProfileId ? 'Đã tải lựa chọn hiện tại.' : 'Chọn một profile rồi lưu để bắt đầu.');
+  const profiles = (result.profiles || []).map(profile => ({ ...profile, available: profile.available !== false }));
+  await chrome.storage.local.set({ mosaicExtensionProfiles: profiles, mosaicProfileHost: result.hostName });
+  const selected = renderProfiles(profiles, stored.indeckProfileId);
+  if (!selected) setStatus('Profiles are listed, but none have an available Default Library Location.', true);
+  else setStatus(stored.indeckProfileId ? 'Current profile selection loaded.' : 'Choose a profile and save to begin.');
 }
 save.addEventListener('click', async () => {
-  await chrome.storage.local.set({ indeckProfileId: select.value });
-  setStatus(`Đã chọn profile “${select.options[select.selectedIndex].text}”.`);
+  const selected = select.options[select.selectedIndex];
+  if (!selected?.value || selected.disabled) return;
+  const stored = await chrome.storage.local.get('mosaicProfileHost');
+  await chrome.storage.local.set({ indeckProfileId: select.value, mosaicProfileHost: stored.mosaicProfileHost || null });
+  setStatus(`Selected profile: “${selected.text}”.`);
 });
 refresh.addEventListener('click', () => { void loadProfiles(); });
 void loadProfiles();

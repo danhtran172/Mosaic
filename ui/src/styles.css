@@ -119,6 +119,25 @@
   --sidebar-ring: oklch(0.58 0.068 150 / 50%);
 }
 
+/* The green palette is the default. A chosen color replaces the app's
+   semantic primary/accent variables in both light and dark appearances. */
+:root[data-theme-color="blue"] { --theme-primary: #0055DA; --theme-primary-foreground: #fff; }
+:root[data-theme-color="teal"] { --theme-primary: #76ABAE; --theme-primary-foreground: #102b2d; }
+:root[data-theme-color="pink"] { --theme-primary: #F5788B; --theme-primary-foreground: #42151e; }
+:root[data-theme-color="orange"] { --theme-primary: #F7A00A; --theme-primary-foreground: #3d2500; }
+:root[data-theme-color] {
+  --primary: var(--theme-primary);
+  --primary-foreground: var(--theme-primary-foreground);
+  --sidebar-primary: var(--theme-primary);
+  --sidebar-primary-foreground: var(--theme-primary-foreground);
+  --accent: color-mix(in srgb, var(--theme-primary) 18%, var(--background));
+  --accent-foreground: color-mix(in srgb, var(--theme-primary) 70%, var(--foreground));
+  --sidebar-accent: color-mix(in srgb, var(--theme-primary) 18%, var(--sidebar));
+  --sidebar-accent-foreground: color-mix(in srgb, var(--theme-primary) 70%, var(--sidebar-foreground));
+  --ring: color-mix(in srgb, var(--theme-primary) 55%, transparent);
+  --sidebar-ring: color-mix(in srgb, var(--theme-primary) 50%, transparent);
+}
+
 @layer base {
   * {
     border-color: var(--color-border);

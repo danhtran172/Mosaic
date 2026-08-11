@@ -22,7 +22,7 @@ function readBlobAsDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error('Không thể đọc dữ liệu ảnh.'));
+    reader.onerror = () => reject(new Error('Image data could not be read.'));
     reader.readAsDataURL(blob);
   });
 }
@@ -41,7 +41,7 @@ async function writeImageToClipboard(dataUrl) {
   canvas.height = bitmap.height;
   canvas.getContext('2d').drawImage(bitmap, 0, 0);
   const png = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-  if (!png) throw new Error('Không thể xử lý ảnh để copy.');
+  if (!png) throw new Error('The image could not be processed for copying.');
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
 }
 function showToast(message) {
@@ -55,24 +55,26 @@ function setSaving(slot, saving) {
   if (!slot) return;
   slot.classList.toggle('is-saving', saving);
   const label = slot.querySelector('.indeck-slot-copy strong');
-  if (saving && label) label.textContent = 'Đang lưu ảnh…';
+  if (saving && label) label.textContent = 'Saving image…';
 }
 async function saveImage(event, gallery, slot) {
   event.preventDefault();
   const url = dropUrl(event);
-  if (!isRemoteUrl(url)) { showToast('Ảnh này không có URL web để lưu vào Mosaic.'); removeZones(); return; }
+  if (!isRemoteUrl(url)) { showToast('This image has no web URL that Mosaic can save.'); removeZones(); return; }
   setSaving(slot, true);
-  const galleryId = gallery?.id || null;
   try {
-    const result = await chrome.runtime.sendMessage({ type: 'save-image', url, galleryId });
-    const target = result?.galleryId && gallery ? `Gallery “${gallery.name}”` : 'thư mục mặc định';
+    const result = await chrome.runtime.sendMessage({ type: 'save-image', url, galleryId: gallery?.id || null });
+    const target = result?.galleryId && gallery ? `Gallery “${gallery.name}”` : 'the default folder';
     const fileName = result?.name ? `“${result.name}” ` : '';
-    showToast(result?.ok && result?.saved === true ? `Đã lưu ${fileName}vào ${target}.` : (result?.error || 'Không thể lưu ảnh.'));
+    showToast(result?.ok && result?.saved === true ? `Saved ${fileName}to ${target}.` : (result?.error || 'The image could not be saved.'));
   } catch {
-    showToast('Không thể kết nối với Mosaic để lưu ảnh.');
+    showToast('Could not connect to Mosaic to save the image.');
   } finally {
     removeZones();
   }
+}
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 }
 function makeDropTarget({ kind, gallery, defaultFolder }) {
   const slot = document.createElement('button');
@@ -80,18 +82,18 @@ function makeDropTarget({ kind, gallery, defaultFolder }) {
   slot.className = `indeck-save-slot ${kind === 'default' ? 'indeck-default-slot' : ''} ${gallery ? 'has-gallery' : 'is-empty'}`;
   slot.dataset.galleryId = gallery?.id || '';
   slot.innerHTML = kind === 'default'
-    ? `<span class="indeck-slot-icon">⌁</span><span class="indeck-slot-copy"><strong>Lưu mặc định</strong><small>${defaultFolder?.name || 'DefaultSave'}</small></span>`
+    ? `<span class="indeck-slot-icon">⌁</span><span class="indeck-slot-copy"><strong>Save to default</strong><small>${defaultFolder?.name || 'DefaultSave'}</small></span>`
     : gallery
-      ? `<span class="indeck-slot-copy"><strong>${escapeHtml(gallery.name)}</strong><small>Thả ảnh để thêm vào Gallery</small></span>`
-      : `<span class="indeck-slot-add">＋</span><span class="indeck-slot-copy"><strong>Slot trống</strong><small>Kéo Gallery vào đây</small></span>`;
+      ? `<span class="indeck-slot-copy"><strong>${escapeHtml(gallery.name)}</strong><small>Drop an image to save it in this Gallery</small></span>`
+      : `<span class="indeck-slot-add">＋</span><span class="indeck-slot-copy"><strong>Empty slot</strong><small>Drag a Gallery here</small></span>`;
   slot.addEventListener('dragover', event => {
-    const galleryPayload = event.dataTransfer?.getData('application/x-indeck-gallery');
+    const galleryPayload = event.dataTransfer?.getData('application/x-mosaic-gallery');
     if (galleryPayload || draggedImageUrl) { event.preventDefault(); slot.classList.add('is-over'); }
   });
   slot.addEventListener('dragleave', () => slot.classList.remove('is-over'));
   slot.addEventListener('drop', async event => {
     slot.classList.remove('is-over');
-    const galleryPayload = event.dataTransfer?.getData('application/x-indeck-gallery');
+    const galleryPayload = event.dataTransfer?.getData('application/x-mosaic-gallery');
     if (kind !== 'default' && galleryPayload) {
       event.preventDefault();
       await replaceSlot(Number(slot.dataset.slotIndex), galleryPayload);
@@ -101,24 +103,22 @@ function makeDropTarget({ kind, gallery, defaultFolder }) {
   });
   return slot;
 }
-function escapeHtml(value) {
-  return String(value || '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
-}
 async function replaceSlot(index, galleryId) {
   const result = await chrome.runtime.sendMessage({ type: 'set-gallery-slot', index, galleryId });
-  if (!result?.ok) { showToast(result?.error || 'Không thể lưu Gallery vào slot.'); return; }
+  if (!result?.ok) { showToast(result?.error || 'The Gallery could not be saved to this slot.'); return; }
   renderSaveTray(result);
 }
 function renderSaveTray(config) {
   if (!saveTray) return;
   const slots = Array.isArray(config.slots) ? config.slots : [];
+  const mosaicIcon = chrome.runtime.getURL('icons/mosaic.png');
   saveTray.innerHTML = `
-    <div class="indeck-tray-title"><span>Mosaic</span><small>Thả ảnh vào đích muốn lưu</small></div>
+    <div class="indeck-tray-title"><img src="${mosaicIcon}" alt="" style="width:20px;height:20px;border-radius:6px;object-fit:cover"><span>Mosaic</span><small>Drop an image on a destination</small></div>
     <div class="indeck-save-targets"></div>
     <div class="indeck-gallery-row">
-      <label for="indeck-gallery-select">＋ Chọn Gallery để thêm slot</label>
-      <select id="indeck-gallery-select"><option value="">Chọn từ danh sách Gallery…</option>${(config.galleries || []).map(gallery => `<option value="${escapeHtml(gallery.id)}">${escapeHtml(gallery.name)}</option>`).join('')}</select>
-      <button type="button" id="indeck-gallery-list">Kéo Gallery</button>
+      <label for="indeck-gallery-select">＋ Add Gallery slot</label>
+      <select id="indeck-gallery-select"><option value="">Choose a Gallery…</option>${(config.galleries || []).map(gallery => `<option value="${escapeHtml(gallery.id)}">${escapeHtml(gallery.name)}</option>`).join('')}</select>
+      <button type="button" id="indeck-gallery-list">Drag Gallery</button>
     </div>
     <div class="indeck-gallery-picker" hidden></div>`;
   const targets = saveTray.querySelector('.indeck-save-targets');
@@ -131,17 +131,16 @@ function renderSaveTray(config) {
   const select = saveTray.querySelector('#indeck-gallery-select');
   select.addEventListener('change', async () => {
     if (!select.value) return;
-    const firstEmpty = slots.length < 4 ? slots.length : 3;
-    await replaceSlot(firstEmpty, select.value);
+    await replaceSlot(slots.length < 4 ? slots.length : 3, select.value);
   });
   const picker = saveTray.querySelector('.indeck-gallery-picker');
   saveTray.querySelector('#indeck-gallery-list').addEventListener('click', () => {
     picker.hidden = !picker.hidden;
-    picker.innerHTML = (config.galleries || []).map(gallery => `<button type="button" draggable="true" data-gallery-id="${escapeHtml(gallery.id)}">◇ <span>${escapeHtml(gallery.name)}</span></button>`).join('') || '<small>Chưa có Gallery khả dụng trong Mosaic.</small>';
+    picker.innerHTML = (config.galleries || []).map(gallery => `<button type="button" draggable="true" data-gallery-id="${escapeHtml(gallery.id)}">◇ <span>${escapeHtml(gallery.name)}</span></button>`).join('') || '<small>No Galleries are available in Mosaic.</small>';
     picker.querySelectorAll('[data-gallery-id]').forEach(item => item.addEventListener('dragstart', event => {
       draggingGallery = true;
       event.dataTransfer.effectAllowed = 'copy';
-      event.dataTransfer.setData('application/x-indeck-gallery', item.dataset.galleryId);
+      event.dataTransfer.setData('application/x-mosaic-gallery', item.dataset.galleryId);
     }));
   });
 }
@@ -160,9 +159,9 @@ function showCopyZone() {
       const fetched = await chrome.runtime.sendMessage({ type: 'get-image-data', url });
       dataUrl = fetched?.ok ? fetched.dataUrl : null;
     }
-    if (!dataUrl) { showToast('Không thể đọc dữ liệu ảnh để copy.'); removeZones(); return; }
+    if (!dataUrl) { showToast('Image data could not be read for copying.'); removeZones(); return; }
     const result = await chrome.runtime.sendMessage({ type: 'copy-image', url, dataUrl });
-    showToast(result?.ok ? 'Đã copy ảnh.' : (result?.error || 'Không thể copy ảnh.'));
+    showToast(result?.ok ? 'Image copied.' : (result?.error || 'The image could not be copied.'));
     removeZones();
   });
   document.documentElement.append(copyZone);
@@ -172,18 +171,15 @@ async function showSaveTray() {
   const request = ++saveTrayRequest;
   saveTray = document.createElement('section');
   saveTray.id = 'indeck-save-tray';
-  // Expose the targets immediately while the desktop bridge is loading.
   renderSaveTray({ defaultFolder: { name: 'DefaultSave' }, galleries: [], slots: [null, null, null, null] });
   document.documentElement.append(saveTray);
   const config = await chrome.runtime.sendMessage({ type: 'get-extension-config' });
   if (request !== saveTrayRequest || !draggedImageUrl || !saveTray) return;
-  if (!config?.ok) { return;
-    saveTray.innerHTML = '<div class="indeck-tray-loading">Mở ứng dụng Mosaic để chọn Gallery.</div>';
-    document.documentElement.append(saveTray);
+  if (!config?.ok) {
+    saveTray.innerHTML = '<div class="indeck-tray-loading">Open Mosaic and choose a destination profile in Extension Settings.</div>';
     return;
   }
   renderSaveTray(config);
-  document.documentElement.append(saveTray);
 }
 
 document.addEventListener('dragstart', event => {
@@ -198,5 +194,5 @@ document.addEventListener('dragend', () => {
   setTimeout(removeZones, 0);
 }, true);
 chrome.runtime.onMessage.addListener(message => {
-  if (message?.type === 'web-extention-result') showToast(message.ok && message.saved === true ? 'Đã lưu ảnh.' : (message.error || 'Không thể lưu ảnh.'));
+  if (message?.type === 'mosaic-extension-result') showToast(message.ok && message.saved === true ? 'Image saved.' : (message.error || 'The image could not be saved.'));
 });

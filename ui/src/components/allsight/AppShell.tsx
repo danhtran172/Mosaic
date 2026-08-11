@@ -57,6 +57,7 @@ export function AppShell() {
   const [propFilters, setPropFilters] = useState<Record<string, string[]>>({});
   const [galleryFilterIds, setGalleryFilterIds] = useState<string[]>([]);
   const [sourceFilterIds, setSourceFilterIds] = useState<string[]>([]);
+  const [invertAdvancedFilters, setInvertAdvancedFilters] = useState(false);
   const [groupBy, setGroupBy] = useState<MediaGroupBy[]>([]);
 
   const [selected, setSelected] = useState<string[]>([]);
@@ -77,6 +78,7 @@ export function AppShell() {
   const [currentProfile, setCurrentProfile] = useState<InDeckProfile | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ state: "idle" });
   const previousFolderLocks = useRef(new Map<string, boolean>());
+  const startupLockApplied = useRef(false);
 
   useEffect(() => {
     const bridge = getInDeckBridge();
@@ -97,6 +99,14 @@ export function AppShell() {
   const folder = view.kind === "folder" ? state.folders.find((f) => f.id === view.id) ?? null : null;
   const folderLocked = !!folder?.locked && !unlockedFolders.includes(folder.id);
   const requiresFolderPassword = Boolean(state.password && state.requirePasswordToUnlockGallery);
+
+  // App locking is persistent, unlike Gallery unlock grants. Once the
+  // profile state arrives from disk, every new app session starts locked.
+  useEffect(() => {
+    if (startupLockApplied.current || !state.password) return;
+    startupLockApplied.current = true;
+    if (state.appLockEnabled) setLocked(true);
+  }, [state.appLockEnabled, state.password]);
 
   // Gallery source only exists for Main Gallery. Do not keep a hidden grouping
   // active after navigating into an individual Gallery.
@@ -190,33 +200,35 @@ export function AppShell() {
       if (filter === "favorites" && !m.favorite) return false;
       if (filter === "images" && m.type !== "image") return false;
       if (filter === "videos" && m.type !== "video") return false;
-      for (const [gid, vals] of Object.entries(propFilters)) {
-        if (!vals.length) continue;
-        if (folder?.managedGroupIds?.length && !folder.managedGroupIds.includes(gid)) continue;
-        if (folder?.disabledGeneralGroupIds?.includes(gid) || folder?.disabledGalleryGroupIds?.includes(gid)) continue;
-        // In Main Gallery, a Property must not affect media whose only
-        // Gallery owners have explicitly disabled that Property.
-        if (!folder && providers.length > 0 && providers.every((provider) =>
-          (provider.disabledGeneralGroupIds ?? []).includes(gid) || (provider.disabledGalleryGroupIds ?? []).includes(gid),
-        )) continue;
-        const own = m.props[gid] ?? [];
-        if (!vals.some((v) => own.includes(v))) return false;
-      }
-      if (galleryFilterIds.length && !providers.some((f) => galleryFilterIds.includes(f.id))) return false;
-      if (sourceFilterIds.length) {
-        const matchesSource = sourceFilterIds.includes(m.sourceId);
-        const matchesOther = !!folder
-          && sourceFilterIds.includes(OTHER_MEDIA_SOURCE_ID)
-          && !(folder.sourceIds ?? []).includes(m.sourceId);
-        if (!matchesSource && !matchesOther) return false;
-      }
+       const hasAdvancedFilters = Object.values(propFilters).some((values) => values.length) || galleryFilterIds.length > 0 || sourceFilterIds.length > 0;
+       let matchesAdvanced = true;
+       for (const [gid, vals] of Object.entries(propFilters)) {
+         if (!vals.length) continue;
+         if (folder?.managedGroupIds?.length && !folder.managedGroupIds.includes(gid)) continue;
+         if (folder?.disabledGeneralGroupIds?.includes(gid) || folder?.disabledGalleryGroupIds?.includes(gid)) continue;
+         // In Main Gallery, a Property must not affect media whose only
+         // Gallery owners have explicitly disabled that Property.
+         if (!folder && providers.length > 0 && providers.every((provider) =>
+           (provider.disabledGeneralGroupIds ?? []).includes(gid) || (provider.disabledGalleryGroupIds ?? []).includes(gid),
+         )) continue;
+         if (!vals.some((v) => (m.props[gid] ?? []).includes(v))) matchesAdvanced = false;
+       }
+       if (galleryFilterIds.length && !providers.some((f) => galleryFilterIds.includes(f.id))) matchesAdvanced = false;
+       if (sourceFilterIds.length) {
+         const matchesSource = sourceFilterIds.includes(m.sourceId);
+         const matchesOther = !!folder
+           && sourceFilterIds.includes(OTHER_MEDIA_SOURCE_ID)
+           && !(folder.sourceIds ?? []).includes(m.sourceId);
+         if (!matchesSource && !matchesOther) matchesAdvanced = false;
+       }
+       if (hasAdvancedFilters && (invertAdvancedFilters ? matchesAdvanced : !matchesAdvanced)) return false;
       if (q) {
         const hay = [m.name, ...Object.values(m.props).flat()].join(" ").toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     };
-  }, [filter, folder, galleryFilterIds, propFilters, query, sourceFilterIds, state, unlockedFolders]);
+  }, [filter, folder, galleryFilterIds, invertAdvancedFilters, propFilters, query, sourceFilterIds, state, unlockedFolders]);
 
   // Keep member Media Groups aligned with the current view. The group itself
   // stays in order when at least one member passes, but Gallery must receive
@@ -329,7 +341,7 @@ export function AppShell() {
             })}
             className="w-full rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary"
           >
-            {t("unlock")}
+            {t("unlockApp")}
           </button>
         </div>
       </div>
@@ -376,9 +388,11 @@ export function AppShell() {
           folder={folder}
           galleryFilterIds={galleryFilterIds}
           onToggleGalleryFilter={(id) => setGalleryFilterIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id])}
-          sourceFilterIds={sourceFilterIds}
-          onToggleSourceFilter={(id) => setSourceFilterIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id])}
-          onClearAdvancedFilters={() => { setPropFilters({}); setGalleryFilterIds([]); setSourceFilterIds([]); }}
+           sourceFilterIds={sourceFilterIds}
+           onToggleSourceFilter={(id) => setSourceFilterIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id])}
+           invertAdvancedFilters={invertAdvancedFilters}
+           onToggleInvertAdvancedFilters={() => setInvertAdvancedFilters((value) => !value)}
+           onClearAdvancedFilters={() => { setPropFilters({}); setGalleryFilterIds([]); setSourceFilterIds([]); setInvertAdvancedFilters(false); }}
           groupBy={groupBy}
           onToggleGroupBy={(value) => setGroupBy((current) => {
             const id = mediaGroupById(value);

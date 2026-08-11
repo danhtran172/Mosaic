@@ -49,6 +49,7 @@ import indeckIcon from "@/assets/indeck.png";
 import { LockOverlay } from "./LockOverlay";
 
 import { AutoTagEditor } from "./AutoTagEditor";
+import { Chip, PropertyPicker } from "./PropertyPicker";
 
 export type View = { kind: "all" } | { kind: "folders" } | { kind: "folder"; id: string };
 type NewGalleryDraft = {
@@ -118,6 +119,14 @@ export function Sidebar({
   onOpenTrash: () => void;
 }) {
   const t = useT();
+  const [appDisplayName, setAppDisplayName] = useState("Mosaic");
+  useEffect(() => {
+    let active = true;
+    void getInDeckBridge()?.getAppDisplayName().then((name) => {
+      if (active && name) setAppDisplayName(name);
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
   const {
     state,
     createFolder,
@@ -128,8 +137,10 @@ export function Sidebar({
     addToFolder,
     setLanguage,
     setPassword,
+    setAppLockEnabled,
     setRequirePasswordToUnlockGallery,
     setAppearance,
+    setThemeColor,
     toggleExcludedFolder,
     syncMediaLocation,
     restoreMedia,
@@ -144,7 +155,9 @@ export function Sidebar({
     moveGalleryInGroup,
     removeGalleryFromGroup,
     attachSourceFolder,
+    createPropertyValue,
   } = useAllsight();
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
   const [collapsed, setCollapsed] = useState(false);
   const [newFolder, setNewFolder] = useState<NewGalleryDraft | null>(null);
   const [newFolderNameError, setNewFolderNameError] = useState<string | null>(null);
@@ -162,16 +175,20 @@ export function Sidebar({
   const [importFromGallery, setImportFromGallery] = useState<PersonalFolder | null>(null);
   const [addSourcesToGallery, setAddSourcesToGallery] = useState<{ galleryId: string; sourceIds: string[] } | null>(null);
   const [securityOpen, setSecurityOpen] = useState(false);
+  const [enableAppLockAfterPassword, setEnableAppLockAfterPassword] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [profilesOpen, setProfilesOpen] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
   const [trashSelection, setTrashSelection] = useState<string[]>([]);
   const [excludeOpen, setExcludeOpen] = useState(false);
-  const [syncResult, setSyncResult] = useState<number | null>(null);
+  const [syncResult, setSyncResult] = useState<{ moved: number; skipped: number; conflicts: number } | null>(null);
   const [pwd, setPwd] = useState("");
   const [pwdCurrent, setPwdCurrent] = useState("");
   const [pwdConfirm, setPwdConfirm] = useState("");
   const [pwdError, setPwdError] = useState("");
+  const [noGalleryPasswordConfirmOpen, setNoGalleryPasswordConfirmOpen] = useState(false);
+  const [noGalleryPassword, setNoGalleryPassword] = useState("");
+  const [noGalleryPasswordError, setNoGalleryPasswordError] = useState("");
 
   const toggleTrashSelection = (event: React.MouseEvent, key: string) => {
     if (event.ctrlKey || event.metaKey) {
@@ -452,10 +469,10 @@ export function Sidebar({
           className="flex min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none"
         >
           <span className="grid size-7 shrink-0 place-items-center overflow-hidden rounded-lg bg-primary/85 text-primary-foreground">
-            <img src={appIcon} alt="Mosaic" className="size-full object-cover" />
+            <img src={appIcon} alt={appDisplayName} className="size-full object-cover" />
           </span>
           {!collapsed && (
-            <span className="truncate font-display text-lg font-semibold tracking-tight">{t("brand")}</span>
+            <span className="truncate font-display text-lg font-semibold tracking-tight">{appDisplayName}</span>
           )}
         </button>
         <button
@@ -581,6 +598,21 @@ export function Sidebar({
           </DialogHeader>
           <div className="space-y-3">
             <div className="flex items-center gap-2 text-sm">
+              <Palette className="size-4 text-muted-foreground" />
+              <span className="flex-1">{t("themeColor")}</span>
+              <div className="flex items-center gap-1.5">
+                {([
+                  { key: "green", color: "#4b8b60", label: "themeGreen" },
+                  { key: "blue", color: "#0055DA", label: "themeBlue" },
+                  { key: "teal", color: "#76ABAE", label: "themeTeal" },
+                  { key: "pink", color: "#F5788B", label: "themePink" },
+                  { key: "orange", color: "#F7A00A", label: "themeOrange" },
+                ] as const).map(({ key, color, label }) => (
+                  <button key={key} onClick={() => setThemeColor(key)} title={t(label)} aria-label={t(label)} style={{ backgroundColor: color }} className={cn("size-6 rounded-md border-2 border-white/45 shadow-sm transition-transform hover:scale-110", state.themeColor === key && "ring-2 ring-ring ring-offset-2 ring-offset-background")} />
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
               <Languages className="size-4 text-muted-foreground" />
               <span className="flex-1">{t("language")}</span>
               <div className="flex overflow-hidden rounded-md border border-border/70">
@@ -632,12 +664,13 @@ export function Sidebar({
               className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
             >
               <FolderCog className="size-4 text-muted-foreground" />
-              <span className="flex-1 text-left">Quản lý Profile</span>
+              <span className="flex-1 text-left">{c("Quản lý Profile", "Manage profiles")}</span>
               <span className="text-xs text-muted-foreground">Library & shortcut</span>
             </button>
             <button
               onClick={() => {
                 setSettingsOpen(false);
+                setEnableAppLockAfterPassword(false);
                 setSecurityOpen(true);
               }}
               className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
@@ -646,48 +679,75 @@ export function Sidebar({
               <span className="flex-1 text-left">{t("password")}</span>
               <span className="text-xs text-muted-foreground">{state.password ? t("changePassword") : t("setPassword")}</span>
             </button>
-            <div className={cn("flex w-full items-center gap-3 rounded-lg border border-border/70 bg-secondary/40 px-3 py-2", state.password ? "hover:bg-accent/60" : "opacity-50")}>
+            <div className="flex w-full items-center gap-3 rounded-lg border border-border/70 bg-secondary/40 px-3 py-2 hover:bg-accent/60">
               <Lock className="size-4 text-muted-foreground" />
               <span className="min-w-0 flex-1 text-left">
-                <span className="block text-sm">Yêu cầu mật khẩu để mở Gallery</span>
-                <span className="block text-xs text-muted-foreground">Khi tắt, vẫn phải bấm Unlock nhưng không cần nhập mật khẩu.</span>
+                <span className="block text-sm">Không yêu cầu mật khẩu để mở Gallery</span>
+                <span className="block text-xs text-muted-foreground">Khi bật, chỉ cần bấm Unlock. Muốn yêu cầu mật khẩu thì hãy tạo mật khẩu ứng dụng trước.</span>
               </span>
               <button
                 type="button"
                 role="switch"
-                aria-checked={state.requirePasswordToUnlockGallery}
-                aria-label="Yêu cầu mật khẩu để mở Gallery"
-                disabled={!state.password}
+                aria-checked={!state.requirePasswordToUnlockGallery}
+                aria-label="Không yêu cầu mật khẩu để mở Gallery"
                 onClick={() => {
-                  if (state.requirePasswordToUnlockGallery) setRequirePasswordToUnlockGallery(false);
-                  else setRequirePasswordToUnlockGallery(true);
+                  if (state.requirePasswordToUnlockGallery) {
+                    if (state.password) {
+                      setNoGalleryPassword("");
+                      setNoGalleryPasswordError("");
+                      setNoGalleryPasswordConfirmOpen(true);
+                      return;
+                    }
+                    setSettingsOpen(false);
+                    setEnableAppLockAfterPassword(false);
+                    setSecurityOpen(true);
+                    return;
+                  }
+                  if (!state.password) {
+                    setSettingsOpen(false);
+                    setEnableAppLockAfterPassword(false);
+                    setSecurityOpen(true);
+                    return;
+                  }
+                  setRequirePasswordToUnlockGallery(!state.requirePasswordToUnlockGallery);
                 }}
                 className={cn(
-                  "relative h-6 w-11 min-w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
-                  state.requirePasswordToUnlockGallery ? "bg-primary" : "bg-muted-foreground/35",
+                  "relative h-6 w-11 min-w-11 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  !state.requirePasswordToUnlockGallery ? "bg-primary" : "bg-muted-foreground/35",
                 )}
               >
-                <span className={cn("absolute top-0.5 left-0 size-5 rounded-full bg-white shadow-sm transition-transform", state.requirePasswordToUnlockGallery ? "translate-x-5" : "translate-x-0.5")} />
+                <span className={cn("absolute top-0.5 left-0 size-5 rounded-full bg-white shadow-sm transition-transform", !state.requirePasswordToUnlockGallery ? "translate-x-5" : "translate-x-0.5")} />
               </button>
             </div>
             <button
               onClick={() => {
+                if (state.appLockEnabled) {
+                  setAppLockEnabled(false);
+                  return;
+                }
+                if (!state.password) {
+                  setSettingsOpen(false);
+                  setEnableAppLockAfterPassword(true);
+                  setSecurityOpen(true);
+                  return;
+                }
+                setAppLockEnabled(true);
                 setSettingsOpen(false);
                 onLock();
               }}
               className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
             >
-              <Lock className="size-4 text-muted-foreground" />
-              {t("lockApp")}
+              {state.appLockEnabled ? <LockOpen className="size-4 text-muted-foreground" /> : <Lock className="size-4 text-muted-foreground" />}
+              {state.appLockEnabled ? t("unlockApp") : t("lockApp")}
             </button>
             <button
-              onClick={() => setSyncResult(syncMediaLocation())}
+              onClick={() => { void syncMediaLocation().then(setSyncResult).catch(() => setSyncResult({ moved: 0, skipped: 1, conflicts: 0 })); }}
               className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
             >
               <RefreshCw className="size-4 text-muted-foreground" />
               <span className="flex-1 text-left">{t("syncMediaLocation")}</span>
               {syncResult !== null && (
-                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult })}</span>
+                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult.moved })}{syncResult.conflicts ? ` · ${syncResult.conflicts} conflict` : ""}</span>
               )}
             </button>
             <p className="text-xs text-muted-foreground">{t("syncMediaHint")}</p>
@@ -918,14 +978,14 @@ export function Sidebar({
       <Dialog open={!!newFolder} onOpenChange={(o) => { if (!o) { setNewFolder(null); setNewFolderNameError(null); } }}>
         <DialogContent className="glass-float rounded-2xl">
           <DialogHeader>
-            <DialogTitle className="font-display">Gallery mới</DialogTitle>
+            <DialogTitle className="font-display">{c("Gallery mới", "New Gallery")}</DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
             <input
               autoFocus
               value={newFolder?.name ?? ""}
               onChange={(e) => { setNewFolderNameError(null); setNewFolder((s) => s ? { ...s, name: e.target.value, nameMode: "manual" } : s); }}
-              placeholder={(newFolder?.sourcePaths.length ?? 0) > 1 ? "Nhập tên Gallery (bắt buộc)" : "Tên Gallery"}
+              placeholder={(newFolder?.sourcePaths.length ?? 0) > 1 ? c("Nhập tên Gallery (bắt buộc)", "Enter a Gallery name (required)") : c("Tên Gallery", "Gallery name")}
               aria-invalid={Boolean(newFolderNameError)}
               className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
             />
@@ -934,7 +994,7 @@ export function Sidebar({
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <p className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Media Sources</p>
-                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Chọn folder trên máy để làm nguồn media cho Gallery này.</p>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{c("Chọn folder trên máy để làm nguồn media cho Gallery này.", "Choose folders on this computer as Media Sources for this Gallery.")}</p>
                 </div>
                 <button
                   type="button"
@@ -954,7 +1014,7 @@ export function Sidebar({
                   })()}
                   className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
                 >
-                  <FolderPlus className="size-3.5" /> Thêm folder
+                  <FolderPlus className="size-3.5" /> {c("Thêm folder", "Add folder")}
                 </button>
               </div>
               <div className="max-h-52 overflow-y-auto rounded-xl border border-border/65 bg-background/25">
@@ -984,7 +1044,7 @@ export function Sidebar({
                     }} className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"><X className="size-3.5" /></button>
                   </div>;
                 })}
-                {(newFolder?.sourcePaths.length ?? 0) === 0 && <p className="px-3 py-4 text-center text-xs text-muted-foreground">Chưa có Media Source. Thêm một hoặc nhiều folder.</p>}
+                {(newFolder?.sourcePaths.length ?? 0) === 0 && <p className="px-3 py-4 text-center text-xs text-muted-foreground">{c("Chưa có Media Source. Thêm một hoặc nhiều folder.", "No Media Sources yet. Add one or more folders.")}</p>}
               </div>
               {(newFolder?.sourcePaths.length ?? 0) > 1 && !newFolder?.name.trim() && <p className="text-xs text-amber-500">Đã chọn nhiều folder. Hãy nhập tên Gallery trước khi tạo.</p>}
             </section>
@@ -999,13 +1059,13 @@ export function Sidebar({
               <p className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Auto Tag</p>
               {state.propertyGroups.map((group) => {
                 const values = newFolder?.autoTags[group.id] ?? [];
-                return <div key={group.id} className="flex items-center gap-2">
-                  <span className="w-24 shrink-0 truncate text-xs text-muted-foreground">{group.name}</span>
-                  <select value="" onChange={(e) => { const value = e.target.value; if (!value) return; setNewFolder((draft) => draft ? { ...draft, autoTags: { ...draft.autoTags, [group.id]: [...new Set([...(draft.autoTags[group.id] ?? []), value])] } } : draft); }} className="min-w-0 flex-1 rounded-md border border-border bg-background/60 px-2 py-1 text-xs">
-                    <option value="">Thêm tag…</option>
-                    {group.values.filter((value) => !values.includes(value)).map((value) => <option key={value} value={value}>{value}</option>)}
-                  </select>
-                  {values.length > 0 && <span className="max-w-24 truncate text-xs text-primary" title={values.join(", ")}>{values.join(", ")}</span>}
+                const addValue = (value: string, create = false) => {
+                  if (create) createPropertyValue(group.id, value);
+                  setNewFolder((draft) => draft ? { ...draft, autoTags: { ...draft.autoTags, [group.id]: [...new Set([...(draft.autoTags[group.id] ?? []), value])] } } : draft);
+                };
+                return <div key={group.id} className="flex items-start gap-2">
+                  <span className="w-24 shrink-0 pt-1.5 truncate text-xs text-muted-foreground">{group.name}</span>
+                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-1.5"><PropertyPicker label={`Thêm Prop ${group.name}`} options={group.values.filter((value) => !values.includes(value)).map((value) => ({ id: value, label: value }))} onSelect={(value) => addValue(value)} onCreate={(value) => addValue(value, true)} trigger={<button type="button" className="glass-btn rounded-md px-2 py-1 text-xs">Thêm Prop…</button>} />{values.map((value) => <Chip key={value} label={value} onRemove={() => setNewFolder((draft) => draft ? { ...draft, autoTags: { ...draft.autoTags, [group.id]: (draft.autoTags[group.id] ?? []).filter((item) => item !== value) } } : draft)} />)}</div></div>
                 </div>;
               })}
             </section>
@@ -1019,7 +1079,12 @@ export function Sidebar({
                   setNewFolderNameError(sourcePaths.length > 1 ? "Đã chọn nhiều folder, hãy nhập tên Gallery trước khi tạo." : "Hãy nhập tên Gallery trước khi tạo.");
                   return;
                 }
-                const id = createFolder(name, {
+                const usedNames = new Set(state.folders.map((folder) => folder.name.trim().toLocaleLowerCase()));
+                let galleryName = name;
+                for (let number = 2; usedNames.has(galleryName.toLocaleLowerCase()); number += 1) {
+                  galleryName = `${name} (${number})`;
+                }
+                const id = createFolder(galleryName, {
                   sourceIds: [],
                   notes: newFolder?.notes ?? "",
                   autoTags: newFolder?.autoTags ?? {},
@@ -1029,12 +1094,12 @@ export function Sidebar({
                 onView({ kind: "folder", id });
                 // Every Gallery owns an InDeck-managed Default Source. Extra
                 // Media Sources are scanned independently and never replaced.
-                void ensureFolderDefaultSource(id, name);
+                void ensureFolderDefaultSource(id, galleryName);
                 void Promise.all(sourcePaths.map((path) => attachSourceFolder(id, path)));
               }}
               className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary"
             >
-              Tạo Gallery
+              {c("Tạo Gallery", "Create Gallery")}
             </button>
           </DialogFooter>
         </DialogContent>
@@ -1179,8 +1244,40 @@ export function Sidebar({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={noGalleryPasswordConfirmOpen} onOpenChange={(open) => {
+        setNoGalleryPasswordConfirmOpen(open);
+        if (!open) { setNoGalleryPassword(""); setNoGalleryPasswordError(""); }
+      }}>
+        <DialogContent className="glass-float rounded-2xl">
+          <DialogHeader>
+            <DialogTitle className="font-display">Xác nhận bỏ yêu cầu mật khẩu</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">Nhập mật khẩu ứng dụng để cho phép mở Gallery mà không cần mật khẩu.</p>
+          <input
+            autoFocus
+            type="password"
+            value={noGalleryPassword}
+            onChange={(event) => { setNoGalleryPassword(event.target.value); setNoGalleryPasswordError(""); }}
+            placeholder="Mật khẩu ứng dụng"
+            className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+          />
+          {noGalleryPasswordError && <p className="text-xs text-destructive">{noGalleryPasswordError}</p>}
+          <DialogFooter className="gap-2">
+            <button onClick={() => setNoGalleryPasswordConfirmOpen(false)} className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-accent">Hủy</button>
+            <button onClick={() => { void (async () => {
+              if (!state.password || await passwordHash(noGalleryPassword) !== state.password) {
+                setNoGalleryPasswordError("Mật khẩu không đúng.");
+                return;
+              }
+              setRequirePasswordToUnlockGallery(false);
+              setNoGalleryPasswordConfirmOpen(false);
+            })(); }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">Xác nhận</button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Security dialog */}
-      <Dialog open={securityOpen} onOpenChange={setSecurityOpen}>
+      <Dialog open={securityOpen} onOpenChange={(open) => { setSecurityOpen(open); if (!open) setEnableAppLockAfterPassword(false); }}>
         <DialogContent className="glass-float rounded-2xl">
           <DialogHeader>
             <DialogTitle className="font-display">{t("password")}</DialogTitle>
@@ -1218,7 +1315,7 @@ export function Sidebar({
                   onConfirm({
                     title: t("removePassword"),
                     onConfirm: () => {
-                      setPassword(null); setRequirePasswordToUnlockGallery(false);
+                      setPassword(null); setAppLockEnabled(false); setRequirePasswordToUnlockGallery(false);
                       setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError(""); setSecurityOpen(false);
                     },
                   });
@@ -1233,8 +1330,14 @@ export function Sidebar({
                 if (!pwd.trim()) { setPwdError("Nhập mật khẩu mới."); return; }
                 if (pwd !== pwdConfirm) { setPwdError("Xác nhận mật khẩu chưa khớp."); return; }
                 if (state.password && await passwordHash(pwdCurrent) !== state.password) { setPwdError("Mật khẩu hiện tại không đúng."); return; }
-                setPassword(await passwordHash(pwd));
-                setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError(""); setSecurityOpen(false);
+                const hash = await passwordHash(pwd);
+                setPassword(hash);
+                // Choosing Lock app before a password exists establishes the
+                // shared password and enables lock-on-next-launch, without
+                // interrupting the current session.
+                if (enableAppLockAfterPassword) setAppLockEnabled(true);
+                setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError("");
+                setEnableAppLockAfterPassword(false); setSecurityOpen(false);
               })(); }}
               className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary"
             >
@@ -1243,6 +1346,7 @@ export function Sidebar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
     </aside>
   );
 }

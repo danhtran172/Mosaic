@@ -30,6 +30,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "extension/native-host.js",
       "package.json",
       "ui/dist/**/*",
       "assets/**/*",

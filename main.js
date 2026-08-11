@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, clipboard, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, clipboard, nativeImage, shell, screen } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
@@ -7,28 +7,50 @@ const { execFile } = require('child_process');
 const { pathToFileURL } = require('url');
 const ffmpegPath = require('ffmpeg-static');
 
-// Rebrand the desktop application without moving existing profiles and
-// libraries out of Electron's previous InDeck user-data folder.
-app.setName('Mosaic');
-app.setPath('userData', path.join(app.getPath('appData'), 'InDeck'));
+// The development instance needs a distinct name so it is never confused
+// with the installed Mosaic application. Both continue to share the existing
+// profile/library location for realistic testing.
+const APP_DISPLAY_NAME = app.isPackaged ? 'Mosaic' : 'MosaicTest';
+const LEGACY_USER_DATA_PATH = path.join(app.getPath('appData'), 'InDeck');
+const MOSAIC_USER_DATA_PATH = path.join(app.getPath('appData'), 'Mosaic');
+app.setName(APP_DISPLAY_NAME);
+app.setPath('userData', MOSAIC_USER_DATA_PATH);
+// Windows uses the App User Model ID to associate a running Electron process
+// with its taskbar icon instead of the generic electron.exe icon.
+app.setAppUserModelId(app.isPackaged ? 'com.mosaic.app' : 'com.mosaic.test');
+const WINDOW_STATE_FILE = path.join(app.getPath('userData'), 'mosaic-window-state.json');
 
 const MEDIA_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif', '.mp4', '.mov', '.m4v', '.webm', '.avi', '.ts']);
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif']);
 const WEB_IMPORTS_SOURCE_ID = 'allsight-web-imports';
 const PROFILE_MAIN_LIBRARY_SOURCE_ID = 'indeck-profile-main-library';
-const VAULT_BRIDGE_FILE = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'MasterVisionVault', 'indeck-bridge.json');
+const VAULT_BRIDGE_FILES = [
+  path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'MosaicVault', 'mosaic-bridge.json'),
+  path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'MasterVisionVault', 'mosaic-bridge.json'),
+  // Existing Vault installations continue to work while they migrate their
+  // bridge file name independently of Mosaic.
+  path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'MasterVisionVault', 'indeck-bridge.json'),
+];
 // Keep branded resources inside the project so packaged/source builds never
 // depend on a user Downloads path.
 const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
+const APP_ICON_ICO_PATH = path.join(app.getPath('userData'), 'Mosaic.ico');
 const DEFAULT_PROFILE_ID = 'default';
-const NATIVE_HOST_NAME = 'com.indeck.mastervision';
+// Test and installed applications must never overwrite one another's native
+// messaging registration. The production extension uses com.mosaic.app.
+const NATIVE_HOST_NAME = app.isPackaged ? 'com.mosaic.app' : 'com.mosaictest.app';
+const LEGACY_NATIVE_HOST_NAME = 'com.indeck.mastervision';
 const EXTENSION_ID = 'fpbeciobaoekefhhjjenfomhkffmejah';
 const EXTENSION_STORE_URL = `https://chromewebstore.google.com/detail/${EXTENSION_ID}`;
 const profileWindows = new Map();
 const webContentsProfileIds = new Map();
 const profileWatchers = new Map();
 let profileRegistryWriteQueue = Promise.resolve();
-const NATIVE_MESSAGING_MODE = process.argv.some(argument => String(argument).startsWith('chrome-extension://'));
+// Chrome passes its extension origin to a native host, but Electron can strip
+// protocol-looking argv values from a packaged executable on Windows. The
+// production launcher therefore supplies an explicit flag as well.
+const NATIVE_MESSAGING_MODE = process.argv.includes('--native-messaging')
+  || process.argv.some(argument => String(argument).startsWith('chrome-extension://'));
 const NATIVE_HOST_REGISTRATION_MODE = process.argv.includes('--register-native-host');
 let nativeHostInput = Buffer.alloc(0);
 let nativeHostInputEnded = false;
@@ -37,6 +59,36 @@ let nativeHostHandling = Promise.resolve();
 const nativeHostKeepAlive = NATIVE_MESSAGING_MODE ? setInterval(() => {}, 1000) : null;
 let nativeHostWindow = null;
 let autoUpdaterConfigured = false;
+async function migrateLegacyAppData() {
+  if (normalizedPath(LEGACY_USER_DATA_PATH) === normalizedPath(MOSAIC_USER_DATA_PATH)) return;
+  const [legacyReady, mosaicReady] = await Promise.all([
+    fs.promises.stat(path.join(LEGACY_USER_DATA_PATH, 'profiles.json')).then(stat => stat.isFile()).catch(() => false),
+    fs.promises.stat(path.join(MOSAIC_USER_DATA_PATH, 'profiles.json')).then(stat => stat.isFile()).catch(() => false),
+  ]);
+  if (!legacyReady || mosaicReady) return;
+  await fs.promises.mkdir(MOSAIC_USER_DATA_PATH, { recursive: true });
+  await fs.promises.cp(LEGACY_USER_DATA_PATH, MOSAIC_USER_DATA_PATH, { recursive: true, force: false, errorOnExist: false });
+}
+async function migrateProfileDataPaths() {
+  const legacyRoot = path.resolve(LEGACY_USER_DATA_PATH);
+  const mosaicRoot = path.resolve(MOSAIC_USER_DATA_PATH);
+  const rebase = value => {
+    if (!value) return value;
+    const current = path.resolve(String(value));
+    const relative = path.relative(legacyRoot, current);
+    if (relative && (relative.startsWith('..') || path.isAbsolute(relative))) return value;
+    return path.join(mosaicRoot, relative);
+  };
+  const registry = await readProfileRegistry();
+  let changed = false;
+  for (const bucket of [registry.profiles, registry.discardedProfiles || []]) {
+    for (const profile of bucket) {
+      const nextPath = rebase(profile.dataPath);
+      if (nextPath !== profile.dataPath) { profile.dataPath = nextPath; changed = true; }
+    }
+  }
+  if (changed) await writeProfileRegistry(registry);
+}
 function requestedProfileId(argv = process.argv) {
   const argument = argv.find(value => String(value).startsWith('--profile='));
   return argument ? String(argument).slice('--profile='.length) || null : null;
@@ -83,8 +135,8 @@ function legacyProfile() {
     id: DEFAULT_PROFILE_ID,
     name: 'Default',
     dataPath: app.getPath('userData'),
-    mediaPath: path.join(app.getPath('pictures'), 'InDeckMedia'),
-    lastMediaPath: path.join(app.getPath('pictures'), 'InDeckMedia'),
+    mediaPath: path.join(app.getPath('pictures'), 'MosaicMedia'),
+    lastMediaPath: path.join(app.getPath('pictures'), 'MosaicMedia'),
     isDefault: true,
     initialized: true,
     createdAt: 0,
@@ -100,7 +152,95 @@ function profileRecoveryMediaPath(profile) {
   const candidates = [profile?.lastMediaPath, profile?.mediaPath]
     .map(value => String(value || '').trim())
     .filter(value => value && !isRecycleBinPath(value));
-  return candidates[0] || path.join(app.getPath('pictures'), `InDeckMedia_${safeFolderPart(profile?.name || 'Profile')}`);
+  return candidates[0] || path.join(app.getPath('pictures'), `MosaicMedia_${safeFolderPart(profile?.name || 'Profile')}`);
+}
+const PROFILE_FOLDER_ICON_MARKER = '; Mosaic Profile Folder';
+const PROFILE_FOLDER_ICON_FILE = 'Mosaic Profile.ico';
+function icoFromPng(png) {
+  // Windows supports PNG payloads inside modern ICO files. This lets the
+  // source build reuse the app icon without carrying a second binary asset.
+  const header = Buffer.alloc(22);
+  header.writeUInt16LE(0, 0);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(1, 4);
+  header[6] = 0; header[7] = 0; // 256 × 256
+  header[8] = 0; header[9] = 0;
+  header.writeUInt16LE(1, 10);
+  header.writeUInt16LE(32, 12);
+  header.writeUInt32LE(png.length, 14);
+  header.writeUInt32LE(22, 18);
+  return Buffer.concat([header, png]);
+}
+async function ensureTaskbarIcon() {
+  if (!fs.existsSync(APP_ICON_PATH)) return APP_ICON_PATH;
+  try {
+    await fs.promises.mkdir(path.dirname(APP_ICON_ICO_PATH), { recursive: true });
+    await fs.promises.writeFile(APP_ICON_ICO_PATH, icoFromPng(await fs.promises.readFile(APP_ICON_PATH)));
+    return APP_ICON_ICO_PATH;
+  } catch { return APP_ICON_PATH; }
+}
+async function ensureProfileFolderIcon(folder) {
+  const target = String(folder || '').trim();
+  if (!target || !fs.existsSync(APP_ICON_PATH)) return false;
+  const desktopIni = path.join(target, 'desktop.ini');
+  const existing = await fs.promises.readFile(desktopIni, 'utf8').catch(() => '');
+  // Never overwrite a folder appearance explicitly owned by the user.
+  if (existing && !existing.includes(PROFILE_FOLDER_ICON_MARKER)) return false;
+  try {
+    const iconName = PROFILE_FOLDER_ICON_FILE;
+    await fs.promises.writeFile(path.join(target, iconName), icoFromPng(await fs.promises.readFile(APP_ICON_PATH)));
+    await fs.promises.writeFile(desktopIni, `${PROFILE_FOLDER_ICON_MARKER}\r\n[.ShellClassInfo]\r\nIconResource=${iconName},0\r\n`, 'utf8');
+    await Promise.all([
+      runFileCommand('attrib', ['+s', target]),
+      runFileCommand('attrib', ['+h', '+s', desktopIni]),
+      runFileCommand('attrib', ['+h', path.join(target, iconName)]),
+    ]);
+    return true;
+  } catch { return false; }
+}
+async function existingProfileLibraryLocation(profile) {
+  const candidates = [...new Set([profile?.lastMediaPath, profile?.mediaPath]
+    .map(value => String(value || '').trim())
+    .filter(value => value && !isRecycleBinPath(value)))];
+  for (const candidate of candidates) {
+    const exists = await fs.promises.stat(candidate).then(stat => stat.isDirectory()).catch(() => false);
+    if (exists) return path.resolve(candidate);
+  }
+  if (profile?.mediaTracking) {
+    const tracked = await resolveTrackedFolder({ folder: profile.mediaPath || profile.lastMediaPath, tracking: profile.mediaTracking });
+    if (tracked && !isRecycleBinPath(tracked)) return tracked;
+  }
+  return null;
+}
+async function migrateLegacyProfileLibraryFolder(folder) {
+  const source = path.resolve(folder);
+  const base = path.basename(source);
+  if (!/^indeckmedia(?:_|$)/i.test(base)) return source;
+  const destination = path.join(path.dirname(source), base.replace(/^indeckmedia/i, 'MosaicMedia'));
+  if (normalizedPath(source) === normalizedPath(destination)) return source;
+  const destinationExists = await fs.promises.stat(destination).then(stat => stat.isDirectory()).catch(() => false);
+  if (destinationExists) return source; // Never merge two user Libraries automatically.
+  try {
+    await fs.promises.rename(source, destination);
+    return destination;
+  } catch { return source; }
+}
+async function restoreProfileLibraryLocation(profile) {
+  const previous = profile.mediaPath || null;
+  const existing = await existingProfileLibraryLocation(profile);
+  let location = existing || profileRecoveryMediaPath(profile);
+  if (existing) location = await migrateLegacyProfileLibraryFolder(location);
+  const changed = !profile.initialized
+    || normalizedPath(profile.mediaPath || location) !== normalizedPath(location)
+    || normalizedPath(profile.lastMediaPath || location) !== normalizedPath(location);
+  if (!changed) return profile;
+  profile.mediaPath = location;
+  profile.lastMediaPath = location;
+  profile.initialized = true;
+  profile.mediaTracking = await identifyFolder(location);
+  const stored = await updateProfileInRegistry(profile);
+  if (previous && normalizedPath(previous) !== normalizedPath(location)) await relocateManagedProfilePaths(stored, previous);
+  return stored;
 }
 function newProfileId() { return `profile-${crypto.randomUUID()}`; }
 function cleanProfileName(value) { return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 80); }
@@ -180,19 +320,21 @@ async function createProfile(name) {
     createdAt: Date.now(),
   };
   await fs.promises.mkdir(profile.dataPath, { recursive: true });
+  await ensureProfileFolderIcon(profile.dataPath);
   registry.profiles.push(profile);
   await writeProfileRegistry(registry);
+  await createProfileShortcut(profile.id);
   return profile;
 }
-function isInDeckLibraryFolder(folder) { return /^indeckmedia(?:_|$)/i.test(path.basename(folder)); }
+function isMosaicLibraryFolder(folder) { return /^(?:mosaicmedia|indeckmedia)(?:_|$)/i.test(path.basename(folder)); }
 function libraryMediaPathForSelection(folder, profile) {
   const value = String(folder || '').trim();
   if (!value) throw new Error('Choose a library location');
   const selected = path.resolve(value);
-  // Selecting an existing InDeckMedia_* explicitly means sharing it. A new
+  // Existing legacy Libraries remain shareable. New profiles use MosaicMedia.
   // selection always creates a Library named after the profile that owns it.
-  if (isInDeckLibraryFolder(selected)) return selected;
-  return path.join(selected, `InDeckMedia_${safeFolderPart(profile?.name || 'Profile')}`);
+  if (isMosaicLibraryFolder(selected)) return selected;
+  return path.join(selected, `MosaicMedia_${safeFolderPart(profile?.name || 'Profile')}`);
 }
 async function libraryLocationStatus(profileId, folder) {
   const profile = await profileById(profileId);
@@ -217,7 +359,7 @@ async function configureProfileLibrary(profileId, folder, useExisting) {
   const profile = await profileById(profileId);
   if (!profile) throw new Error('Profile not found');
   const status = await libraryLocationStatus(profileId, folder);
-  if (status.exists && !useExisting) throw new Error('InDeckMedia already exists here. Confirm that you want to use it.');
+  if (status.exists && !useExisting) throw new Error('A MosaicMedia Library already exists here. Confirm that you want to use it.');
   await fs.promises.mkdir(status.mediaPath, { recursive: true });
   profile.mediaPath = status.mediaPath;
   profile.lastMediaPath = status.mediaPath;
@@ -226,6 +368,7 @@ async function configureProfileLibrary(profileId, folder, useExisting) {
   profile.libraryLocationConfiguredAt = Date.now();
   const stored = await updateProfileInRegistry(profile);
   await recoverProfileLibrary(stored);
+  await ensureProfileFolderIcon(status.mediaPath);
   return stored;
 }
 async function relocateManagedProfilePaths(profile, previousMediaPath) {
@@ -274,13 +417,20 @@ async function trackProfileLibraryLocation(profile) {
   return profile;
 }
 async function recoverProfileLibrary(profile) {
-  if (!isProfileReady(profile)) throw new Error('Choose a Default Library Location before recovering this profile');
+  // Recovery is also the repair path for an incomplete profile record. Prefer
+  // an existing last-known Library location, then its tracked location; only
+  // create a new Mosaic Library when neither can be found.
+  profile = await restoreProfileLibraryLocation(profile);
   profile = await ensureProfileLibraryFolders(profile);
+  await Promise.all([ensureProfileFolderIcon(profile.dataPath), ensureProfileFolderIcon(profile.mediaPath)]);
   const data = await readStore(profile);
   const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data);
+  // Rebuild all Gallery DMS links before scanning Main Gallery. That prevents
+  // its root source from absorbing DMS files and guarantees every Gallery
+  // leaves recovery with a source record, directory, and sourceIds link.
+  const repairedDefaults = await ensureDefaultSourcesForExistingGalleries(profile, data);
   const mainLibraryChanged = await ensureProfileMainLibrarySource(profile, data);
   const prunedUnavailable = await reconcileUnavailableSources(profile, data);
-  const repairedDefaults = await ensureDefaultSourcesForExistingGalleries(profile, data);
   if (defaultSaveChanged || mainLibraryChanged || prunedUnavailable || repairedDefaults) await writeStore(profile, data);
   return { profile, repairedDefaults, prunedUnavailable, defaultSaveChanged, mainLibraryChanged, mediaPath: profile.mediaPath };
 }
@@ -293,14 +443,18 @@ async function renameProfile(profileId, name) {
   if (!profileNameIsAvailable(profileName, registry.profiles, profile.id)) throw new Error('A profile with this name already exists');
   profile.name = profileName;
   await writeProfileRegistry(registry);
+  await syncProfileShortcut(profile);
   return profile;
 }
 async function setDefaultProfile(profileId) {
   const registry = await readProfileRegistry();
   const profile = registry.profiles.find(item => item.id === String(profileId));
   if (!profile) throw new Error('Profile not found');
+  const previousDefault = registry.profiles.find(item => item.isDefault) || null;
   registry.profiles.forEach(item => { item.isDefault = item.id === profile.id; });
   await writeProfileRegistry(registry);
+  if (previousDefault && previousDefault.id !== profile.id) await syncProfileShortcut({ ...previousDefault, isDefault: false });
+  await syncProfileShortcut({ ...profile, isDefault: true });
   return profile;
 }
 async function deleteProfile(profileId, typedName, replacementDefaultId = null) {
@@ -321,6 +475,8 @@ async function deleteProfile(profileId, typedName, replacementDefaultId = null) 
   registry.discardedProfiles ||= [];
   registry.discardedProfiles.unshift({ ...profile, isDefault: false, discardedAt: Date.now() });
   await writeProfileRegistry(registry);
+  await removeProfileShortcut(profile);
+  if (replacement) await syncProfileShortcut({ ...replacement, isDefault: true });
   if (replacement) await createWindow(replacement.id);
   const window = profileWindows.get(id);
   if (window && !window.isDestroyed()) setTimeout(() => window.close(), 0);
@@ -337,13 +493,40 @@ async function recoverDiscardedProfile(profileId) {
   if (!registry.profiles.some(item => item.isDefault)) profile.isDefault = true;
   registry.profiles.push(profile);
   await writeProfileRegistry(registry);
+  await createProfileShortcut(profile.id);
   return profile;
+}
+function profileShortcutPath(profile) {
+  const fileName = profile.isDefault ? 'Mosaic.lnk' : `${safeFolderPart(profile.name)}.lnk`;
+  return path.join(app.getPath('desktop'), fileName);
+}
+function profileShortcutCandidates(profile) {
+  return [...new Set([
+    profile.shortcutPath,
+    profileShortcutPath(profile),
+    path.join(app.getPath('desktop'), `Mosaic - ${safeFolderPart(profile.name)}.lnk`),
+    path.join(app.getPath('desktop'), 'Mosaic.lnk'),
+  ].filter(Boolean))];
+}
+function shortcutBelongsToProfile(shortcutPath, profileId) {
+  try { return String(shell.readShortcutLink(shortcutPath)?.args || '').includes(`--profile=${profileId}`); }
+  catch { return false; }
+}
+async function removeProfileShortcut(profile) {
+  for (const shortcutPath of profileShortcutCandidates(profile)) {
+    if (!shortcutBelongsToProfile(shortcutPath, profile.id)) continue;
+    await fs.promises.unlink(shortcutPath).catch(() => {});
+  }
+}
+async function syncProfileShortcut(profile) {
+  await removeProfileShortcut(profile);
+  return createProfileShortcut(profile.id);
 }
 async function createProfileShortcut(profileId) {
   const profile = await profileById(profileId);
   if (!profile) throw new Error('Profile not found');
-  const fileName = `Mosaic - ${safeFolderPart(profile.name)}.lnk`;
-  const shortcutPath = path.join(app.getPath('desktop'), fileName);
+  await removeProfileShortcut(profile);
+  const shortcutPath = profileShortcutPath(profile);
   const options = app.isPackaged
     ? {
       target: app.getPath('exe'),
@@ -352,16 +535,31 @@ async function createProfileShortcut(profileId) {
       workingDirectory: path.dirname(app.getPath('exe')),
     }
     : {
-      // Keep the feature testable from the source checkout too. The batch
-      // file rebuilds ui/dist, then forwards the profile argument to Electron.
-      target: process.env.ComSpec || 'C:\\Windows\\System32\\cmd.exe',
-      args: `/d /c ""${path.join(__dirname, 'Run MasterVision.bat')}" --profile=${profile.id}"`,
+      // Source-checkout shortcuts open the same Electron entry used by
+      // MosaicTest, without depending on an old InDeck batch file.
+      target: path.join(__dirname, 'node_modules', 'electron', 'dist', 'electron.exe'),
+      args: `. --profile=${profile.id}`,
       description: `Open Mosaic profile ${profile.name}`,
       workingDirectory: __dirname,
     };
-  if (fs.existsSync(APP_ICON_PATH)) options.icon = APP_ICON_PATH;
+  if (fs.existsSync(APP_ICON_ICO_PATH)) options.icon = APP_ICON_ICO_PATH;
+  else if (fs.existsSync(APP_ICON_PATH)) options.icon = APP_ICON_PATH;
   if (!shell.writeShortcutLink(shortcutPath, 'create', options)) throw new Error('Could not create the profile shortcut');
+  const registry = await readProfileRegistry();
+  const index = registry.profiles.findIndex(item => item.id === profile.id);
+  if (index >= 0 && registry.profiles[index].shortcutPath !== shortcutPath) {
+    registry.profiles[index].shortcutPath = shortcutPath;
+    await writeProfileRegistry(registry);
+  }
   return shortcutPath;
+}
+async function ensureProfileShortcuts() {
+  const registry = await readProfileRegistry();
+  for (const profile of registry.profiles) {
+    await syncProfileShortcut(profile);
+    await ensureProfileFolderIcon(profile.dataPath);
+    if (profile.mediaPath) await ensureProfileFolderIcon(profile.mediaPath);
+  }
 }
 
 if (!NATIVE_MESSAGING_MODE && !NATIVE_HOST_REGISTRATION_MODE && !app.requestSingleInstanceLock()) app.quit();
@@ -442,6 +640,80 @@ async function removeCachedSource(profile, sourceId) {
   await writeCatalog(profile);
 }
 function thumbnailPath(profile, asset) { return path.join(thumbnailDirectory(profile), `${crypto.createHash('sha1').update(`${asset.id}:${asset.modified || 0}`).digest('hex')}.png`); }
+const THUMBNAIL_CACHE_LIMIT = 1600;
+const thumbnailCachePruneCounters = new Map();
+const thumbnailWorkQueues = new Map();
+// Thumbnail calls are made by visible cards.  The work queue is shared by the
+// whole profile, not by each IPC request, so a fast scroll cannot multiply
+// image/video decoding work beyond this fixed concurrency.
+function scheduleThumbnail(profile, asset, requestId) {
+  const profileKey = String(profile?.id || DEFAULT_PROFILE_ID);
+  let queue = thumbnailWorkQueues.get(profileKey);
+  if (!queue) {
+    queue = { active: 0, pending: [], jobs: new Map() };
+    thumbnailWorkQueues.set(profileKey, queue);
+  }
+  const jobKey = `${asset?.id}:${asset?.modified || 0}`;
+  requestId ||= `batch:${crypto.randomUUID()}`;
+  let job = queue.jobs.get(jobKey);
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  if (job) {
+    const consumers = job.consumers.get(requestId) || [];
+    consumers.push(resolve);
+    job.consumers.set(requestId, consumers);
+    return promise;
+  }
+  job = { asset, jobKey, consumers: new Map([[requestId, [resolve]]]), started: false };
+  queue.jobs.set(jobKey, job);
+  queue.pending.push(job);
+  const pump = () => {
+    while (queue.active < 3 && queue.pending.length) {
+      const next = queue.pending.shift();
+      if (!next.consumers.size) { queue.jobs.delete(next.jobKey); continue; }
+      queue.active += 1;
+      next.started = true;
+      createThumbnail(profile, next.asset)
+        .then(value => { next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(value))); }, () => { next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(null))); })
+        .finally(() => {
+          queue.active -= 1;
+          queue.jobs.delete(next.jobKey);
+          pump();
+        });
+    }
+  };
+  pump();
+  return promise;
+}
+function cancelThumbnailRequest(profile, requestId) {
+  if (!requestId) return;
+  const queue = thumbnailWorkQueues.get(String(profile?.id || DEFAULT_PROFILE_ID));
+  if (!queue) return;
+  queue.jobs.forEach(job => {
+    const resolvers = job.consumers.get(requestId);
+    if (resolvers) { job.consumers.delete(requestId); resolvers.forEach(resolve => resolve(null)); }
+  });
+}
+async function pruneThumbnailCache(profile) {
+  const key = String(profile?.id || DEFAULT_PROFILE_ID);
+  const count = (thumbnailCachePruneCounters.get(key) || 0) + 1;
+  thumbnailCachePruneCounters.set(key, count);
+  // Pruning occasionally, rather than during every thumbnail lookup, keeps
+  // the cache bounded without putting directory enumeration on the scroll path.
+  if (count % 80) return;
+  try {
+    const folder = thumbnailDirectory(profile);
+    const files = (await fs.promises.readdir(folder, { withFileTypes: true }))
+      .filter(entry => entry.isFile() && entry.name.endsWith('.png'));
+    if (files.length <= THUMBNAIL_CACHE_LIMIT) return;
+    const details = await Promise.all(files.map(async entry => ({
+      path: path.join(folder, entry.name),
+      mtime: (await fs.promises.stat(path.join(folder, entry.name))).mtimeMs,
+    })));
+    details.sort((a, b) => a.mtime - b.mtime);
+    await Promise.all(details.slice(0, details.length - THUMBNAIL_CACHE_LIMIT).map(file => fs.promises.rm(file.path, { force: true })));
+  } catch { /* A cache is disposable. */ }
+}
 function createVideoThumbnail(asset, target) {
   const source = asset?.vault ? asset.contentUrl : asset?.path;
   if (!ffmpegPath || !source) return Promise.resolve(false);
@@ -467,6 +739,8 @@ async function createThumbnail(profile, asset) {
   const temporary = `${target}.${process.pid}.${Date.now()}.tmp.png`;
   try {
     await fs.promises.access(target);
+    // The filesystem timestamp doubles as the LRU access marker.
+    void fs.promises.utimes(target, new Date(), new Date()).catch(() => {});
     return pathToFileURL(target).href;
   } catch { /* Generate missing cache entry below. */ }
   try {
@@ -474,6 +748,7 @@ async function createThumbnail(profile, asset) {
     if (asset.type === 'video') {
       if (!(await createVideoThumbnail(asset, temporary))) { await fs.promises.rm(temporary, { force: true }).catch(() => {}); return null; }
       await fs.promises.rename(temporary, target);
+      void pruneThumbnailCache(profile);
       return pathToFileURL(target).href;
     }
     let image;
@@ -490,23 +765,17 @@ async function createThumbnail(profile, asset) {
     if (image.isEmpty()) return null;
     await fs.promises.writeFile(temporary, image.toPNG());
     await fs.promises.rename(temporary, target);
+    void pruneThumbnailCache(profile);
     return pathToFileURL(target).href;
   } catch { await fs.promises.rm(temporary, { force: true }).catch(() => {}); return null; }
 }
-async function createThumbnails(profile, assets) {
-  // The renderer reveals media in 50-item batches. Keep the backend bounded
-  // too, so an accidental large IPC payload cannot spike image decoding.
+async function createThumbnails(profile, assets, requestId) {
+  // Keep IPC payloads bounded; `scheduleThumbnail` is the profile-wide queue
+  // that enforces decoding concurrency across all visible cards.
   const items = Array.isArray(assets) ? assets.slice(0, 50) : [];
   const output = {};
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const asset = items[next++];
-      const thumbnailUrl = await createThumbnail(profile, asset);
-      if (thumbnailUrl) output[asset.id] = thumbnailUrl;
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
+  const urls = await Promise.all(items.map(asset => scheduleThumbnail(profile, asset, requestId)));
+  urls.forEach((thumbnailUrl, index) => { if (thumbnailUrl) output[items[index].id] = thumbnailUrl; });
   return output;
 }
 
@@ -604,10 +873,12 @@ function bridgeTracking(bridge) {
   return volume && fileId ? { volume, fileId } : null;
 }
 async function readVaultBridges() {
-  try {
-    const document = JSON.parse(await fs.promises.readFile(VAULT_BRIDGE_FILE, 'utf8'));
-    return Array.isArray(document.vaults) ? document.vaults : [];
-  } catch { return []; }
+  const documents = await Promise.all(VAULT_BRIDGE_FILES.map(async file => {
+    try { return JSON.parse(await fs.promises.readFile(file, 'utf8')); }
+    catch { return null; }
+  }));
+  const bridges = documents.flatMap(document => Array.isArray(document?.vaults) ? document.vaults : []);
+  return [...new Map(bridges.filter(bridge => bridge?.id).map(bridge => [String(bridge.id), bridge])).values()];
 }
 async function vaultBridgeForSource(source) {
   const bridges = await readVaultBridges();
@@ -773,12 +1044,14 @@ async function ensureProfileLibraryFolders(profile) {
   }
   await Promise.all([
     fs.promises.mkdir(indeckMediaPath(profile), { recursive: true }),
+    fs.promises.mkdir(galleryDefaultSourcesPath(profile), { recursive: true }),
     fs.promises.mkdir(extensionImportsPath(profile), { recursive: true }),
     fs.promises.mkdir(discardsPath(profile), { recursive: true }),
   ]);
+  await ensureProfileFolderIcon(indeckMediaPath(profile));
   return profile;
 }
-async function ensureProfileDefaultSaveSource(profile, data) {
+async function ensureProfileDefaultSaveSource(profile, data, { scan = true } = {}) {
   const folder = extensionImportsPath(profile);
   data.sources ||= [];
   let source = data.sources.find(item => String(item.id) === WEB_IMPORTS_SOURCE_ID)
@@ -791,8 +1064,13 @@ async function ensureProfileDefaultSaveSource(profile, data) {
   }
   if (source.path !== folder) { source.path = folder; changed = true; }
   if (source.name !== 'DefaultSave') { source.name = 'DefaultSave'; changed = true; }
-  const scanned = await scanDirectoryKeepingKnownIds(folder, source);
-  if (JSON.stringify(source.assets || []) !== JSON.stringify(scanned)) { source.assets = scanned; changed = true; }
+  // Reading a Library snapshot must be metadata-only.  Recursive scans happen
+  // at recovery/import/refresh time or after a watcher event, never merely
+  // because React asks for the current state.
+  if (scan) {
+    const scanned = await scanDirectoryKeepingKnownIds(folder, source);
+    if (JSON.stringify(source.assets || []) !== JSON.stringify(scanned)) { source.assets = scanned; changed = true; }
+  }
   return changed;
 }
 async function ensureProfileMainLibrarySource(profile, data) {
@@ -805,12 +1083,12 @@ async function ensureProfileMainLibrarySource(profile, data) {
     || data.sources.find(item => normalizedPath(item.path) === normalizedPath(root));
   let changed = false;
   if (!source) {
-    source = { id: PROFILE_MAIN_LIBRARY_SOURCE_ID, name: 'InDeckMedia', path: root, assets: [] };
+    source = { id: PROFILE_MAIN_LIBRARY_SOURCE_ID, name: 'MosaicMedia', path: root, assets: [] };
     data.sources.push(source);
     changed = true;
   }
   if (source.path !== root) { source.path = root; changed = true; }
-  if (!source.name) { source.name = 'InDeckMedia'; changed = true; }
+  if (!source.name || source.name === 'InDeckMedia') { source.name = 'MosaicMedia'; changed = true; }
   const managedChildFolders = [
     extensionImportsPath(profile),
     // Discards is InDeck's trash. It must never be surfaced through the root
@@ -848,9 +1126,10 @@ function safeFolderPart(value) {
   return clean.slice(0, 100) || 'Untitled Gallery';
 }
 function galleryDefaultSourceId(galleryId) { return `indeck-gallery-default:${String(galleryId)}`; }
+function galleryDefaultSourcesPath(profile) { return path.join(indeckMediaPath(profile), 'Galleries'); }
 function galleryDefaultSourcePathWithSuffix(profile, galleryName, index) {
   const base = `${safeFolderPart(galleryName)} Default Source`;
-  return path.join(indeckMediaPath(profile), index > 0 ? `${base} ${index}` : base);
+  return path.join(galleryDefaultSourcesPath(profile), index > 0 ? `${base} ${index}` : base);
 }
 async function availableGalleryDefaultSourcePath(profile, data, gallery, currentPath = null) {
   const sourceId = String(gallery.defaultSourceId || galleryDefaultSourceId(gallery.id));
@@ -927,7 +1206,7 @@ async function moveFileSafely(from, to) {
 async function discardGalleryDefaultSource(profile, { sourceId, sourcePath }) {
   const folder = path.resolve(String(sourcePath || ''));
   if (!String(sourceId || '').startsWith('indeck-gallery-default:') || !isPathInside(indeckMediaPath(profile), folder)) {
-    throw new Error('Only a Gallery Default Source inside InDeckMedia can be discarded');
+    throw new Error('Only a Gallery Default Source inside MosaicMedia can be discarded');
   }
   const exists = await fs.promises.stat(folder).then(stat => stat.isDirectory()).catch(() => false);
   if (!exists) return { source: { id: DISCARDS_SOURCE_ID, name: 'Discards', path: discardsPath(profile) }, moved: [] };
@@ -979,15 +1258,28 @@ async function ensureGalleryDefaultSource(profile, data, gallery, preferredPath)
   const id = String(gallery.defaultSourceId || galleryDefaultSourceId(gallery.id));
   const existing = (data.sources || []).find(source => String(source.id) === id);
   const current = existing?.path || gallery.defaultSourcePath;
-  // Recovery recreates a missing managed folder at its recorded location. Do
-  // not silently move a Gallery that already has a valid/default path.
-  const target = preferredPath || current || await availableGalleryDefaultSourcePath(profile, data, gallery, current);
-  if (current && normalizedPath(current) !== normalizedPath(target)) await moveDirectoryIfNeeded(current, target);
+  const galleryRoot = galleryDefaultSourcesPath(profile);
+  const managedPath = [preferredPath, current]
+    .map(value => value ? String(value) : null)
+    .find(value => value && isPathInside(galleryRoot, value));
+  // A Gallery DMS always belongs inside MosaicMedia/Galleries. Older DMS
+  // folders directly under the Library are moved into this parent folder;
+  // external/stale paths are repaired into a new managed DMS there instead.
+  const target = managedPath || await availableGalleryDefaultSourcePath(profile, data, gallery, current);
+  const moved = current && normalizedPath(current) !== normalizedPath(target)
+    ? await moveDirectoryIfNeeded(current, target)
+    : false;
   await fs.promises.mkdir(target, { recursive: true });
   const source = existing || { id, name: 'Default Source', path: target, assets: [] };
   source.id = id;
   source.name = 'Default Source';
   source.path = target;
+  if (moved && current) {
+    source.assets = (source.assets || []).map(asset => ({
+      ...asset,
+      path: isPathInside(current, asset.path) ? path.join(target, path.relative(current, asset.path)) : asset.path,
+    }));
+  }
   source.assets = await scanDirectoryKeepingKnownIds(target, source);
   if (!existing) data.sources = [...(data.sources || []), source];
   gallery.defaultSourceId = id;
@@ -998,31 +1290,18 @@ async function ensureGalleryDefaultSource(profile, data, gallery, preferredPath)
   for (const asset of source.assets) if (!discarded.has(String(asset.id)) && !gallery.items.includes(asset.id)) gallery.items.push(asset.id);
   return source;
 }
-async function disconnectMissingGalleryDefaultSources(data) {
-  let changed = false;
+async function ensureDefaultSourcesForExistingGalleries(profile, data) {
+  const before = JSON.stringify({
+    sources: data.sources || [],
+    collections: data.collections || [],
+  });
   for (const gallery of data.collections || []) {
-    const sourceId = gallery.defaultSourceId ? String(gallery.defaultSourceId) : null;
-    if (!sourceId) continue;
-    const source = (data.sources || []).find(item => String(item.id) === sourceId);
-    const sourcePath = source?.path || gallery.defaultSourcePath;
-    const exists = sourcePath && await fs.promises.stat(sourcePath).then(stat => stat.isDirectory()).catch(() => false);
-    if (exists) continue;
-
-    // A manually deleted Default Source is a real disconnect. Do not recreate
-    // it at startup; an explicit Extension save may create and reconnect it.
-    const assetIds = new Set((source?.assets || []).map(asset => String(asset.id)));
-    data.sources = (data.sources || []).filter(item => String(item.id) !== sourceId);
-    gallery.sourceIds = (gallery.sourceIds || []).map(String).filter(id => id !== sourceId);
-    for (const field of ['items', 'discardedIds', 'manualItemIds', 'extensionItemIds']) {
-      if (Array.isArray(gallery[field])) gallery[field] = gallery[field].map(String).filter(id => !assetIds.has(id));
-    }
-    if (assetIds.has(String(gallery.coverId))) delete gallery.coverId;
-    delete gallery.defaultSourceId;
-    delete gallery.defaultSourcePath;
-    for (const assetId of assetIds) delete data.assetMeta?.[assetId];
-    changed = true;
+    await ensureGalleryDefaultSource(profile, data, gallery, gallery.defaultSourcePath);
   }
-  return changed;
+  return before !== JSON.stringify({
+    sources: data.sources || [],
+    collections: data.collections || [],
+  });
 }
 async function scanDirectoryKeepingKnownIds(folder, source) {
   const previousIds = new Map((source?.assets || []).map(asset => [normalizedPath(asset.path), asset.id]));
@@ -1063,31 +1342,113 @@ function sanitizeExtensionGalleryMembership(profile, data) {
   }
   return changed;
 }
-function isMediaLocationSyncCandidate(profile, assetPath, targetFolder) {
-  const sourceParent = normalizedPath(path.dirname(targetFolder));
-  const assetFolder = normalizedPath(path.dirname(assetPath));
-  return assetFolder === sourceParent || assetFolder === normalizedPath(extensionImportsPath(profile));
-}
-async function syncMediaLocations(profile, entries) {
+async function refreshTrackedSources(profile, folders = []) {
   const data = await readStore(profile);
-  const sources = data.sources || [];
-  const moved = [], skipped = [];
-  for (const entry of Array.isArray(entries) ? entries : []) {
-    const source = sources.find(item => item.id === entry?.targetSourceId);
-    const assetPath = path.resolve(String(entry?.assetPath || ''));
-    if (!source || !entry?.assetId || !assetPath || !isMediaLocationSyncCandidate(profile, assetPath, source.path)) { skipped.push({ assetId: entry?.assetId, reason: 'not-eligible' }); continue; }
-    const targetPath = path.join(source.path, path.basename(assetPath));
-    if (normalizedPath(assetPath) === normalizedPath(targetPath)) { skipped.push({ assetId: entry.assetId, reason: 'already-in-source' }); continue; }
-    try {
-      const [assetInfo, targetInfo, targetExists] = await Promise.all([fs.promises.stat(assetPath), fs.promises.stat(source.path), fs.promises.access(targetPath).then(() => true).catch(() => false)]);
-      if (!assetInfo.isFile() || !targetInfo.isDirectory()) { skipped.push({ assetId: entry.assetId, reason: 'invalid-path' }); continue; }
-      if (targetExists) { skipped.push({ assetId: entry.assetId, reason: 'target-exists' }); continue; }
-      try { await fs.promises.rename(assetPath, targetPath); }
-      catch (error) { if (error.code !== 'EXDEV') throw error; await fs.promises.copyFile(assetPath, targetPath); await fs.promises.unlink(assetPath); }
-      moved.push({ assetId: entry.assetId, from: assetPath, to: targetPath });
-    } catch (error) { skipped.push({ assetId: entry.assetId, reason: error.code || 'move-failed' }); }
+  const requested = new Set((Array.isArray(folders) ? folders : []).map(normalizedPath));
+  const targets = (data.sources || []).filter(source => !requested.size || requested.has(normalizedPath(source.path)));
+  const removedIds = new Set();
+  const addedIdsBySource = new Map();
+  let changed = false;
+  for (const source of targets) {
+    if (isInDeckDiscardPath(profile, source.path)) continue;
+    const previousByPath = new Map((source.assets || []).map(asset => [normalizedPath(asset.path), String(asset.id)]));
+    const previousIds = new Set(previousByPath.values());
+    const result = await scanSource(profile, source);
+    if (!result.folder) continue;
+    if (normalizedPath(source.path) !== normalizedPath(result.folder)) {
+      source.path = result.folder;
+      source.name = path.basename(result.folder) || source.name;
+      changed = true;
+    }
+    if (result.tracking) source.tracking = result.tracking;
+    if (result.vaultBridgeId) source.vaultBridgeId = result.vaultBridgeId;
+    const nextAssets = (result.assets || []).map(asset => ({ ...asset, id: previousByPath.get(normalizedPath(asset.path)) || asset.id }));
+    const nextIds = new Set(nextAssets.map(asset => String(asset.id)));
+    previousIds.forEach(id => { if (!nextIds.has(id)) removedIds.add(id); });
+    addedIdsBySource.set(String(source.id), [...nextIds].filter(id => !previousIds.has(id)));
+    if (JSON.stringify(source.assets || []) !== JSON.stringify(nextAssets)) { source.assets = nextAssets; changed = true; }
   }
-  return { moved, skipped };
+  for (const gallery of data.collections || []) {
+    const addedIds = (gallery.sourceIds || []).flatMap(sourceId => addedIdsBySource.get(String(sourceId)) || []);
+    if (!addedIds.length) continue;
+    gallery.items ||= [];
+    const discarded = new Set((gallery.discardedIds || []).map(String));
+    for (const assetId of addedIds) {
+      if (discarded.has(assetId) || gallery.items.map(String).includes(assetId)) continue;
+      gallery.items.push(assetId);
+      const meta = (data.assetMeta ||= {})[assetId] ||= {};
+      meta.tags ||= [];
+      meta.persons ||= [];
+      meta.tagGroups ||= {};
+      for (const tag of gallery.defaultTags || []) if (!meta.tags.includes(tag)) meta.tags.push(tag);
+      for (const person of gallery.defaultPersons || []) if (!meta.persons.includes(person)) meta.persons.push(person);
+      for (const [groupId, values] of Object.entries(gallery.autoTagGroups || {})) {
+        const key = String(groupId);
+        const target = meta.tagGroups[key] ||= [];
+        for (const value of values || []) if (!target.includes(value)) target.push(value);
+      }
+      changed = true;
+    }
+  }
+  changed = removeLibraryAssetReferences(data, removedIds) || changed;
+  if (changed) await writeStore(profile, data);
+  return { refreshedSourceIds: targets.map(source => String(source.id)), removedAssetIds: [...removedIds] };
+}
+
+function localMediaSource(profile, source) {
+  return source && !source.vaultBridgeId && source.path && !isRecycleBinPath(source.path) && !isInDeckDiscardPath(profile, source.path);
+}
+
+async function syncMediaLocations(profile) {
+  profile = await ensureProfileLibraryFolders(profile);
+  const data = await readStore(profile);
+  await ensureProfileDefaultSaveSource(profile, data);
+  const moved = [], skipped = [], conflicts = [];
+
+  // A physical file can have only one home. Ensure every Gallery has its DMS
+  // first, then select it only when that Gallery is the file's sole owner.
+  for (const gallery of data.collections || []) {
+    try { await ensureGalleryDefaultSource(profile, data, gallery, gallery.defaultSourcePath); }
+    catch (error) { skipped.push({ galleryId: gallery.id, reason: error.code || 'default-source-unavailable' }); }
+  }
+  const sourceById = new Map((data.sources || []).map(source => [String(source.id), source]));
+
+  const assets = (data.sources || []).flatMap(source => (source.assets || []).map(asset => ({ source, asset })));
+  for (const { source: origin, asset } of assets) {
+    const assetId = String(asset.id);
+    const assetPath = String(asset.path || '');
+    if (!localMediaSource(profile, origin) || !assetPath || asset.vault || isRecycleBinPath(assetPath) || isInDeckDiscardPath(profile, assetPath)) {
+      skipped.push({ assetId, reason: 'not-local' });
+      continue;
+    }
+    const owners = (data.collections || []).filter(gallery =>
+      !(gallery.discardedIds || []).map(String).includes(assetId) && (gallery.items || []).map(String).includes(assetId),
+    );
+    if (owners.length > 1) {
+      conflicts.push({ assetId, reason: 'multiple-galleries', galleryIds: owners.map(gallery => String(gallery.id)) });
+      continue;
+    }
+    const target = owners.length === 1
+      ? sourceById.get(String(owners[0].defaultSourceId || galleryDefaultSourceId(owners[0].id)))
+      : sourceById.get(WEB_IMPORTS_SOURCE_ID);
+    if (!target?.path) { skipped.push({ assetId, reason: 'target-unavailable' }); continue; }
+    const targetPath = path.join(target.path, path.basename(assetPath));
+    if (normalizedPath(assetPath) === normalizedPath(targetPath)) { skipped.push({ assetId, reason: 'already-in-default-source' }); continue; }
+    try {
+      const [assetInfo, targetInfo, targetExists] = await Promise.all([
+        fs.promises.stat(assetPath), fs.promises.stat(target.path), fs.promises.access(targetPath).then(() => true).catch(() => false),
+      ]);
+      if (!assetInfo.isFile() || !targetInfo.isDirectory()) { skipped.push({ assetId, reason: 'invalid-path' }); continue; }
+      if (targetExists) { skipped.push({ assetId, reason: 'target-exists' }); continue; }
+      await moveFileSafely(assetPath, targetPath);
+      origin.assets = (origin.assets || []).filter(item => String(item.id) !== assetId);
+      target.assets ||= [];
+      target.assets.push({ ...asset, path: targetPath, relativePath: path.basename(targetPath) });
+      moved.push({ assetId, from: assetPath, to: targetPath, galleryId: owners[0] ? String(owners[0].id) : null });
+    } catch (error) { skipped.push({ assetId, reason: error.code || 'move-failed' }); }
+  }
+  await writeStore(profile, data);
+  return { moved, skipped, conflicts };
 }
 function broadcast(profileId, channel, value) {
   const window = profileWindows.get(String(profileId));
@@ -1208,10 +1569,24 @@ async function importWebImage(profile, sourceUrl, galleryId = null) {
   broadcast(profile.id, 'media:imported', { asset, sourceId: source.id, galleryId: gallery?.id || null });
   return { asset, galleryId: gallery?.id || null, saved: true };
 }
-function nativeHostManifestPath() { return path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'InDeck', 'native-messaging', `${NATIVE_HOST_NAME}.json`); }
-function nativeHostLauncherPath() { return path.join(path.dirname(nativeHostManifestPath()), `${NATIVE_HOST_NAME}.cmd`); }
+function nativeHostManifestPath(hostName = NATIVE_HOST_NAME) {
+  const folder = app.isPackaged ? 'Mosaic' : 'MosaicTest';
+  return path.join(process.env.LOCALAPPDATA || app.getPath('userData'), folder, 'native-messaging', `${hostName}.json`);
+}
+function nativeHostLauncherPath(hostName = NATIVE_HOST_NAME) { return path.join(path.dirname(nativeHostManifestPath(hostName)), `${hostName}.cmd`); }
 async function nativeHostExecutablePath() {
-  if (app.isPackaged) return app.getPath('exe');
+  if (app.isPackaged) {
+    // Electron GUI mode does not provide a reliable binary stdin/stdout
+    // channel for Chrome Native Messaging. Run the bundled headless worker
+    // with Electron's Node runtime instead; it has no BrowserWindow, no
+    // single-instance lock, and preserves protocol frames byte-for-byte.
+    const launcher = nativeHostLauncherPath();
+    const worker = path.join(path.dirname(app.getPath('exe')), 'resources', 'app.asar', 'extension', 'native-host.js');
+    const content = `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${app.getPath('exe')}" "${worker}" %*\r\n`;
+    await fs.promises.mkdir(path.dirname(launcher), { recursive: true });
+    await fs.promises.writeFile(launcher, content, 'utf8');
+    return launcher;
+  }
   const hostScript = path.join(__dirname, 'extension', 'native-host.js');
   if (!fs.existsSync(hostScript)) throw new Error('Native messaging worker was not found');
   // Electron's GUI runtime does not expose Chrome's binary stdin reliably in
@@ -1223,27 +1598,33 @@ async function nativeHostExecutablePath() {
   return launcher;
 }
 async function registerNativeMessagingHost() {
-  const manifestPath = nativeHostManifestPath();
-  const manifest = {
-    name: NATIVE_HOST_NAME,
+  const hostNames = app.isPackaged ? [NATIVE_HOST_NAME, LEGACY_NATIVE_HOST_NAME] : [NATIVE_HOST_NAME];
+  const executable = await nativeHostExecutablePath();
+  const registrations = [];
+  for (const hostName of hostNames) {
+    const manifestPath = nativeHostManifestPath(hostName);
+    const manifest = {
+      name: hostName,
     description: 'Mosaic profile-aware media importer',
-    path: await nativeHostExecutablePath(),
+      path: executable,
     type: 'stdio',
     allowed_origins: [`chrome-extension://${EXTENSION_ID}/`],
-  };
-  await fs.promises.mkdir(path.dirname(manifestPath), { recursive: true });
-  await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
-  const registryKeys = [
-    `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
-    `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
-    `HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\${NATIVE_HOST_NAME}`,
-  ];
-  const registrations = await Promise.all(registryKeys.map(async key => {
-    const result = await runFileCommand('reg', ['add', key, '/ve', '/t', 'REG_SZ', '/d', manifestPath, '/f']);
-    return { key, installed: !result.error };
-  }));
+    };
+    await fs.promises.mkdir(path.dirname(manifestPath), { recursive: true });
+    await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    const registryKeys = [
+      `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${hostName}`,
+      `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${hostName}`,
+      `HKCU\\Software\\BraveSoftware\\Brave-Browser\\NativeMessagingHosts\\${hostName}`,
+    ];
+    const result = await Promise.all(registryKeys.map(async key => {
+      const command = await runFileCommand('reg', ['add', key, '/ve', '/t', 'REG_SZ', '/d', manifestPath, '/f']);
+      return { key, hostName, manifestPath, installed: !command.error };
+    }));
+    registrations.push(...result);
+  }
   if (!registrations.some(item => item.installed)) throw new Error('Could not register the native messaging host');
-  return { installed: true, manifestPath, registrations };
+  return { installed: true, manifestPaths: [...new Set(registrations.map(item => item.manifestPath))], registrations };
 }
 function writeNativeMessage(value) {
   const payload = Buffer.from(JSON.stringify(value), 'utf8');
@@ -1255,7 +1636,26 @@ async function handleNativeMessage(message) {
   const type = String(message?.type || '');
   if (type === 'profiles:list') {
     const registry = await readProfileRegistry();
-    return { ok: true, profiles: registry.profiles.filter(isProfileReady).map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault) })) };
+    const profiles = await Promise.all(registry.profiles
+      .slice()
+      .sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+      .map(async profile => {
+        const configured = isProfileReady(profile);
+        const reachable = configured && await fs.promises.stat(profile.mediaPath).then(stat => stat.isDirectory()).catch(() => false);
+        return {
+          id: profile.id,
+          name: profile.name,
+          isDefault: Boolean(profile.isDefault),
+          available: Boolean(reachable),
+          reason: !configured
+            ? 'Default Library Location has not been configured.'
+            : reachable ? null : 'Mosaic cannot access this profile’s Library location.',
+        };
+      }));
+    return {
+      ok: true,
+      profiles,
+    };
   }
   if (type === 'profile:config') {
     let profile = await profileById(message.profileId);
@@ -1307,7 +1707,10 @@ function processNativeInput() {
 }
 function startNativeMessagingHost() {
   const origin = process.argv.find(argument => String(argument).startsWith('chrome-extension://'));
-  if (origin !== `chrome-extension://${EXTENSION_ID}/`) {
+  // Chrome already validates `allowed_origins` in the native-host manifest.
+  // Electron production builds may omit the protocol-looking origin from
+  // process.argv, so only reject an origin when one is actually available.
+  if (origin && origin !== `chrome-extension://${EXTENSION_ID}/`) {
     writeNativeMessage({ ok: false, error: 'Unauthorized extension' });
     if (nativeHostKeepAlive) clearInterval(nativeHostKeepAlive);
     app.quit();
@@ -1366,18 +1769,69 @@ function focusWindow(window) {
   window.show();
   window.focus();
 }
+function readWindowState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(WINDOW_STATE_FILE, 'utf8'));
+    const width = Math.round(Number(saved?.width));
+    const height = Math.round(Number(saved?.height));
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
+    return {
+      width: Math.max(1050, width),
+      height: Math.max(700, height),
+      x: Number.isFinite(Number(saved.x)) ? Math.round(Number(saved.x)) : undefined,
+      y: Number.isFinite(Number(saved.y)) ? Math.round(Number(saved.y)) : undefined,
+      isMaximized: Boolean(saved.isMaximized),
+    };
+  } catch { return null; }
+}
+function usableWindowState() {
+  const saved = readWindowState();
+  if (!saved) return { width: 1480, height: 920, isMaximized: false };
+  const point = saved.x == null || saved.y == null ? null : { x: saved.x, y: saved.y };
+  const display = point ? screen.getDisplayNearestPoint(point) : screen.getPrimaryDisplay();
+  const area = display.workArea;
+  // A previously used monitor may have been disconnected. Keep the size in a
+  // usable range and only restore coordinates that still land on a display.
+  const isVisible = point && saved.x + 120 >= area.x && saved.x <= area.x + area.width - 120
+    && saved.y + 80 >= area.y && saved.y <= area.y + area.height - 80;
+  return {
+    width: Math.min(saved.width, area.width),
+    height: Math.min(saved.height, area.height),
+    ...(isVisible ? { x: saved.x, y: saved.y } : {}),
+    isMaximized: saved.isMaximized,
+  };
+}
+function saveWindowState(window) {
+  if (!window || window.isDestroyed()) return;
+  const bounds = window.getNormalBounds();
+  const snapshot = { ...bounds, isMaximized: window.isMaximized() };
+  const temporary = `${WINDOW_STATE_FILE}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    // Persist synchronously on each native resize/move notification. Test
+    // windows are intentionally closed forcefully between builds, so a
+    // debounced asynchronous write can otherwise lose the last resize.
+    fs.mkdirSync(path.dirname(WINDOW_STATE_FILE), { recursive: true });
+    fs.writeFileSync(temporary, JSON.stringify(snapshot), 'utf8');
+    fs.renameSync(temporary, WINDOW_STATE_FILE);
+  } catch { /* Window state is a convenience, never a startup blocker. */ }
+}
 async function createWindow(profileId = null) {
   let profile = profileId ? await profileById(profileId) : await defaultProfile();
   if (!profile) throw new Error('Profile not found');
   if (isProfileReady(profile)) profile = await trackProfileLibraryLocation(profile);
   const existing = profileWindows.get(profile.id);
   if (existing && !existing.isDestroyed()) { focusWindow(existing); return existing; }
+  const { isMaximized: restoreMaximized, ...windowBounds } = usableWindowState();
   const window = new BrowserWindow({
-    width: 1480, height: 920, minWidth: 1050, minHeight: 700,
-    title: `Mosaic — ${profile.name}`, titleBarStyle: 'hidden', backgroundColor: '#111217',
-    icon: fs.existsSync(APP_ICON_PATH) ? APP_ICON_PATH : undefined,
+    ...windowBounds,
+    minWidth: 1050, minHeight: 700,
+    title: `${APP_DISPLAY_NAME} — ${profile.name}`, titleBarStyle: 'hidden', backgroundColor: '#111217',
+    icon: fs.existsSync(APP_ICON_ICO_PATH) ? APP_ICON_ICO_PATH : fs.existsSync(APP_ICON_PATH) ? APP_ICON_PATH : undefined,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true }
   });
+  // BrowserWindow accepts bounds in its constructor but does not restore a
+  // custom `isMaximized` field. Apply it explicitly after construction.
+  if (restoreMaximized) window.maximize();
   // BrowserWindow.webContents is destroyed before the `closed` event runs.
   // Keep the stable id now so the cleanup handler never touches a destroyed
   // Electron object when the custom Close button is used.
@@ -1385,11 +1839,24 @@ async function createWindow(profileId = null) {
   window.webContents.on('did-fail-load', (_, errorCode, errorDescription, validatedURL) => {
     console.error('[InDeck renderer load failed]', errorCode, errorDescription, validatedURL);
   });
+  // The Vite document title is intentionally generic. Keep test windows
+  // visibly distinct from the installed Mosaic application in the taskbar.
+  window.webContents.on('page-title-updated', event => {
+    event.preventDefault();
+    window.setTitle(`${APP_DISPLAY_NAME} — ${profile.name}`);
+  });
   window.webContents.on('console-message', (_, level, message, line, sourceId) => {
     if (level >= 2) console.error('[InDeck renderer]', message, `${sourceId}:${line}`);
   });
   window.webContents.on('render-process-gone', (_, details) => {
     console.error('[InDeck renderer process gone]', details.reason, details.exitCode);
+  });
+  window.on('resize', () => saveWindowState(window));
+  window.on('move', () => saveWindowState(window));
+  window.on('maximize', () => saveWindowState(window));
+  window.on('unmaximize', () => saveWindowState(window));
+  window.on('close', () => {
+    saveWindowState(window);
   });
   window.on('closed', () => {
     webContentsProfileIds.delete(webContentsId);
@@ -1405,6 +1872,9 @@ async function createWindow(profileId = null) {
 }
 
 app.whenReady().then(async () => {
+  await migrateLegacyAppData();
+  await migrateProfileDataPaths();
+  await ensureTaskbarIcon();
   if (NATIVE_HOST_REGISTRATION_MODE) {
     try {
       const registration = await registerNativeMessagingHost();
@@ -1421,38 +1891,45 @@ app.whenReady().then(async () => {
     startNativeMessagingHost();
     return;
   }
+  const startupProfiles = await readProfileRegistry();
+  for (const profile of startupProfiles.profiles) {
+    if (isProfileReady(profile)) await restoreProfileLibraryLocation(profile);
+  }
+  await ensureProfileShortcuts();
   let currentDefaultProfile = await defaultProfile();
   if (isProfileReady(currentDefaultProfile)) {
     currentDefaultProfile = await trackProfileLibraryLocation(currentDefaultProfile);
     const library = await readStore(currentDefaultProfile);
     const migrated = await migrateInDeckMedia(currentDefaultProfile, library);
     const sanitized = sanitizeExtensionGalleryMembership(currentDefaultProfile, library);
+    // Gallery Default Media Sources are Mosaic-managed folders. Missing ones
+    // are repaired at startup instead of being treated as disconnected user
+    // folders, preserving the DMS link created with every Gallery.
+    const repairedDefaults = await ensureDefaultSourcesForExistingGalleries(currentDefaultProfile, library);
     const prunedUnavailable = await reconcileUnavailableSources(currentDefaultProfile, library);
-    const disconnectedDefaults = await disconnectMissingGalleryDefaultSources(library);
-    if (migrated || sanitized || prunedUnavailable || disconnectedDefaults) await writeStore(currentDefaultProfile, library);
+    if (migrated || sanitized || repairedDefaults || prunedUnavailable) await writeStore(currentDefaultProfile, library);
   }
   registerNativeMessagingHost().catch(error => console.error('Could not register native messaging host:', error.message));
   configureAutoUpdater();
   async function readReconciledStore(profile) {
     const data = await readStore(profile);
-    // DefaultSave is the permanent Main Gallery destination for extension
-    // imports. Re-index it on every renderer snapshot so a file that has
-    // already reached the folder cannot be invisible just because an older
-    // state write omitted its source record.
-    const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data);
-    const prunedUnavailable = await reconcileUnavailableSources(profile, data);
-    const disconnectedDefaults = await disconnectMissingGalleryDefaultSources(data);
-    if (defaultSaveChanged || prunedUnavailable || disconnectedDefaults) await writeStore(profile, data);
+    // Snapshot reads are on the hot path during app startup, source watcher
+    // updates, and UI changes.  They must not recursively walk DefaultSave or
+    // stat every known Media.  Source changes are reconciled by the watcher,
+    // explicit refresh, import, recovery, and source removal flows instead.
+    const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data, { scan: false });
+    if (defaultSaveChanged) await writeStore(profile, data);
     return data;
   }
+  ipcMain.handle('app:display-name', () => APP_DISPLAY_NAME);
   ipcMain.handle('store:read', async event => readReconciledStore(await profileForWebContents(event.sender)));
   ipcMain.handle('store:write', async (event, value) => {
     const profile = await profileForWebContents(event.sender);
     const data = value && typeof value === 'object' ? value : {};
-    // A renderer may hold an old snapshot while a file/source is deleted.
-    // Reconcile before every write so stale UI state can never resurrect it.
-    await reconcileUnavailableSources(profile, data);
-    await disconnectMissingGalleryDefaultSources(data);
+    // Filesystem reconciliation is intentionally not done here. A normal UI
+    // edit used to stat every asset in every Media Source before writing the
+    // state, which made large Libraries progressively slower. Watcher-driven
+    // `sources:refresh` owns that work and persists the reconciled result.
     return writeStore(profile, data);
   });
   // New renderers consume a versioned snapshot instead of treating browser
@@ -1461,7 +1938,9 @@ app.whenReady().then(async () => {
     const profile = await profileForWebContents(event.sender);
     return { version: 1, library: await readReconciledStore(profile) };
   });
-  ipcMain.handle('profiles:list', async () => (await readProfileRegistry()).profiles.map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, lastMediaPath: profile.lastMediaPath || null })));
+  ipcMain.handle('profiles:list', async () => (await readProfileRegistry()).profiles
+    .slice().sort((a, b) => Number(Boolean(b.isDefault)) - Number(Boolean(a.isDefault)))
+    .map(profile => ({ id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, lastMediaPath: profile.lastMediaPath || null })));
   ipcMain.handle('profiles:discarded-list', async () => (await readProfileRegistry()).discardedProfiles.map(profile => ({ id: profile.id, name: profile.name, initialized: isProfileReady(profile), mediaPath: profile.mediaPath || null, discardedAt: profile.discardedAt || null })));
   ipcMain.handle('profiles:current', async event => {
     const profile = await profileForWebContents(event.sender);
@@ -1474,7 +1953,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('profiles:rename', async (_, profileId, name) => {
     const profile = await renameProfile(profileId, name);
     const window = profileWindows.get(profile.id);
-    if (window && !window.isDestroyed()) window.setTitle(`Mosaic — ${profile.name}`);
+    if (window && !window.isDestroyed()) window.setTitle(`${APP_DISPLAY_NAME} — ${profile.name}`);
     return { id: profile.id, name: profile.name, isDefault: Boolean(profile.isDefault), initialized: isProfileReady(profile) };
   });
   ipcMain.handle('profiles:set-default', async (_, profileId) => {
@@ -1535,27 +2014,39 @@ app.whenReady().then(async () => {
     const data = await readStore(profile);
     const stored = (data.collections || []).find(gallery => String(gallery.id) === galleryId);
     const previousPath = payload.previousPath ? String(payload.previousPath) : null;
-    const gallery = {
+    // Persist the DMS record in the backend as part of Gallery creation. The
+    // renderer also persists its state, but this prevents a quick close or a
+    // render race from leaving a physical folder without its Gallery link.
+    const gallery = stored || {
       id: galleryId,
       name: galleryName,
-      defaultSourceId: stored?.defaultSourceId || galleryDefaultSourceId(galleryId),
-      defaultSourcePath: previousPath || stored?.defaultSourcePath,
+      defaultSourceId: galleryDefaultSourceId(galleryId),
+      defaultSourcePath: previousPath,
+      sourceIds: [],
+      items: [],
     };
-    const target = await availableGalleryDefaultSourcePath(profile, data, gallery, previousPath || stored?.defaultSourcePath);
-    if (previousPath && normalizedPath(previousPath) !== normalizedPath(target)) await moveDirectoryIfNeeded(previousPath, target);
-    await fs.promises.mkdir(target, { recursive: true });
-    return { id: gallery.defaultSourceId, name: 'Default Source', path: target };
+    if (!stored) {
+      gallery.name = galleryName;
+      gallery.defaultSourcePath = previousPath;
+    }
+    const source = await ensureGalleryDefaultSource(profile, data, gallery, previousPath || gallery.defaultSourcePath);
+    await writeStore(profile, data);
+    return { id: source.id, name: source.name, path: source.path };
   });
   ipcMain.handle('gallery:default-source:discard', async (event, payload = {}) => discardGalleryDefaultSource(await profileForWebContents(event.sender), payload));
   ipcMain.handle('folder:scan', async (event, source) => scanSource(await profileForWebContents(event.sender), source));
   ipcMain.handle('source:catalog', async (event, source) => cachedSourceScan(await profileForWebContents(event.sender), source));
   ipcMain.handle('source:catalog-remove', async (event, sourceId) => removeCachedSource(await profileForWebContents(event.sender), sourceId));
   ipcMain.handle('source:resolve', (_, source) => resolveSource(source));
-  ipcMain.handle('thumbnails:ensure', async (event, assets) => createThumbnails(await profileForWebContents(event.sender), assets));
+  ipcMain.handle('thumbnails:ensure', async (event, assets, requestId) => createThumbnails(await profileForWebContents(event.sender), assets, requestId));
+  ipcMain.handle('thumbnails:cancel', async (event, requestId) => {
+    cancelThumbnailRequest(await profileForWebContents(event.sender), requestId);
+  });
   ipcMain.handle('vault:bridges', async () => (await readVaultBridges())
     .filter(item => item?.id && item?.folder)
     .map(item => ({ id: String(item.id), folder: String(item.folder), tracking: bridgeTracking(item) })));
-  ipcMain.handle('media:sync-locations', async (event, entries) => syncMediaLocations(await profileForWebContents(event.sender), entries));
+  ipcMain.handle('media:sync-locations', async event => syncMediaLocations(await profileForWebContents(event.sender)));
+  ipcMain.handle('sources:refresh', async (event, folders) => refreshTrackedSources(await profileForWebContents(event.sender), folders));
   ipcMain.handle('sources:watch', (event, folders) => {
     return profileForWebContents(event.sender).then(profile => watchFolders(profile, event.sender, Array.isArray(folders) ? folders : []));
   });
@@ -1577,10 +2068,11 @@ app.whenReady().then(async () => {
     if (asset?.vault || !asset?.path) return false;
     return !(await shell.openPath(asset.path));
   });
-  ipcMain.handle('media:permanent-delete', async (_, asset) => {
+  ipcMain.handle('media:trash', async (_, asset) => {
     try {
-      if (asset?.vault) return (await fetch(asset.contentUrl.replace('/content?', '?'), { method: 'DELETE' })).ok;
-      await fs.promises.unlink(asset?.path || ''); return true;
+      if (asset?.vault || !asset?.path || isRecycleBinPath(asset.path)) return false;
+      await shell.trashItem(asset.path);
+      return true;
     }
     catch { return false; }
   });

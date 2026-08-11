@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Eye, EyeOff, Folder, FolderPlus, HardDrive, Heart, PanelRightClose, Pencil, Play, Trash2 } from "lucide-react";
+import { Check, Eye, EyeOff, Folder, FolderPlus, HardDrive, Heart, PanelRightClose, Pencil, Play, Search, Trash2 } from "lucide-react";
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
@@ -79,6 +79,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
   const [addingSource, setAddingSource] = useState(false);
   const [sourceMessage, setSourceMessage] = useState("");
   const [defaultSavePath, setDefaultSavePath] = useState("");
+  const [galleryQuery, setGalleryQuery] = useState("");
   useEffect(() => {
     const bridge = getInDeckBridge();
     if (!bridge) return;
@@ -90,6 +91,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
     return () => { active = false; };
   }, []);
   const excluded = new Set(state.excludedFolderIds);
+  const visibleFolders = state.folders.filter((folder) => folder.name.toLowerCase().includes(galleryQuery.trim().toLowerCase()));
   const excludedFolders = state.folders.filter((folder) => excluded.has(folder.id));
   const includesLockedGallery = excludedFolders.some((folder) => folder.locked);
   const isDefaultMedia = (mediaId: string) => {
@@ -147,8 +149,12 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           <span className={cn("absolute top-0.5 size-3.5 rounded-full bg-white shadow-sm transition-transform", state.ignoreMediaSourcesWhenExcluded ? "translate-x-[18px]" : "translate-x-0.5")} />
         </span>
       </button>
-      <div className="space-y-1.5">
-        {state.folders.map((folder) => {
+      <label className="glass-btn flex items-center gap-2 rounded-lg px-2.5 py-2">
+        <Search className="size-3.5 text-muted-foreground" />
+        <input value={galleryQuery} onChange={(event) => setGalleryQuery(event.target.value)} placeholder={t("searchGalleries")} className="min-w-0 flex-1 bg-transparent text-xs outline-none" />
+      </label>
+      <div className="app-scroll max-h-60 space-y-1.5 overflow-y-auto pr-1">
+        {visibleFolders.map((folder) => {
           const off = excluded.has(folder.id);
           return <button key={folder.id} onClick={() => toggleExcludedFolder(folder.id)} className="glass-btn flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm">
             {off ? <EyeOff className="size-4 text-muted-foreground" /> : <Eye className="size-4 text-primary" />}
@@ -166,6 +172,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           </button>;
         })()}
         {state.folders.length === 0 && <p className="text-sm text-muted-foreground">{t("none")}</p>}
+        {state.folders.length > 0 && visibleFolders.length === 0 && <p className="py-3 text-center text-xs text-muted-foreground">{t("noGalleriesFound")}</p>}
       </div>
       <section className="space-y-2.5 border-t border-border/50 pt-4">
         <div className="flex items-center justify-between gap-3">
@@ -333,15 +340,15 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             disabled={addingSource}
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
-              if (!bridge) { setSourceMessage("Chỉ có thể thêm folder trong ứng dụng Mosaic."); return; }
+              if (!bridge) { setSourceMessage(t("onlyDesktopApp")); return; }
               const path = await bridge.pickFolder();
               if (!path) return;
               setAddingSource(true);
               setSourceMessage("");
               const result = await attachSourceFolder(folder.id, path);
               setAddingSource(false);
-              if (result === "exists") setSourceMessage("Folder này đã là Media Source của Gallery.");
-              if (result === "unavailable") setSourceMessage("Không thể đọc folder này. Vui lòng thử lại.");
+              if (result === "exists") setSourceMessage(t("sourceAlreadyInGallery"));
+              if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
             })()}
             className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
           >
@@ -366,12 +373,12 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
                 </span>
                 {!isDefaultSource && <button
                   type="button"
-                  aria-label={`Gỡ ${source.name} khỏi Gallery`}
-                  title="Gỡ source khỏi Gallery"
+                  aria-label={`${t("removeSourceFromGallery")}: ${source.name}`}
+                  title={t("removeSourceFromGallery")}
                   onClick={() => onConfirm({
-                    title: "Gỡ Media Source?",
-                    description: `Gỡ “${source.name}” khỏi Gallery “${folder.name}”. Media từ folder này sẽ không còn nằm trong Gallery, nhưng folder và file gốc vẫn được giữ nguyên.`,
-                    confirmLabel: "Gỡ source",
+                    title: t("removeSourceFromGallery"),
+                    description: t("removeSourceFromGalleryHint", { source: source.name, gallery: folder.name }),
+                    confirmLabel: t("removeSourceFromGallery"),
                     onConfirm: () => detachSourceFromFolder(folder.id, source.id),
                   })}
                   className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
@@ -386,7 +393,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><Folder className="size-4" /></span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm font-medium">{t("other")}</span>
-                <span className="block truncate text-[11px] text-muted-foreground">Media được thêm vào Gallery nhưng không thuộc Media Source.</span>
+                <span className="block truncate text-[11px] text-muted-foreground">{t("manualGalleryMediaHint")}</span>
                 <span className="mt-0.5 block text-[11px] text-muted-foreground">{otherMedia.length} media</span>
               </span>
             </div>

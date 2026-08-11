@@ -12,6 +12,7 @@ import { buildEmptyState } from "./initial-state";
 import type {
   AllsightState,
   Appearance,
+  ThemeColor,
   GalleryGroup,
   GalleryOrderEntry,
   Language,
@@ -229,8 +230,10 @@ function libraryToState(library: Record<string, any>): AllsightState {
     order,
     language: library.language === "en" ? "en" : "vi",
     appearance: library.appearance === "light" ? "light" : "dark",
+    themeColor: ["blue", "teal", "pink", "orange"].includes(library.themeColor) ? library.themeColor : "green",
     // This is a SHA-256 digest produced by the old InDeck flow, never plaintext.
     password: library.passwordHash ? String(library.passwordHash) : null,
+    appLockEnabled: Boolean(library.passwordHash && library.appLockEnabled),
     requirePasswordToUnlockGallery: Boolean(library.requirePasswordToUnlockGallery),
     thumbHeight: Math.max(100, Math.min(400, Math.round(Number(library.zoom ?? 200) / 50) * 50)),
     inspectorAutoOpen: library.inspectorAutoOpen !== false,
@@ -370,7 +373,9 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   });
   next.language = state.language;
   next.appearance = state.appearance;
+  next.themeColor = state.themeColor;
   next.passwordHash = state.password;
+  next.appLockEnabled = Boolean(state.password && state.appLockEnabled);
   next.requirePasswordToUnlockGallery = state.requirePasswordToUnlockGallery;
   next.inspectorAutoOpen = state.inspectorAutoOpen;
   next.lightboxFitMedia = state.lightboxFitMedia;
@@ -409,7 +414,7 @@ interface Ctx {
   toggleExcludeOtherMedia: () => void;
   toggleExcludeDefaultMedia: () => void;
   toggleIgnoreMediaSourcesWhenExcluded: () => void;
-  syncMediaLocation: () => number;
+  syncMediaLocation: () => Promise<{ moved: number; skipped: number; conflicts: number }>;
   duplicateMedia: (id: string) => void;
 
   // property groups
@@ -469,8 +474,10 @@ interface Ctx {
   // prefs
   setLanguage: (l: Language) => void;
   setAppearance: (a: Appearance) => void;
+  setThemeColor: (color: ThemeColor) => void;
   setThumbHeight: (n: number) => void;
   setPassword: (p: string | null) => void;
+  setAppLockEnabled: (value: boolean) => void;
   setRequirePasswordToUnlockGallery: (value: boolean) => void;
   setInspectorAutoOpen: (v: boolean) => void;
   setLightboxFitMedia: (v: boolean) => void;
@@ -549,17 +556,17 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
   // returns the snapshot.
   useEffect(() => {
     const bridge = getInDeckBridge();
-    if (!hydrated || !bridge?.watchSources || !bridge.onFolderChanged) return;
+    if (!hydrated || !bridge?.watchSources || !bridge.refreshSources || !bridge.onFolderChanged) return;
     const folders = [...new Set(state.sources.map((source) => source.path).filter(Boolean))];
     void bridge.watchSources(folders);
     let active = true;
     let queued = false;
-    const unsubscribe = bridge.onFolderChanged(() => {
+    const unsubscribe = bridge.onFolderChanged((folder) => {
       if (!active || queued) return;
       queued = true;
       window.setTimeout(() => {
         queued = false;
-        void bridge.readLibrarySnapshot().then(({ library }) => {
+        void bridge.refreshSources([folder]).then(() => bridge.readLibrarySnapshot()).then(({ library }) => {
           if (!active || !library || typeof library !== "object") return;
           desktopLibrary = library as Record<string, any>;
           skipPersist.current = true;
@@ -709,35 +716,21 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         ...s,
         ignoreMediaSourcesWhenExcluded: !s.ignoreMediaSourcesWhenExcluded,
       })),
-      syncMediaLocation: () => {
-        const s = state;
-        const targets = new Map<string, string>(); // mediaId -> new path
-        for (const f of s.folders) {
-          // Sources that actually own the files of this collection.
-          const dirs = new Set<string>();
-          for (const id of f.mediaIds) {
-            const m = s.media.find((x) => x.id === id);
-            const src = m && s.sources.find((x) => x.id === m.sourceId);
-            if (m && src && m.path.startsWith(`${src.path}/`)) dirs.add(src.path);
-          }
-          // Ambiguous when two or more qualifying sources -> skip this collection.
-          if (dirs.size !== 1) continue;
-          const base = [...dirs][0]!;
-          const sub = `${base}/${f.name.replace(/[\\/]+/g, "-")}`;
-          for (const id of f.mediaIds) {
-            const m = s.media.find((x) => x.id === id);
-            if (!m) continue;
-            const file = m.path.split("/").pop()!;
-            const next = `${sub}/${file}`;
-            if (next !== m.path) targets.set(id, next);
-          }
+      syncMediaLocation: async () => {
+        const bridge = getInDeckBridge();
+        if (!bridge) return { moved: 0, skipped: 0, conflicts: 0 };
+        const result = await bridge.syncMediaLocations();
+        const snapshot = await bridge.readLibrarySnapshot();
+        if (snapshot.library && typeof snapshot.library === "object") {
+          desktopLibrary = snapshot.library as Record<string, any>;
+          skipPersist.current = true;
+          setState(libraryToState(desktopLibrary));
         }
-        if (targets.size)
-          set((prev) => ({
-            ...prev,
-            media: prev.media.map((m) => (targets.has(m.id) ? { ...m, path: targets.get(m.id)! } : m)),
-          }));
-        return targets.size;
+        return {
+          moved: result.moved?.length ?? 0,
+          skipped: result.skipped?.length ?? 0,
+          conflicts: result.conflicts?.length ?? 0,
+        };
       },
 
 
@@ -868,11 +861,17 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           folders: [
             ...s.folders,
             (() => {
+              const requestedName = name.trim() || "Untitled Gallery";
+              const usedNames = new Set(s.folders.map((folder) => folder.name.trim().toLocaleLowerCase()));
+              let uniqueName = requestedName;
+              for (let number = 2; usedNames.has(uniqueName.toLocaleLowerCase()); number += 1) {
+                uniqueName = `${requestedName} (${number})`;
+              }
               const addedMediaIds = s.media.filter((media) => (options.sourceIds ?? []).includes(media.sourceId)).map((media) => media.id);
               const mediaIds = [...addedMediaIds].reverse();
               return {
               id,
-              name,
+              name: uniqueName,
               notes: options.notes ?? "",
               autoTags: options.autoTags ?? {},
               sourceIds: [...new Set(options.sourceIds ?? [])],
@@ -1546,8 +1545,10 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         }),
       setLanguage: (language) => set((s) => ({ ...s, language })),
       setAppearance: (appearance) => set((s) => ({ ...s, appearance })),
+      setThemeColor: (themeColor) => set((s) => ({ ...s, themeColor })),
       setThumbHeight: (thumbHeight) => set((s) => ({ ...s, thumbHeight })),
       setPassword: (password) => set((s) => ({ ...s, password })),
+      setAppLockEnabled: (appLockEnabled) => set((s) => ({ ...s, appLockEnabled: Boolean(s.password && appLockEnabled) })),
       setRequirePasswordToUnlockGallery: (requirePasswordToUnlockGallery) => set((s) => ({ ...s, requirePasswordToUnlockGallery })),
       setInspectorAutoOpen: (inspectorAutoOpen) => set((s) => ({ ...s, inspectorAutoOpen })),
       setLightboxFitMedia: (lightboxFitMedia) => set((s) => ({ ...s, lightboxFitMedia })),
@@ -1571,6 +1572,12 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
     mq.addEventListener("change", apply);
     return () => mq.removeEventListener("change", apply);
   }, [state.appearance]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    if (state.themeColor === "green") delete document.documentElement.dataset.themeColor;
+    else document.documentElement.dataset.themeColor = state.themeColor;
+  }, [state.themeColor]);
 
   const t = useMemo(() => makeTranslate(state.language), [state.language]);
 

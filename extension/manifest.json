@@ -13,6 +13,7 @@
     "css": ["content.css"],
     "run_at": "document_idle"
   }],
-  "action": { "default_title": "Mosaic Extension" },
+  "icons": { "16": "icons/mosaic.png", "32": "icons/mosaic.png", "48": "icons/mosaic.png", "128": "icons/mosaic.png" },
+  "action": { "default_title": "Mosaic Extension", "default_icon": { "16": "icons/mosaic.png", "32": "icons/mosaic.png", "48": "icons/mosaic.png", "128": "icons/mosaic.png" } },
   "options_ui": { "page": "options.html", "open_in_tab": true }
 }

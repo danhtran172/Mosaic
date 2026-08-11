@@ -7,9 +7,14 @@
 ; A browser extension without its desktop companion must not retain a stale
 ; native-host registration after Mosaic is removed.
 !macro customUnInstall
+  DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\com.mosaic.app"
+  DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.mosaic.app"
+  DeleteRegKey HKCU "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.mosaic.app"
   DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\com.indeck.mastervision"
   DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.indeck.mastervision"
   DeleteRegKey HKCU "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.indeck.mastervision"
   Delete "$LOCALAPPDATA\InDeck\native-messaging\com.indeck.mastervision.json"
   RMDir "$LOCALAPPDATA\InDeck\native-messaging"
+  Delete "$LOCALAPPDATA\Mosaic\native-messaging\com.mosaic.app.json"
+  RMDir "$LOCALAPPDATA\Mosaic\native-messaging"
 !macroend

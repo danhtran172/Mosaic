@@ -80,6 +80,7 @@ export type OrderEntry = { kind: "media" | "group"; id: string };
 export type GalleryOrderEntry = { kind: "folder" | "group"; id: string };
 
 export type Appearance = "light" | "dark" | "system";
+export type ThemeColor = "green" | "blue" | "teal" | "pink" | "orange";
 export type Language = "en" | "vi";
 export type FilterKind = "all" | "favorites" | "images" | "videos";
 
@@ -108,7 +109,10 @@ export interface AllsightState {
   order: OrderEntry[];
   language: Language;
   appearance: Appearance;
+  themeColor: ThemeColor;
   password: string | null;
+  /** Require the app password before a Library is shown after startup. */
+  appLockEnabled: boolean;
   requirePasswordToUnlockGallery: boolean;
   thumbHeight: number;
   inspectorAutoOpen: boolean;

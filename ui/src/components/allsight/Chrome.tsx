@@ -77,6 +77,8 @@ export function Header({
   onToggleGalleryFilter,
   sourceFilterIds,
   onToggleSourceFilter,
+  invertAdvancedFilters,
+  onToggleInvertAdvancedFilters,
   onClearAdvancedFilters,
   groupBy,
   onToggleGroupBy,
@@ -101,6 +103,8 @@ export function Header({
   onToggleGalleryFilter: (id: string) => void;
   sourceFilterIds: string[];
   onToggleSourceFilter: (id: string) => void;
+  invertAdvancedFilters: boolean;
+  onToggleInvertAdvancedFilters: () => void;
   onClearAdvancedFilters: () => void;
   groupBy: MediaGroupBy[];
   onToggleGroupBy: (groupBy: MediaGroupBy) => void;
@@ -165,6 +169,8 @@ export function Header({
             onToggleGallery={onToggleGalleryFilter}
             sourceFilterIds={sourceFilterIds}
             onToggleSource={onToggleSourceFilter}
+            inverted={invertAdvancedFilters}
+            onToggleInvert={onToggleInvertAdvancedFilters}
             onClearAll={onClearAdvancedFilters}
           />
         )}
@@ -334,6 +340,8 @@ function FilterPopover({
   onToggleGallery,
   sourceFilterIds,
   onToggleSource,
+  inverted,
+  onToggleInvert,
   onClearAll,
 }: {
   propFilters: Record<string, string[]>;
@@ -345,6 +353,8 @@ function FilterPopover({
   onToggleGallery: (id: string) => void;
   sourceFilterIds: string[];
   onToggleSource: (id: string) => void;
+  inverted: boolean;
+  onToggleInvert: () => void;
   onClearAll: () => void;
 }) {
   const t = useT();
@@ -365,7 +375,7 @@ function FilterPopover({
     return media && !(folder.sourceIds ?? []).includes(media.sourceId);
   });
   const availableSources = otherInFolder
-    ? [...managedSources, { id: OTHER_MEDIA_SOURCE_ID, name: "Khác", path: "" }]
+    ? [...managedSources, { id: OTHER_MEDIA_SOURCE_ID, name: t("other"), path: "" }]
     : managedSources;
   // A source filter is only useful once there is a meaningful choice. Keep
   // the popover focused when a Gallery has one or two source folders.
@@ -390,11 +400,7 @@ function FilterPopover({
       <PopoverContent align="end" className="glass-float w-72 rounded-2xl p-3">
         <div className="mb-2 flex items-center justify-between">
           <span className="text-xs font-semibold">{t("filters")}</span>
-          {activeCount > 0 && (
-            <button onClick={onClearAll} className="text-xs text-muted-foreground transition-colors hover:text-foreground">
-              {t("clearFilters")}
-            </button>
-          )}
+          {activeCount > 0 && <div className="flex items-center gap-3"><button onClick={onToggleInvert} className={cn("text-xs transition-colors hover:text-foreground", inverted ? "text-primary" : "text-muted-foreground")}>{t("invertFilters")}</button><button onClick={onClearAll} className="text-xs text-muted-foreground transition-colors hover:text-foreground">{t("clearFilters")}</button></div>}
         </div>
 
         <div className="glass-btn mb-3 flex items-center gap-2 rounded-xl px-2.5 py-1.5">
