@@ -1,6 +1,6 @@
 {
   "name": "master-vision",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "A private visual library desktop app",
   "productName": "Mosaic",
   "main": "main.js",
@@ -10,7 +10,7 @@
     "start": "electron .",
     "dev": "electron .",
     "package:extension": "node scripts/package-extension.cjs",
-    "dist:win": "npm run build:ui && npm run package:extension && electron-builder --win nsis --x64"
+    "dist:win": "npm run build:ui && npm run package:extension && electron-builder --win nsis --x64 && node scripts/organize-release.cjs"
   },
   "devDependencies": {
     "electron": "^32.2.7",
@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "electron-updater": "^6.6.2",
+    "exiftool-vendored": "^33.0.0",
     "ffmpeg-static": "^5.3.0"
   },
   "build": {
@@ -40,16 +41,21 @@
     ],
     "asar": true,
     "asarUnpack": [
-      "node_modules/ffmpeg-static/**"
+      "node_modules/ffmpeg-static/**",
+      "node_modules/exiftool-vendored.exe/**",
+      "node_modules/exiftool-vendored.pl/**",
+      "assets/mosaic-exif.config"
     ],
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
-      "icon": "assets/app-icon.png"
+      "icon": "assets/app-icon.ico"
     },
     "nsis": {
       "oneClick": false,

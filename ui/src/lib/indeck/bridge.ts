@@ -73,7 +73,7 @@ export type InDeckBridge = {
   resolveSource: (source: unknown) => Promise<unknown>;
   ensureThumbnails: (assets: unknown[], requestId?: string) => Promise<Record<string, string>>;
   cancelThumbnails: (requestId: string) => Promise<void>;
-  syncMediaLocations: () => Promise<{ moved: unknown[]; skipped: unknown[]; conflicts: unknown[] }>;
+  syncMediaLocations: () => Promise<{ moved: unknown[]; renamed: unknown[]; skipped: unknown[]; conflicts: unknown[] }>;
   watchSources: (folders: string[]) => Promise<unknown>;
   refreshSources: (folders: string[]) => Promise<unknown>;
   onFolderChanged: (callback: (folder: string) => void) => () => void;

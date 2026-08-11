@@ -292,6 +292,13 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
       .map(([id, values]) => [id.startsWith("exclusive:") ? id.split(":").at(-1)! : id, values]));
   }
   const collectionsById = new Map((library.collections ?? []).map((item: Record<string, any>) => [item.id, item]));
+  // `state.order` is the exact visible sequence. Persist a timestamp for a
+  // Group entry as well as individual Media so backend folder sync can expand
+  // the Group at its real position instead of appending it after loose Media.
+  const orderTimestamp = Date.now();
+  const groupOrderById = new Map(state.order
+    .map((entry, index) => entry.kind === "group" ? [entry.id, orderTimestamp - index] as const : null)
+    .filter((entry): entry is readonly [string, number] => entry !== null));
   next.collections = state.folders.map((folder) => {
     const old = collectionsById.get(folder.id) ?? { id: folder.id, sourceIds: [], groups: [], discardedIds: [], manualItemIds: [] };
     return {
@@ -350,7 +357,7 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
     assets: group.memberIds,
     collapsed: group.collapsed,
     coverId: group.coverId ?? undefined,
-    order: Math.max(...group.memberIds.map((id) => next.assetMeta[id]?.order ?? 0), 0),
+    order: groupOrderById.get(group.id) ?? Math.max(...group.memberIds.map((id) => next.assetMeta[id]?.order ?? 0), 0),
   }));
   next.galleryGroups = state.galleryGroups.filter((group) => group.folderIds.length > 1).map((group, index) => ({
     id: group.id,
@@ -367,9 +374,8 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   }));
   next.galleryOrder = state.galleryOrder;
   next.extensionGallerySlots = Array.from({ length: 4 }, (_, index) => state.extensionGallerySlotIds[index] ?? null);
-  const now = Date.now();
   state.order.forEach((entry, index) => {
-    if (entry.kind === "media") (next.assetMeta[entry.id] ??= {}).order = now - index;
+    if (entry.kind === "media") (next.assetMeta[entry.id] ??= {}).order = orderTimestamp - index;
   });
   next.language = state.language;
   next.appearance = state.appearance;
@@ -414,7 +420,7 @@ interface Ctx {
   toggleExcludeOtherMedia: () => void;
   toggleExcludeDefaultMedia: () => void;
   toggleIgnoreMediaSourcesWhenExcluded: () => void;
-  syncMediaLocation: () => Promise<{ moved: number; skipped: number; conflicts: number }>;
+  syncMediaLocation: () => Promise<{ moved: number; renamed: number; skipped: number; conflicts: number }>;
   duplicateMedia: (id: string) => void;
 
   // property groups
@@ -718,7 +724,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       })),
       syncMediaLocation: async () => {
         const bridge = getInDeckBridge();
-        if (!bridge) return { moved: 0, skipped: 0, conflicts: 0 };
+        if (!bridge) return { moved: 0, renamed: 0, skipped: 0, conflicts: 0 };
         const result = await bridge.syncMediaLocations();
         const snapshot = await bridge.readLibrarySnapshot();
         if (snapshot.library && typeof snapshot.library === "object") {
@@ -728,6 +734,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         }
         return {
           moved: result.moved?.length ?? 0,
+          renamed: result.renamed?.length ?? 0,
           skipped: result.skipped?.length ?? 0,
           conflicts: result.conflicts?.length ?? 0,
         };

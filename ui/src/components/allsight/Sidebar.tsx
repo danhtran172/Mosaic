@@ -181,7 +181,7 @@ export function Sidebar({
   const [discardOpen, setDiscardOpen] = useState(false);
   const [trashSelection, setTrashSelection] = useState<string[]>([]);
   const [excludeOpen, setExcludeOpen] = useState(false);
-  const [syncResult, setSyncResult] = useState<{ moved: number; skipped: number; conflicts: number } | null>(null);
+  const [syncResult, setSyncResult] = useState<{ moved: number; renamed: number; skipped: number; conflicts: number } | null>(null);
   const [pwd, setPwd] = useState("");
   const [pwdCurrent, setPwdCurrent] = useState("");
   const [pwdConfirm, setPwdConfirm] = useState("");
@@ -741,13 +741,13 @@ export function Sidebar({
               {state.appLockEnabled ? t("unlockApp") : t("lockApp")}
             </button>
             <button
-              onClick={() => { void syncMediaLocation().then(setSyncResult).catch(() => setSyncResult({ moved: 0, skipped: 1, conflicts: 0 })); }}
+              onClick={() => { void syncMediaLocation().then(setSyncResult).catch(() => setSyncResult({ moved: 0, renamed: 0, skipped: 1, conflicts: 0 })); }}
               className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
             >
               <RefreshCw className="size-4 text-muted-foreground" />
               <span className="flex-1 text-left">{t("syncMediaLocation")}</span>
               {syncResult !== null && (
-                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult.moved })}{syncResult.conflicts ? ` · ${syncResult.conflicts} conflict` : ""}</span>
+                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult.moved, ordered: syncResult.renamed })}{syncResult.conflicts ? ` · ${syncResult.conflicts} conflict` : ""}</span>
               )}
             </button>
             <p className="text-xs text-muted-foreground">{t("syncMediaHint")}</p>
