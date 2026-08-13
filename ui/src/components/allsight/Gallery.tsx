@@ -136,14 +136,17 @@ function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: num
   });
 }
 
-function squareRows(items: MediaItem[], width: number, targetHeight: number, fixedColumns?: number): Row[] {
+// `fillWidth` makes a complete row span its container exactly instead of
+// leaving a ragged right edge — what a Media Group wants inside its frame.
+// The column count still comes from the requested (zoom) size, so zooming
+// works there too; it is rounded up so the cards end up at or just under the
+// requested size rather than stretching past it.
+function squareRows(items: MediaItem[], width: number, targetHeight: number, fillWidth?: boolean): Row[] {
   if (!items.length) return [];
   const requestedSide = Math.max(100, Math.min(400, targetHeight));
-  const columns = fixedColumns ?? Math.max(1, Math.floor((width + GAP) / (requestedSide + GAP)));
-  // A Media Group's square layout deliberately uses six smaller cards per
-  // complete row. Deriving its side from the available width avoids a ragged
-  // right edge while preserving true 1:1 cards.
-  const side = fixedColumns
+  const perRow = (width + GAP) / (requestedSide + GAP);
+  const columns = Math.max(1, fillWidth ? Math.ceil(perRow) : Math.floor(perRow));
+  const side = fillWidth
     ? Math.max(1, (width - GAP * (columns - 1)) / columns)
     : requestedSide;
   const rows: Row[] = [];
@@ -161,28 +164,28 @@ function layoutRows(
   width: number,
   targetHeight: number,
   layout: GalleryLayout,
-  fixedSquareColumns?: number,
+  fillSquareWidth?: boolean,
   extraWidth?: (item: MediaItem, index: number) => number,
 ) {
   return layout === "justified"
     ? equalJustifiedRows(items, width, targetHeight, extraWidth)
-    : squareRows(items, width, targetHeight, fixedSquareColumns);
+    : squareRows(items, width, targetHeight, fillSquareWidth);
 }
 
 function groupContentWidth(width: number) {
-  // The group frame is border-box. Its six square cards must fit inside both
-  // the inner padding and its stronger 2px border, not just inside the outer
-  // Gallery width.
+  // The group frame is border-box. Its cards must fit inside both the inner
+  // padding and its stronger 2px border, not just inside the outer Gallery
+  // width.
   return Math.max(width - GROUP_INSET * 2 - GROUP_ROW_END_GUTTER, 100);
 }
 
 function groupRows(items: MediaItem[], width: number, targetHeight: number, layout: GalleryLayout) {
   const contentWidth = groupContentWidth(width);
-  // Square is the only Group layout that asks for a fixed six-column row.
+  // Square is the only Group layout that asks for rows flush with the frame.
   // Justified must keep its aspect-ratio row algorithm independent of that
   // square-specific requirement.
   return layout === "square"
-    ? squareRows(items, contentWidth, targetHeight, 6)
+    ? squareRows(items, contentWidth, targetHeight, true)
     : equalJustifiedRows(items, contentWidth, targetHeight);
 }
 
