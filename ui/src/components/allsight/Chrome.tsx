@@ -10,6 +10,7 @@ import {
   Video,
   ZoomIn,
   ZoomOut,
+  Rows3,
   X,
   FolderPlus,
   Boxes,
@@ -33,7 +34,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
-import type { FilterKind, PersonalFolder } from "@/lib/allsight/types";
+import type { FilterKind, GalleryLayout, PersonalFolder } from "@/lib/allsight/types";
 import { mediaGroupById, type MediaGroupBy } from "@/lib/allsight/grouping";
 
 const OTHER_MEDIA_SOURCE_ID = "__indeck-other-media__";
@@ -110,7 +111,7 @@ export function Header({
   onToggleGroupBy: (groupBy: MediaGroupBy) => void;
 }) {
   const t = useT();
-  const { state, setThumbHeight } = useAllsight();
+  const { state, setThumbHeight, setGalleryLayout } = useAllsight();
   const zoomPct = Math.round((state.thumbHeight / BASE_THUMB) * 100);
   const activeCount = Object.values(propFilters).reduce((n, v) => n + v.length, 0) + galleryFilterIds.length + sourceFilterIds.length;
 
@@ -148,12 +149,12 @@ export function Header({
       </div>
 
       <div className="ml-auto flex min-w-0 shrink items-center gap-2">
-        <div className="glass-btn flex w-[25vw] max-w-md min-w-24 shrink items-center gap-2 rounded-xl px-3 py-1.5 focus-within:ring-2 focus-within:ring-ring">
+        <div className="glass-btn flex w-[18vw] max-w-[18rem] min-w-24 shrink items-center gap-2 rounded-xl px-3 py-1.5 focus-within:ring-2 focus-within:ring-ring">
           <Search className="size-4 shrink-0 text-muted-foreground" />
           <input
             value={query}
             onChange={(e) => onQuery(e.target.value)}
-            placeholder={t("search")}
+            placeholder="Search..."
             className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
         </div>
@@ -183,6 +184,8 @@ export function Header({
             folder={folder}
           />
         )}
+
+        {showFilters && <LayoutPopover layout={folder?.layout ?? state.mainGalleryLayout} onChange={(layout) => setGalleryLayout(folder?.id ?? null, layout)} />}
 
         {showFilters && (
           <TooltipProvider delayDuration={200}>
@@ -230,6 +233,39 @@ export function Header({
   );
 }
 
+function LayoutPopover({ layout, onChange }: { layout: GalleryLayout; onChange: (layout: GalleryLayout) => void }) {
+  const t = useT();
+  const item = (value: GalleryLayout, label: string, Icon: typeof Grid2X2) => (
+    <button
+      type="button"
+      onClick={() => onChange(value)}
+      className={cn("flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-accent", layout === value && "bg-primary/15 text-foreground")}
+    >
+      <Icon className="size-3.5" />
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <Check className={cn("size-3.5", layout === value ? "text-primary" : "invisible")} />
+    </button>
+  );
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          aria-label={t("galleryLayout")}
+          title={t("galleryLayout")}
+          className={cn(iconBtn, "flex h-8 w-auto items-center justify-center gap-1.5 px-2.5 text-xs font-medium", layout === "justified" && "bg-primary/20 text-foreground")}
+        >
+          {layout === "justified" ? <Rows3 className="size-4" /> : <Grid2X2 className="size-4" />}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="glass-float w-44 rounded-2xl p-2">
+        <p className="px-2.5 py-1.5 text-xs font-semibold">{t("galleryLayout")}</p>
+        {item("justified", t("justifiedLayout"), Rows3)}
+        {item("square", t("squareLayout"), Grid2X2)}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
 export function WindowControls() {
   const t = useT();
   const [isMaximized, setIsMaximized] = useState(false);
@@ -252,7 +288,7 @@ export function WindowControls() {
         onClick={() => { void getInDeckBridge()?.toggleMaximizeWindow().then(setIsMaximized); }}
         title={isMaximized ? t("restoreWindow") : t("maximizeWindow")}
         aria-label={isMaximized ? t("restoreWindow") : t("maximizeWindow")}
-        className="grid h-full w-11 place-items-center border-l border-border/55 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        className="grid h-full w-11 place-items-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
       >
         {isMaximized ? <Minimize2 className="size-3" /> : <Maximize2 className="size-3" />}
       </button>
@@ -260,7 +296,7 @@ export function WindowControls() {
         onClick={() => { void getInDeckBridge()?.closeWindow(); }}
         title={t("closeWindow")}
         aria-label={t("closeWindow")}
-        className="grid h-full w-11 place-items-center border-l border-border/55 text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
+        className="grid h-full w-11 place-items-center text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground"
       >
         <X className="size-4" />
       </button>

@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useAllsight } from "@/lib/allsight/store";
+import { currentMediaDrag, finishMediaDrag } from "@/lib/allsight/media-drag-transfer";
 import { useT } from "@/lib/allsight/i18n";
 import type { GalleryOrderEntry, MediaItem, PersonalFolder } from "@/lib/allsight/types";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
@@ -87,8 +88,9 @@ function TrashMediaPreview({ media }: { media: MediaItem }) {
       modified: media.modified,
       vault: media.vault,
       contentUrl: media.contentUrl,
+      thumbnailSize: 160,
     }]).then((urls) => {
-      if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!);
+      if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!, 160);
     });
     return () => { active = false; };
   }, [media, setMediaPreview]);
@@ -135,6 +137,7 @@ export function Sidebar({
     ensureFolderDefaultSource,
     deleteFolder,
     addToFolder,
+    moveToFolder,
     setLanguage,
     setPassword,
     setAppLockEnabled,
@@ -165,6 +168,7 @@ export function Sidebar({
   const [renamingGalleryGroup, setRenamingGalleryGroup] = useState<{ id: string; name: string } | null>(null);
   const [navSelectedFolders, setNavSelectedFolders] = useState<string[]>([]);
   const [navDrag, setNavDrag] = useState<GalleryOrderEntry | null>(null);
+  const [mediaDropTarget, setMediaDropTarget] = useState<string | null>(null);
   const [navDragPoint, setNavDragPoint] = useState<{ x: number; y: number } | null>(null);
   const [navRail, setNavRail] = useState<{ y: number; left: number; width: number } | null>(null);
   const navListRef = useRef<HTMLDivElement>(null);
@@ -335,16 +339,57 @@ export function Sidebar({
     if (entry.kind === "folder" && state.galleryGroups.some((group) => group.folderIds.includes(entry.id))) removeGalleryFromGroup(entry.id);
     moveGalleryEntry(entry, index);
   };
+  const draggedMedia = (event: React.DragEvent) => {
+    const plain = event.dataTransfer.getData("text/plain");
+    const raw = event.dataTransfer.getData("application/x-mosaic-media")
+      || event.dataTransfer.getData("text/x-mosaic-media")
+      || (plain.startsWith("mosaic-media:") ? plain.slice("mosaic-media:".length) : "");
+    if (!raw) return currentMediaDrag();
+    try {
+      const value = JSON.parse(raw);
+      const mediaIds = Array.isArray(value?.mediaIds) ? value.mediaIds.map(String).filter(Boolean) : [];
+      return mediaIds.length ? { mediaIds, sourceFolderId: value.sourceFolderId == null ? null : String(value.sourceFolderId) } : null;
+    } catch {
+      return currentMediaDrag();
+    }
+  };
+  const canDropMedia = (event: React.DragEvent) => {
+    // DataTransfer.types is a DOMStringList in some Electron/Chromium builds
+    // and an array in others; Array.from handles both. Two MIME markers make
+    // a card-to-nav drag reliable across those versions.
+    const types = Array.from(event.dataTransfer.types ?? []);
+    // On some Electron builds custom MIME types disappear during dragover
+    // (even though they are present again on drop). The renderer-local drag
+    // payload is authoritative for Mosaic's own card drag and lets us call
+    // preventDefault here, which is required for the browser to dispatch
+    // the subsequent drop event at all.
+    return Boolean(currentMediaDrag())
+      || types.includes("application/x-mosaic-media")
+      || types.includes("text/x-mosaic-media");
+  };
+  useEffect(() => {
+    const clearMediaDrop = () => { setMediaDropTarget(null); finishMediaDrag(); };
+    window.addEventListener("dragend", clearMediaDrop);
+    return () => window.removeEventListener("dragend", clearMediaDrop);
+  }, []);
 
   const galleryRow = (f: PersonalFolder, nested = false, groupId?: string, entryIndex = 0, memberIndex = 0) => (
     <ContextMenu key={f.id}>
       <ContextMenuTrigger asChild>
         <button
+          data-gallery-media-drop-id={f.id}
           draggable
           onDragStart={(event) => beginNavDrag(event, { kind: "folder", id: f.id })}
           onDrag={trackNavDrag}
           onDragEnd={finishNavDrag}
           onDragOver={(event) => {
+            if (!navDrag && canDropMedia(event)) {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "move";
+              setMediaDropTarget(f.id);
+              setNavRail(null);
+              return;
+            }
             if (!navDrag) return;
             event.preventDefault();
             const rect = event.currentTarget.getBoundingClientRect();
@@ -352,6 +397,15 @@ export function Sidebar({
             placeNavRail(event, before);
           }}
           onDrop={(event) => {
+            const media = draggedMedia(event);
+            if (media) {
+              event.preventDefault();
+              event.stopPropagation();
+              moveToFolder(f.id, media.mediaIds, media.sourceFolderId);
+              setMediaDropTarget(null);
+              finishMediaDrag();
+              return;
+            }
             if (!navDrag) return;
             event.preventDefault();
             event.stopPropagation();
@@ -361,6 +415,16 @@ export function Sidebar({
             else moveToTopLevel(navDrag, before ? entryIndex : entryIndex + 1);
             finishNavDrag();
           }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node)) setMediaDropTarget((id) => id === f.id ? null : id);
+          }}
+          onPointerEnter={() => {
+            if (currentMediaDrag()) setMediaDropTarget(f.id);
+          }}
+          onPointerMove={() => {
+            if (currentMediaDrag()) setMediaDropTarget(f.id);
+          }}
+          onPointerLeave={() => setMediaDropTarget((id) => id === f.id ? null : id)}
           onClick={(event) => {
             if (event.ctrlKey || event.metaKey) {
               setNavSelectedFolders((ids) => ids.includes(f.id) ? ids.filter((id) => id !== f.id) : [...ids, f.id]);
@@ -376,6 +440,7 @@ export function Sidebar({
             nested && !collapsed && "ml-3 w-[calc(100%-0.75rem)]",
             collapsed && "justify-center px-0",
             view.kind === "folder" && view.id === f.id ? "bg-primary/15 text-foreground" : navSelectedFolders.includes(f.id) ? "bg-primary/10 text-foreground" : "hover:bg-accent/60",
+            mediaDropTarget === f.id && "bg-primary/20 ring-2 ring-primary/70",
           )}
         >
           {coverFor(f) ? (
@@ -505,12 +570,17 @@ export function Sidebar({
         )}
 
         <button
+          data-gallery-media-drop-id="__mosaic-main-gallery__"
+          onPointerEnter={() => { if (currentMediaDrag()) setMediaDropTarget("__mosaic-main-gallery__"); }}
+          onPointerMove={() => { if (currentMediaDrag()) setMediaDropTarget("__mosaic-main-gallery__"); }}
+          onPointerLeave={() => setMediaDropTarget((id) => id === "__mosaic-main-gallery__" ? null : id)}
           onClick={() => onView({ kind: "all" })}
           title={t("allMedia")}
           className={cn(
             itemBase,
             collapsed && "justify-center px-0",
             view.kind === "all" ? "bg-primary/15 text-foreground" : "hover:bg-accent/60",
+            mediaDropTarget === "__mosaic-main-gallery__" && "bg-primary/20 ring-2 ring-primary/70",
           )}
         >
           <img src={indeckIcon} alt="" className="size-4 shrink-0 rounded-[3px] object-cover" />

@@ -14,6 +14,7 @@ import type {
   Appearance,
   ThemeColor,
   GalleryGroup,
+  GalleryLayout,
   GalleryOrderEntry,
   Language,
   MediaItem,
@@ -22,6 +23,7 @@ import type {
 } from "./types";
 import { I18nContext, makeTranslate } from "./i18n";
 import { getInDeckBridge } from "../indeck/bridge";
+import { rememberMemoryPreview } from "./thumbnail-memory-cache";
 
 // Kept only for the browser-only preview. Desktop state is persisted by the
 // Electron backend, never by Lovable's old localStorage key.
@@ -78,6 +80,10 @@ function libraryToState(library: Record<string, any>): AllsightState {
     id: String(source.id),
     name: String(source.name ?? source.path ?? "Untitled source"),
     path: String(source.path ?? ""),
+    vaultBridgeId: source.vaultBridgeId ? String(source.vaultBridgeId) : undefined,
+    tracking: source.tracking?.volume && source.tracking?.fileId
+      ? { volume: String(source.tracking.volume), fileId: String(source.tracking.fileId) }
+      : undefined,
   }));
   const media = (library.sources ?? []).flatMap((source: Record<string, any>) =>
     (source.assets ?? []).map((asset: Record<string, any>) => {
@@ -154,6 +160,9 @@ function libraryToState(library: Record<string, any>): AllsightState {
         ? String(gallery.coverId)
         : (gallery.itemOrder === "newest-first" ? storedMediaIds.at(-1) : storedMediaIds[0]) ?? null,
       locked: Boolean(gallery.locked),
+      // `galleryLayout` was a short-lived app-wide preference. Use it only
+      // as a migration fallback, then persist the choice on each Gallery.
+      layout: gallery.layout === "justified" || (!gallery.layout && library.galleryLayout === "justified") ? "justified" : "square",
       managedGroupIds: [...new Set([
         ...(gallery.generalTagGroupIds ?? groups.map((group: Record<string, any>) => group.id)),
         ...(gallery.exclusiveTagGroups ?? []).filter((group: Record<string, any>) => group.enabled !== false).map((group: Record<string, any>) => `exclusive:${gallery.id}:${group.id}`),
@@ -236,6 +245,7 @@ function libraryToState(library: Record<string, any>): AllsightState {
     appLockEnabled: Boolean(library.passwordHash && library.appLockEnabled),
     requirePasswordToUnlockGallery: Boolean(library.requirePasswordToUnlockGallery),
     thumbHeight: Math.max(100, Math.min(400, Math.round(Number(library.zoom ?? 200) / 50) * 50)),
+    mainGalleryLayout: library.mainGalleryLayout === "justified" || (!library.mainGalleryLayout && library.galleryLayout === "justified") ? "justified" : "square",
     inspectorAutoOpen: library.inspectorAutoOpen !== false,
     lightboxFitMedia: Boolean(library.lightboxFitMedia),
   };
@@ -259,6 +269,8 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
       id: source.id,
       name: source.name,
       path: source.path,
+      vaultBridgeId: source.vaultBridgeId,
+      tracking: source.tracking,
       assets: state.media
         .filter((media) => media.sourceId === source.id && activeMediaIds.has(media.id))
         .map((media) => ({
@@ -313,6 +325,7 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
       discardedIds: [...new Set(folder.discardedMediaIds ?? [])],
       coverId: folder.coverId ?? undefined,
       locked: folder.locked,
+      layout: folder.layout ?? "square",
       // A disabled Property must no longer auto-tag files on the backend. The
       // filter also cleans up old profile data created before this rule.
       defaultTags: (folder.disabledGeneralGroupIds ?? []).includes("theme") ? [] : (folder.autoTags.theme ?? []),
@@ -351,6 +364,7 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
     discardedIds: [...new Set(folder.discardedMediaIds ?? [])],
     coverId: folder.coverId ?? undefined,
     locked: folder.locked,
+    layout: folder.layout ?? "square",
   }));
   next.libraryGroups = state.groups.filter((group) => group.memberIds.length > 1).map((group) => ({
     id: group.id,
@@ -390,6 +404,7 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
     next.allMediaExcludeDefault = state.excludeDefaultMedia;
   next.allMediaIgnoreMediaSources = state.ignoreMediaSourcesWhenExcluded;
   next.zoom = state.thumbHeight;
+  next.mainGalleryLayout = state.mainGalleryLayout;
   return next;
 }
 
@@ -403,7 +418,7 @@ const uid = (p: string) => `${p}-${Math.random().toString(36).slice(2, 9)}`;
 interface Ctx {
   state: AllsightState;
   set: (fn: (s: AllsightState) => AllsightState) => void;
-  setMediaPreview: (id: string, url: string) => void;
+  setMediaPreview: (id: string, url: string, previewSize?: number) => void;
   setMediaDimensions: (id: string, width: number, height: number) => void;
   reset: () => void;
   // media
@@ -442,6 +457,8 @@ interface Ctx {
   ensureFolderDefaultSource: (id: string, name?: string) => Promise<void>;
   deleteFolder: (id: string) => Promise<void>;
   addToFolder: (folderId: string, mediaIds: string[]) => void;
+  /** Move media membership from one Gallery (or Main Gallery) into another Gallery. */
+  moveToFolder: (targetFolderId: string, mediaIds: string[], sourceFolderId?: string | null) => void;
   /** Reorder media inside one Gallery without changing any other Gallery. */
   moveMediaInFolder: (folderId: string, mediaId: string, targetIndex: number) => void;
   removeFromFolder: (folderId: string, mediaId: string) => void;
@@ -482,6 +499,7 @@ interface Ctx {
   setAppearance: (a: Appearance) => void;
   setThemeColor: (color: ThemeColor) => void;
   setThumbHeight: (n: number) => void;
+  setGalleryLayout: (galleryId: string | null, layout: GalleryLayout) => void;
   setPassword: (p: string | null) => void;
   setAppLockEnabled: (value: boolean) => void;
   setRequirePasswordToUnlockGallery: (value: boolean) => void;
@@ -495,6 +513,11 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AllsightState>(() => buildEmptyState());
   const [hydrated, setHydrated] = useState(false);
   const skipPersist = useRef(false);
+  const queuedPreviews = useRef(new Map<string, { url: string; previewSize: number }>());
+  const evictedPreviews = useRef(new Set<string>());
+  const queuedDimensions = useRef(new Map<string, { width: number; height: number }>());
+  const previewFrame = useRef<number | null>(null);
+  const dimensionFrame = useRef<number | null>(null);
 
   useEffect(() => {
     const bridge = getInDeckBridge();
@@ -512,24 +535,9 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         skipPersist.current = true;
         setState(initial);
         setHydrated(true);
-        // Render the first viewport from the disk thumbnail cache. Remaining
-        // cards are requested lazily by the gallery as they approach view.
-        const firstBatch = initial.media.slice(0, 50).map((media) => ({
-          id: media.id,
-          path: media.path,
-          type: media.type,
-          modified: media.modified,
-          vault: media.vault,
-          contentUrl: media.contentUrl,
-        }));
-        void bridge.ensureThumbnails(firstBatch).then((urls) => {
-          if (!active) return;
-          skipPersist.current = true;
-          setState((current) => ({
-            ...current,
-            media: current.media.map((media) => urls[media.id] ? { ...media, url: urls[media.id]! } : media),
-          }));
-        });
+        // Gallery knows the real visual viewport and requests only those
+        // cards first. Avoid eagerly generating the first 50 records, which
+        // can be unrelated to what the user is actually looking at.
       })
       .catch(() => {
         if (!active) return;
@@ -607,24 +615,50 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
   }, [state, hydrated]);
 
   const set = useCallback((fn: (s: AllsightState) => AllsightState) => setState(fn), []);
-  const setMediaPreview = useCallback((id: string, url: string) => {
-    skipPersist.current = true;
-    setState((current) => ({
-      ...current,
-      media: current.media.map((media) => media.id === id ? { ...media, url } : media),
-    }));
+  const setMediaPreview = useCallback((id: string, url: string, previewSize = 160) => {
+    rememberMemoryPreview(id, url, previewSize).forEach((evictedId) => evictedPreviews.current.add(evictedId));
+    queuedPreviews.current.set(id, { url, previewSize });
+    if (previewFrame.current !== null) return;
+    previewFrame.current = window.requestAnimationFrame(() => {
+      previewFrame.current = null;
+      const updates = queuedPreviews.current;
+      const evicted = evictedPreviews.current;
+      queuedPreviews.current = new Map();
+      evictedPreviews.current = new Set();
+      if (!updates.size) return;
+      skipPersist.current = true;
+      setState((current) => ({
+        ...current,
+        media: current.media.map((media) => {
+          const update = updates.get(media.id);
+          if (evicted.has(media.id) && !update) return { ...media, url: "", previewSize: 0 };
+          return update && (media.url !== update.url || (media.previewSize ?? 0) < update.previewSize)
+            ? { ...media, url: update.url, previewSize: update.previewSize }
+            : media;
+        }),
+      }));
+    });
   }, []);
   const setMediaDimensions = useCallback((id: string, width: number, height: number) => {
     if (!width || !height) return;
-    skipPersist.current = true;
-    setState((current) => ({
-      ...current,
-      media: current.media.map((media) =>
-        media.id === id && (media.width !== width || media.height !== height)
-          ? { ...media, width, height }
-          : media,
-      ),
-    }));
+    queuedDimensions.current.set(id, { width, height });
+    if (dimensionFrame.current !== null) return;
+    dimensionFrame.current = window.requestAnimationFrame(() => {
+      dimensionFrame.current = null;
+      const updates = queuedDimensions.current;
+      queuedDimensions.current = new Map();
+      if (!updates.size) return;
+      skipPersist.current = true;
+      setState((current) => ({
+        ...current,
+        media: current.media.map((media) => {
+          const update = updates.get(media.id);
+          return update && (media.width !== update.width || media.height !== update.height)
+            ? { ...media, width: update.width, height: update.height }
+            : media;
+        }),
+      }));
+    });
   }, []);
 
   const api = useMemo<Ctx>(() => {
@@ -1037,6 +1071,43 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             }),
           };
         }),
+      moveToFolder: (targetFolderId, mediaIds, sourceFolderId = null) =>
+        set((s) => {
+          if (!mediaIds.length || targetFolderId === sourceFolderId) return s;
+          const target = s.folders.find((folder) => folder.id === targetFolderId);
+          if (!target) return s;
+          const moved = new Set(mediaIds);
+          const auto = target.autoTags ?? {};
+          return {
+            ...s,
+            folders: s.folders.map((folder) => {
+              if (folder.id === targetFolderId) {
+                const nextMediaIds = Array.from(new Set([...mediaIds, ...folder.mediaIds]));
+                return {
+                  ...folder,
+                  mediaIds: nextMediaIds,
+                  coverId: folder.coverId ?? folder.mediaIds[0] ?? mediaIds[0] ?? null,
+                  discardedMediaIds: (folder.discardedMediaIds ?? []).filter((id) => !moved.has(id)),
+                };
+              }
+              if (folder.id !== sourceFolderId) return folder;
+              const nextMediaIds = folder.mediaIds.filter((id) => !moved.has(id));
+              return {
+                ...folder,
+                mediaIds: nextMediaIds,
+                coverId: folder.coverId && moved.has(folder.coverId) ? (nextMediaIds[0] ?? null) : folder.coverId,
+              };
+            }),
+            media: s.media.map((media) => {
+              if (!moved.has(media.id)) return media;
+              const props = { ...media.props };
+              for (const [groupId, values] of Object.entries(auto)) {
+                props[groupId] = Array.from(new Set([...(props[groupId] ?? []), ...values]));
+              }
+              return { ...media, props };
+            }),
+          };
+        }),
       removeFromFolder: (folderId, mediaId) =>
         set((s) => ({
           ...s,
@@ -1259,7 +1330,15 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           // flight. Reuse that source instead of creating a duplicate.
           const concurrent = s.sources.find((source) => normalize(source.path) === normalize(actualPath));
           const id = concurrent?.id ?? sourceId;
-          const source = concurrent ?? { id, name: actualName, path: actualPath };
+          const source = concurrent ?? {
+            id,
+            name: actualName,
+            path: actualPath,
+            vaultBridgeId: result?.vaultBridgeId ? String(result.vaultBridgeId) : undefined,
+            tracking: result?.tracking?.volume && result?.tracking?.fileId
+              ? { volume: String(result.tracking.volume), fileId: String(result.tracking.fileId) }
+              : undefined,
+          };
           const propertyIds = s.propertyGroups.map((group) => group.id);
           const incoming = scanned.map((asset: Record<string, any>): MediaItem => ({
             id: String(asset.id),
@@ -1358,7 +1437,15 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
         set((s) => {
           const concurrent = s.sources.find((source) => normalize(source.path) === normalize(actualPath));
           const id = concurrent?.id ?? sourceId;
-          const source = concurrent ?? { id, name: actualName, path: actualPath };
+          const source = concurrent ?? {
+            id,
+            name: actualName,
+            path: actualPath,
+            vaultBridgeId: result?.vaultBridgeId ? String(result.vaultBridgeId) : undefined,
+            tracking: result?.tracking?.volume && result?.tracking?.fileId
+              ? { volume: String(result.tracking.volume), fileId: String(result.tracking.fileId) }
+              : undefined,
+          };
           const propertyIds = s.propertyGroups.map((group) => group.id);
           const incoming = scanned.map((asset: Record<string, any>): MediaItem => ({
             id: String(asset.id), name: String(asset.name ?? "Untitled media"), path: String(asset.path ?? ""), sourceId: id,
@@ -1554,6 +1641,9 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       setAppearance: (appearance) => set((s) => ({ ...s, appearance })),
       setThemeColor: (themeColor) => set((s) => ({ ...s, themeColor })),
       setThumbHeight: (thumbHeight) => set((s) => ({ ...s, thumbHeight })),
+      setGalleryLayout: (galleryId, layout) => set((s) => galleryId == null
+        ? { ...s, mainGalleryLayout: layout }
+        : { ...s, folders: s.folders.map((folder) => folder.id === galleryId ? { ...folder, layout } : folder) }),
       setPassword: (password) => set((s) => ({ ...s, password })),
       setAppLockEnabled: (appLockEnabled) => set((s) => ({ ...s, appLockEnabled: Boolean(s.password && appLockEnabled) })),
       setRequirePasswordToUnlockGallery: (requirePasswordToUnlockGallery) => set((s) => ({ ...s, requirePasswordToUnlockGallery })),

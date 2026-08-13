@@ -13,8 +13,8 @@ function Preview({ media }: { media: MediaItem }) {
     const bridge = getInDeckBridge();
     if (!bridge) return;
     let active = true;
-    void bridge.ensureThumbnails([{ id: media.id, path: media.path, type: media.type, modified: media.modified, vault: media.vault, contentUrl: media.contentUrl }])
-      .then((urls) => { if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!); });
+    void bridge.ensureThumbnails([{ id: media.id, path: media.path, type: media.type, modified: media.modified, vault: media.vault, contentUrl: media.contentUrl, thumbnailSize: 160 }])
+      .then((urls) => { if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!, 160); });
     return () => { active = false; };
   }, [media, setMediaPreview]);
   return media.url ? <img src={media.url} alt="" className="size-full object-contain" /> : <span className="grid size-full place-items-center bg-muted text-xs text-muted-foreground">…</span>;

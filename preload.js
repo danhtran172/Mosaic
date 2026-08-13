@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('vision', {
   resolveSource: source => ipcRenderer.invoke('source:resolve', source),
   ensureThumbnails: (assets, requestId) => ipcRenderer.invoke('thumbnails:ensure', assets, requestId),
   cancelThumbnails: requestId => ipcRenderer.invoke('thumbnails:cancel', requestId),
+  thumbnailMetrics: () => ipcRenderer.invoke('thumbnails:metrics'),
   listVaultBridges: () => ipcRenderer.invoke('vault:bridges'),
   syncMediaLocations: () => ipcRenderer.invoke('media:sync-locations'),
   refreshSources: folders => ipcRenderer.invoke('sources:refresh', folders),

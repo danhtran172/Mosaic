@@ -1,6 +1,7 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   Boxes,
+  Shapes,
   ClipboardPaste,
   Copy,
   CopyPlus,
@@ -37,15 +38,26 @@ import {
 } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useAllsight } from "@/lib/allsight/store";
+import { acquireThumbnail, cachedThumbnail, type ThumbnailResource } from "@/lib/allsight/thumbnail-resource-manager";
+import { beginMediaDrag, finishMediaDrag } from "@/lib/allsight/media-drag-transfer";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
 import { useT } from "@/lib/allsight/i18n";
-import type { MediaItem, OrderEntry } from "@/lib/allsight/types";
+import { toast } from "sonner";
+import type { GalleryLayout, MediaItem, OrderEntry } from "@/lib/allsight/types";
 import { cn } from "@/lib/utils";
 import type { ConfirmRequest } from "./ConfirmDialog";
 import type { MediaGroupBy } from "@/lib/allsight/grouping";
 
 const GAP = 8; // 30% tighter than the 12px base grid
-const GROUP_PAD = 8; // 30% tighter than 12px
+// Media in an expanded Group always keeps this much clear space from every
+// inner edge of the frame. The border is accounted for separately below.
+const GROUP_PAD = 8;
+const GROUP_BORDER = 2;
+const GROUP_INSET = GROUP_PAD + GROUP_BORDER;
+// Keep a small safety gutter at row end. Browser sub-pixel rounding can
+// otherwise consume the visual right padding when a Group row fills exactly.
+const GROUP_ROW_END_GUTTER = 8;
+const MAIN_GALLERY_DROP_ID = "__mosaic-main-gallery__";
 const EDGE = 50; // reorder hot zone on each side of a cell
 const HOLD_MS = 1500;
 const DWELL_MS = 500; // hovering an insertion point this long widens the gap
@@ -101,38 +113,127 @@ function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: num
   });
 }
 
-function LazyThumbnail({ media, className, priority = false }: { media: MediaItem; className: string; priority?: boolean }) {
-  const { setMediaDimensions, setMediaPreview } = useAllsight();
+function squareRows(items: MediaItem[], width: number, targetHeight: number, fixedColumns?: number): Row[] {
+  if (!items.length) return [];
+  const requestedSide = Math.max(100, Math.min(400, targetHeight));
+  const columns = fixedColumns ?? Math.max(1, Math.floor((width + GAP) / (requestedSide + GAP)));
+  // A Media Group's square layout deliberately uses six smaller cards per
+  // complete row. Deriving its side from the available width avoids a ragged
+  // right edge while preserving true 1:1 cards.
+  const side = fixedColumns
+    ? Math.max(1, (width - GAP * (columns - 1)) / columns)
+    : requestedSide;
+  const rows: Row[] = [];
+  for (let index = 0; index < items.length; index += columns) {
+    rows.push({
+      height: side,
+      items: items.slice(index, index + columns).map((item) => ({ item, width: side })),
+    });
+  }
+  return rows;
+}
+
+function layoutRows(items: MediaItem[], width: number, targetHeight: number, layout: GalleryLayout, fixedSquareColumns?: number) {
+  return layout === "justified"
+    ? equalJustifiedRows(items, width, targetHeight)
+    : squareRows(items, width, targetHeight, fixedSquareColumns);
+}
+
+function groupContentWidth(width: number) {
+  // The group frame is border-box. Its six square cards must fit inside both
+  // the inner padding and its stronger 2px border, not just inside the outer
+  // Gallery width.
+  return Math.max(width - GROUP_INSET * 2 - GROUP_ROW_END_GUTTER, 100);
+}
+
+function groupRows(items: MediaItem[], width: number, targetHeight: number, layout: GalleryLayout) {
+  const contentWidth = groupContentWidth(width);
+  // Square is the only Group layout that asks for a fixed six-column row.
+  // Justified must keep its aspect-ratio row algorithm independent of that
+  // square-specific requirement.
+  return layout === "square"
+    ? squareRows(items, contentWidth, targetHeight, 6)
+    : equalJustifiedRows(items, contentWidth, targetHeight);
+}
+
+function thumbnailSizeForBox(width: number, height: number) {
+  const devicePixels = Math.max(width, height) * (window.devicePixelRatio || 1);
+  if (devicePixels <= 160) return 160;
+  if (devicePixels <= 320) return 320;
+  return 512;
+}
+function placeholderColor(id: string) {
+  let value = 0;
+  for (let index = 0; index < id.length; index += 1) value = (value * 31 + id.charCodeAt(index)) >>> 0;
+  return `hsl(${value % 360} 28% 32% / 0.72)`;
+}
+function BitmapThumbnail({ resource, className, style }: { resource: ThumbnailResource; className: string; style?: CSSProperties }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const draw = useCallback(() => {
+    const element = canvas.current;
+    if (!element || !resource.bitmap) return;
+    const box = element.getBoundingClientRect();
+    const scale = window.devicePixelRatio || 1;
+    const width = Math.max(1, Math.round(box.width * scale));
+    const height = Math.max(1, Math.round(box.height * scale));
+    if (element.width !== width || element.height !== height) { element.width = width; element.height = height; }
+    const context = element.getContext("2d", { alpha: false });
+    if (!context) return;
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    // A canvas has no CSS object-fit. Crop to cover instead of stretching a
+    // decoded bitmap into the justified cell: a tiny rounding mismatch (or
+    // EXIF orientation) must never visibly deform the photo.
+    const sourceRatio = resource.width / resource.height;
+    const targetRatio = width / height;
+    let sx = 0, sy = 0, sw = resource.width, sh = resource.height;
+    if (sourceRatio > targetRatio) {
+      sw = resource.height * targetRatio;
+      sx = (resource.width - sw) / 2;
+    } else if (sourceRatio < targetRatio) {
+      sh = resource.width / targetRatio;
+      sy = (resource.height - sh) / 2;
+    }
+    context.drawImage(resource.bitmap, sx, sy, sw, sh, 0, 0, width, height);
+  }, [resource]);
+  useLayoutEffect(() => {
+    draw();
+    const element = canvas.current;
+    if (!element) return;
+    const observer = new ResizeObserver(draw);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [draw]);
+  // ImageBitmap is the normal path. Keep a browser-image fallback only for a
+  // codec/GPU that cannot construct a bitmap for a particular media file.
+  if (!resource.bitmap) return <img src={resource.url} alt="" draggable={false} decoding="async" className={className} style={style} />;
+  return <canvas ref={canvas} aria-hidden className={className} style={style} />;
+}
+
+function LazyThumbnail({ media, className, priority = false, thumbnailSize = 320, thumbnailDistance = Number.MAX_SAFE_INTEGER, style }: { media: MediaItem; className: string; priority?: boolean; thumbnailSize?: number; thumbnailDistance?: number; style?: CSSProperties }) {
   const target = useRef<HTMLSpanElement>(null);
+  const [resource, setResource] = useState<ThumbnailResource | null>(() => cachedThumbnail(media, thumbnailSize));
 
   useEffect(() => {
-    if (media.url || !target.current) return;
-    const bridge = getInDeckBridge();
-    if (!bridge) return;
     let active = true;
-    const requestId = priority ? `gallery:${media.id}:${media.modified}:${crypto.randomUUID()}` : undefined;
+    let release = () => {};
     const load = () => {
-      // A virtual Gallery card can be unmounted while its thumbnail request is
-      // in flight.  `active` makes that request cancellable from the UI's
-      // point of view: its result is never committed once the card is gone.
-      // The main-process thumbnail pool remains bounded, so fast scrolling
-      // cannot create an unbounded amount of native image work.
-      void bridge.ensureThumbnails([{
-        id: media.id,
-        path: media.path,
-        type: media.type,
-        modified: media.modified,
-        vault: media.vault,
-        contentUrl: media.contentUrl,
-      }], requestId).then((urls) => {
-        if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!);
+      const lease = acquireThumbnail(media, thumbnailSize, priority, thumbnailDistance);
+      release = lease.release;
+      if (lease.resource) {
+        setResource(lease.resource);
+        return;
+      }
+      void lease.promise.then((next) => {
+        if (!active || !next) return;
+        setResource(next);
       });
     };
     if (priority) {
       load();
       return () => {
         active = false;
-        if (requestId) void bridge.cancelThumbnails(requestId);
+        release();
       };
     }
     const observer = new IntersectionObserver((entries) => {
@@ -140,20 +241,12 @@ function LazyThumbnail({ media, className, priority = false }: { media: MediaIte
       observer.disconnect();
       load();
     }, { rootMargin: "600px 0px" });
-    observer.observe(target.current);
-    return () => { active = false; observer.disconnect(); if (requestId) void bridge.cancelThumbnails(requestId); };
-  }, [media, priority, setMediaPreview]);
+    if (target.current) observer.observe(target.current);
+    return () => { active = false; observer.disconnect(); release(); };
+  }, [media, priority, thumbnailDistance, thumbnailSize]);
 
-  if (media.url) return (
-    <img
-      src={media.url}
-      alt=""
-      draggable={false}
-      className={className}
-      onLoad={(event) => setMediaDimensions(media.id, event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)}
-    />
-  );
-  return <span ref={target} className="block size-full bg-muted/60" />;
+  if (resource) return <BitmapThumbnail resource={resource} className={className} style={style} />;
+  return <span ref={target} className="block size-full animate-pulse" style={{ backgroundColor: placeholderColor(media.id), ...style }} />;
 }
 
 type DropInfo =
@@ -170,6 +263,7 @@ export function Gallery({
   onOpen,
   onConfirm,
   currentFolderId,
+  galleryLayout,
   layoutKey,
   groupBy,
 }: {
@@ -181,6 +275,7 @@ export function Gallery({
   onOpen: (id: string) => void;
   onConfirm: (r: ConfirmRequest) => void;
   currentFolderId: string | null;
+  galleryLayout: GalleryLayout;
   /** Changes synchronously whenever a sibling panel changes Gallery width. */
   layoutKey: string;
   /** Display-only multi-level grouping selected in the Library header. */
@@ -198,6 +293,7 @@ export function Gallery({
     dissolveGroup,
     updateGroup,
     addToFolder,
+    moveToFolder,
     removeFromFolder,
     updateFolder,
     hideMedia,
@@ -217,6 +313,9 @@ export function Gallery({
   const [viewportHeight, setViewportHeight] = useState(700);
   const [scrollTop, setScrollTop] = useState(0);
   const scrollDirection = useRef<"up" | "down">("down");
+  const scrollFrame = useRef(0);
+  const pendingScrollTop = useRef(0);
+  const committedScrollTop = useRef(0);
   const [drag, setDrag] = useState<OrderEntry | null>(null);
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number } | null>(null);
   const [drop, setDrop] = useState<DropInfo>(null);
@@ -232,6 +331,8 @@ export function Gallery({
   const [addGroupToGalleryFor, setAddGroupToGalleryFor] = useState<string[] | null>(null);
   const [galleryPickerQuery, setGalleryPickerQuery] = useState("");
 
+  useEffect(() => () => { if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current); }, []);
+
   const galleryPickerFolders = useMemo(() => {
     const needle = galleryPickerQuery.trim().toLowerCase();
     return state.folders.filter((folder) => !needle || folder.name.toLowerCase().includes(needle));
@@ -240,6 +341,19 @@ export function Gallery({
     const folder = state.folders.find((item) => item.id === folderId);
     const media = state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0]));
     return media?.url || (media?.type === "image" ? media.originalUrl || media.contentUrl || null : null);
+  };
+  const copyImageToClipboard = async (media: MediaItem) => {
+    if (media.type !== "image") return;
+    // Browser Clipboard only received the preview URL before, which is why
+    // pasting produced text instead of an image. Electron writes the native
+    // image bitmap so it can be pasted into image-aware applications.
+    const copied = await getInDeckBridge()?.copyImage(media) ?? false;
+    if (copied) toast.success(state.language === "vi" ? "Đã sao chép ảnh." : "Image copied.");
+    else toast.error(state.language === "vi" ? "Không thể sao chép ảnh." : "Unable to copy image.");
+  };
+  const openInFolder = async (media: MediaItem) => {
+    const opened = await getInDeckBridge()?.showInFolder(media) ?? false;
+    if (!opened) toast.error("Unable to open the file location.");
   };
 
   const pointerStart = useRef<{ x: number; y: number; entry: OrderEntry } | null>(null);
@@ -277,10 +391,13 @@ export function Gallery({
     return () => { ro.disconnect(); window.cancelAnimationFrame(frame); };
   }, [entries.length, layoutKey]);
 
-  const mediaById = useCallback(
-    (id: string) => state.media.find((m) => m.id === id),
-    [state.media],
-  );
+  // Building the Gallery no longer repeatedly scans every media item for
+  // every card/group. This map is rebuilt only when the media data changes,
+  // never while the user merely scrolls.
+  const mediaById = useMemo(() => {
+    const byId = new Map(state.media.map((media) => [media.id, media]));
+    return (id: string) => byId.get(id);
+  }, [state.media]);
   const visibleMediaIdSet = useMemo(() => new Set(visibleMediaIds), [visibleMediaIds]);
   const globalIndex = useCallback(
     (entry: OrderEntry) => state.order.findIndex((e) => e.kind === entry.kind && e.id === entry.id),
@@ -637,8 +754,30 @@ export function Gallery({
     };
 
 
-    const onUp = () => {
-      applyDrop();
+    const onUp = (event: PointerEvent) => {
+      // Sidebar rows are outside the Gallery's React subtree, so handling the
+      // final pointer position here is more reliable than depending on a
+      // cross-panel pointerenter/drop event in Electron. It also leaves the
+      // same pointer gesture free for Library ordering and hover-to-group.
+      const targetGalleryId = drag.kind === "media"
+        ? document.elementsFromPoint(event.clientX, event.clientY)
+          .map((element) => (element as HTMLElement).closest<HTMLElement>("[data-gallery-media-drop-id]"))
+          .find((element): element is HTMLElement => !!element)
+          ?.dataset.galleryMediaDropId
+        : undefined;
+      if (targetGalleryId) {
+        const mediaIds = selected.includes(drag.id) ? selected : [drag.id];
+        if (targetGalleryId === MAIN_GALLERY_DROP_ID) {
+          // Main Gallery is the complete media set, rather than a second
+          // membership list. Returning media to it simply removes the
+          // Gallery-specific membership it was dragged out of.
+          if (currentFolderId) mediaIds.forEach((mediaId) => removeFromFolder(currentFolderId, mediaId));
+        } else {
+          moveToFolder(targetGalleryId, mediaIds, currentFolderId);
+        }
+      } else {
+        applyDrop();
+      }
       autoScroll.current = 0;
       pointerStart.current = null;
       dropRef.current = null;
@@ -648,6 +787,9 @@ export function Gallery({
       setDrop(null);
       setDrag(null);
       setDragPoint(null);
+      // Sidebar also observes the same pointer drag as a reliable fallback
+      // for Electron builds that suppress native HTML drag/drop events.
+      finishMediaDrag();
     };
 
 
@@ -657,7 +799,7 @@ export function Gallery({
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [applyDrop, drag, finishHold, globalIndex, needsHold, state.groups]);
+  }, [applyDrop, currentFolderId, drag, finishHold, globalIndex, moveToFolder, needsHold, removeFromFolder, selected, state.groups]);
 
   const startPointer = (e: React.PointerEvent, entry: OrderEntry) => {
     if (e.button !== 0) return;
@@ -666,6 +808,10 @@ export function Gallery({
       const s = pointerStart.current;
       if (!s) return;
       if (Math.hypot(ev.clientX - s.x, ev.clientY - s.y) > 5) {
+        if (entry.kind === "media") {
+          const mediaIds = selected.includes(entry.id) ? selected : [entry.id];
+          beginMediaDrag({ mediaIds, sourceFolderId: currentFolderId ?? null });
+        }
         setDrag(entry);
         setDragPoint({ x: ev.clientX, y: ev.clientY });
         window.removeEventListener("pointermove", onMove);
@@ -740,10 +886,10 @@ export function Gallery({
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids); setSelected([]); }}>
-          <Boxes className="size-4" /> Tạo group từ {ids.length} ảnh đã chọn
+          <Shapes className="size-4 text-[#A56F63]" /> Tạo group từ {ids.length} ảnh đã chọn
         </ContextMenuItem>
         <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(ids); }}>
-          <FolderPlus className="size-4" /> Thêm {ids.length} ảnh vào Gallery
+          <FolderPlus className="size-4 text-[#C59A18]" /> Thêm {ids.length} ảnh vào Gallery
         </ContextMenuItem>
         {hasClipboard && (
           <ContextMenuItem
@@ -754,14 +900,14 @@ export function Gallery({
               }
             }}
           >
-            <ClipboardPaste className="size-4" /> Dán tag vào ảnh đã chọn
+            <ClipboardPaste className="size-4 text-[#5F839A]" /> Dán tag vào ảnh đã chọn
           </ContextMenuItem>
         )}
         {currentFolderId ? (
           <>
             <ContextMenuSeparator />
             <ContextMenuItem
-              className={cn(menuItem, "text-destructive")}
+              className={menuItem}
               onSelect={() => onConfirm({
                 title: `Ẩn ${ids.length} ảnh khỏi Gallery?`,
                 description: "Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.",
@@ -771,21 +917,21 @@ export function Gallery({
                 },
               })}
             >
-              <EyeOff className="size-4" /> Ẩn {ids.length} ảnh khỏi Gallery
+              <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn {ids.length} ảnh khỏi Gallery
             </ContextMenuItem>
           </>
         ) : (
           <>
             <ContextMenuSeparator />
             <ContextMenuItem
-              className={cn(menuItem, "text-destructive")}
+              className={menuItem}
               onSelect={() => onConfirm({
                 title: `Ẩn ${ids.length} media khỏi Main Gallery?`,
                 description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
                 onConfirm: () => { hideMedia(ids); setSelected([]); },
               })}
             >
-              <EyeOff className="size-4" /> Ẩn {ids.length} media khỏi Main Gallery
+              <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn {ids.length} media khỏi Main Gallery
             </ContextMenuItem>
           </>
         )}
@@ -805,27 +951,21 @@ export function Gallery({
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => onOpen(m.id)}>
-          <Maximize2 className="size-4" /> {t("open")}
+          <Maximize2 className="size-4 text-[#1686DC]" /> {t("open")}
         </ContextMenuItem>
-        <ContextMenuItem className={menuItem} onSelect={() => void 0}>
-          <FolderOpen className="size-4" /> {t("openInFolder")}
+        <ContextMenuItem className={menuItem} onSelect={() => { void openInFolder(m); }}>
+          <FolderOpen className="size-4 text-[#C59A18]" /> {t("openInFolder")}
         </ContextMenuItem>
         <ContextMenuItem
           className={menuItem}
-          onSelect={() => {
-            void navigator.clipboard?.writeText(m.url);
-          }}
+          disabled={m.type !== "image"}
+          onSelect={() => { void copyImageToClipboard(m); }}
         >
-          <Copy className="size-4" /> {t("copyImage")}
+          <Copy className="size-4 text-[#4A9D72]" /> {t("copyImage")}
         </ContextMenuItem>
-        <ContextMenuSeparator />
-        {selected.length >= 2 && selected.includes(m.id) ? (
+        {selected.length >= 2 && selected.includes(m.id) && (
           <ContextMenuItem className={menuItem} onSelect={() => { createGroup([...selected]); setSelected([]); }}>
             <Boxes className="size-4" /> {t("createGroupSelected")}
-          </ContextMenuItem>
-        ) : (
-          <ContextMenuItem className={cn(menuItem, "opacity-50")} disabled>
-            <Boxes className="size-4" /> {t("needTwoToGroup")}
           </ContextMenuItem>
         )}
         {group && (
@@ -851,7 +991,7 @@ export function Gallery({
             className={menuItem}
             onSelect={() => setClipboard((c) => ({ ...c, [g.id]: m.props[g.id] ?? [] }))}
           >
-            <Tag className="size-4" />
+            <Tag className="size-4 text-[#5F839A]" />
             {g.id === "character" ? t("copyCharacter") : `${t("copyTheme").split(" ")[0]} ${g.name}`}
           </ContextMenuItem>
         ))}
@@ -868,51 +1008,51 @@ export function Gallery({
         )}
         <ContextMenuSeparator />
         <ContextMenuItem className={menuItem} onSelect={() => duplicateMedia(m.id)}>
-          <CopyPlus className="size-4" /> {t("duplicate")}
+          <CopyPlus className="size-4 text-[#24B1B1]" /> {t("duplicate")}
         </ContextMenuItem>
         {currentFolderId && (
           <ContextMenuItem
             className={menuItem}
             onSelect={() => updateFolder(currentFolderId, { coverId: m.id })}
           >
-            <ImageIcon className="size-4" /> {t("setFolderCover")}
+            <ImageIcon className="size-4 text-[#A5D6A7]" /> {t("setFolderCover")}
           </ContextMenuItem>
         )}
         <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddToGalleryFor(m.id); }}>
-          <FolderPlus className="size-4" /> {t("addToFolder")}
+          <FolderPlus className="size-4 text-[#FFC349]" /> {t("addToFolder")}
         </ContextMenuItem>
         {currentFolderId && (
           <ContextMenuItem className={menuItem} onSelect={() => setMoveToGalleryFor(m.id)}>
-            <FolderInput className="size-4" /> Move to Gallery
+            <FolderInput className="size-4 text-[#FF9A00]" /> Move to Gallery
           </ContextMenuItem>
         )}
         <ContextMenuSeparator />
         {currentFolderId && (
           <ContextMenuItem
-            className={cn(menuItem, "text-destructive")}
+            className={menuItem}
             onSelect={() => onConfirm({
               title: "Ẩn ảnh khỏi Gallery?",
               description: "Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.",
               onConfirm: () => discardFromFolder(currentFolderId, m.id),
             })}
           >
-            <EyeOff className="size-4" /> Ẩn ảnh khỏi Gallery
+            <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn ảnh khỏi Gallery
           </ContextMenuItem>
         )}
         {!currentFolderId && (
           <ContextMenuItem
-            className={cn(menuItem, "text-destructive")}
+            className={menuItem}
             onSelect={() => onConfirm({
               title: "Ẩn media khỏi Main Gallery?",
               description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
               onConfirm: () => hideMedia([m.id]),
             })}
           >
-            <EyeOff className="size-4" /> Ẩn media khỏi Main Gallery
+            <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn media khỏi Main Gallery
           </ContextMenuItem>
         )}
         <ContextMenuItem
-          className={cn(menuItem, "text-destructive")}
+          className={menuItem}
           onSelect={() => onConfirm({
             title: "Đưa file vào Thùng rác máy tính?",
             description: "File gốc sẽ được chuyển vào Recycle Bin của Windows để có thể khôi phục.",
@@ -928,7 +1068,7 @@ export function Gallery({
             },
           })}
         >
-          <Trash2 className="size-4" /> Đưa file vào Thùng rác máy tính
+          <Trash2 className="size-4 text-[#B81E2D]" /> Đưa file vào Thùng rác máy tính
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -976,6 +1116,7 @@ export function Gallery({
     stack?: MediaItem[],
     inGroupId?: string,
     priorityThumbnail = false,
+    thumbnailDistance = Number.MAX_SAFE_INTEGER,
   ) => {
     const isSelected = selected.includes(m.id);
     const holding =
@@ -1008,9 +1149,14 @@ export function Gallery({
               }
             }}
             className={cn(
-              "no-drag group relative shrink-0 rounded-lg border transition-all duration-200 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+              // Keep text unselectable while pointer dragging. The drag
+              // gesture is handled in the renderer so Gallery reordering,
+              // hover-to-group, and dropping onto the Sidebar share it.
+              "select-none group relative shrink-0 rounded-lg border transition-all duration-200 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
               stack ? "glass-panel overflow-visible" : "overflow-hidden",
-              isSelected ? "border-primary ring-2 ring-primary/60" : "border-border/60 hover:shadow-lg",
+              isSelected
+                ? "border-primary ring-[3px] ring-primary/90 shadow-[0_0_0_1px_rgb(255_255_255_/_0.7)]"
+                : "border-border/60 hover:shadow-lg",
               drag?.id === m.id && "opacity-40",
               memberRail && "z-20 overflow-visible",
             )}
@@ -1021,12 +1167,13 @@ export function Gallery({
                 {stack
                   .slice(1, 4)
                   .map((s, i) => (
-                    <img
+                    <LazyThumbnail
                       key={s.id}
-                      src={s.url}
-                      alt=""
-                      draggable={false}
                       className="absolute inset-0 size-full rounded-md border border-border/50 object-cover shadow-soft"
+                      priority={priorityThumbnail}
+                      thumbnailDistance={thumbnailDistance}
+                      thumbnailSize={thumbnailSizeForBox(w, h)}
+                      media={s}
                       style={{
                         transform: `translate(${(3 - i) * 2.25}px, ${(3 - i) * 2.25}px) rotate(${(3 - i) * 1.2}deg)`,
                         opacity: 0.55 + i * 0.1,
@@ -1036,15 +1183,16 @@ export function Gallery({
 
                   ))
                   .reverse()}
-                <img
-                  src={m.url}
-                  alt=""
-                  draggable={false}
+                <LazyThumbnail
+                  media={m}
                   className="relative z-10 size-full rounded-md border border-border/60 object-cover"
+                  priority={priorityThumbnail}
+                  thumbnailDistance={thumbnailDistance}
+                  thumbnailSize={thumbnailSizeForBox(w, h)}
                 />
               </div>
             ) : (
-              <LazyThumbnail media={m} className="size-full object-fill" priority={priorityThumbnail} />
+              <LazyThumbnail media={m} className="size-full object-cover" priority={priorityThumbnail} thumbnailDistance={thumbnailDistance} thumbnailSize={thumbnailSizeForBox(w, h)} />
             )}
             {m.type === "video" && !stack && (
               <span className="glass-panel absolute top-1.5 left-1.5 grid size-6 place-items-center rounded-full">
@@ -1158,100 +1306,154 @@ export function Gallery({
       }
     | { kind: "group"; entry: OrderEntry; items: MediaItem[]; section: number; sectionStart: boolean; sectionLabel: string };
 
-  const blocks: Block[] = [];
-  const pushRun = (entry: OrderEntry, m: MediaItem, section: number, badge?: number, stack?: MediaItem[]) => {
-    const last = blocks[blocks.length - 1];
-    if (last && last.kind === "run" && last.section === section) {
-      last.items.push(m);
-      last.entries.push(entry);
-      last.badges.push(badge);
-      last.stacks.push(stack);
-    } else
-      blocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack], section, sectionStart: false, sectionLabel: "" });
-  };
-
-  displaySections.forEach((displaySection, section) => displaySection.entries.forEach((entry) => {
-    if (entry.kind === "group") {
-      const g = state.groups.find((x) => x.id === entry.id);
-      if (!g) return;
-      const items = g.memberIds
-        .map(mediaById)
-        .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id));
-      if (g.collapsed) {
-        const cover = items.find((media) => media.id === g.coverId) ?? items[0];
-        if (!cover) return;
-        const rest = items.filter((m) => m.id !== cover.id);
-        pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, 4));
+  const blocks = useMemo(() => {
+    const nextBlocks: Block[] = [];
+    const pushRun = (entry: OrderEntry, m: MediaItem, section: number, badge?: number, stack?: MediaItem[]) => {
+      const last = nextBlocks[nextBlocks.length - 1];
+      if (last && last.kind === "run" && last.section === section) {
+        last.items.push(m);
+        last.entries.push(entry);
+        last.badges.push(badge);
+        last.stacks.push(stack);
       } else {
-        blocks.push({ kind: "group", entry, items, section, sectionStart: false, sectionLabel: "" });
+        nextBlocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack], section, sectionStart: false, sectionLabel: "" });
       }
-    } else {
-      const m = mediaById(entry.id);
-      if (!m) return;
-      pushRun(entry, m, section);
-    }
-  }));
-  const markedSections = new Set<number>();
-  blocks.forEach((block) => {
-    block.sectionStart = groupBy.length > 0 && !markedSections.has(block.section);
-    block.sectionLabel = block.sectionStart ? displaySections[block.section]?.label ?? "" : "";
-    markedSections.add(block.section);
-  });
+    };
+    displaySections.forEach((displaySection, section) => displaySection.entries.forEach((entry) => {
+      if (entry.kind === "group") {
+        const group = state.groups.find((item) => item.id === entry.id);
+        if (!group) return;
+        const items = group.memberIds
+          .map(mediaById)
+          .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id));
+        if (group.collapsed) {
+          const cover = items.find((media) => media.id === group.coverId) ?? items[0];
+          if (!cover) return;
+          const rest = items.filter((media) => media.id !== cover.id);
+          pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, 4));
+        } else {
+          nextBlocks.push({ kind: "group", entry, items, section, sectionStart: false, sectionLabel: "" });
+        }
+      } else {
+        const media = mediaById(entry.id);
+        if (media) pushRun(entry, media, section);
+      }
+    }));
+    const markedSections = new Set<number>();
+    nextBlocks.forEach((block) => {
+      block.sectionStart = groupBy.length > 0 && !markedSections.has(block.section);
+      block.sectionLabel = block.sectionStart ? displaySections[block.section]?.label ?? "" : "";
+      markedSections.add(block.section);
+    });
+    return nextBlocks;
+  }, [displaySections, groupBy.length, mediaById, state.groups, visibleMediaIdSet]);
 
   // Large libraries used to build every justified row and every card at
-  // once.  Even though thumbnails were lazy, thousands of DOM nodes, menus,
+  // once. Even though thumbnails were lazy, thousands of DOM nodes, menus,
   // and event handlers still made opening and scrolling a Gallery janky.
-  // Keep the rich justified/group layout for ordinary Galleries, and switch
-  // to a windowed responsive grid for large ones.  The grid deliberately
-  // works with rows (not individual cards) so the number of mounted nodes is
-  // stable while scrolling and there are no blank strips at row boundaries.
+  // Window the same justified rows used by ordinary Galleries instead of
+  // switching to a fixed-card grid: Gallery size must never change image
+  // aspect ratios or visual layout.
   type VirtualCell = {
     item: MediaItem;
     entry: OrderEntry;
+    width: number;
     badge?: number;
     stack?: MediaItem[];
     inGroupId?: string;
     sectionLabel?: string;
   };
-  const virtualCells: VirtualCell[] = [];
-  blocks.forEach((block) => {
-    let sectionLabel = block.sectionStart ? block.sectionLabel : undefined;
-    if (block.kind === "run") {
-      block.items.forEach((item, index) => {
-        virtualCells.push({
-          item,
-          entry: block.entries[index] ?? { kind: "media", id: item.id },
-          badge: block.badges[index],
-          stack: block.stacks[index],
-          sectionLabel,
-        });
-        sectionLabel = undefined;
+  type VirtualLayoutRow = {
+    cells: VirtualCell[];
+    height: number;
+    sectionLabel?: string;
+    groupKey?: string;
+    groupStart?: boolean;
+    groupEnd?: boolean;
+  };
+  // This is deliberately independent of scrollTop. The justified row
+  // geometry is expensive but only changes when the Gallery data, width, or
+  // requested thumbnail height changes.
+  const virtualLayout = useMemo(() => {
+    const virtualRows: VirtualLayoutRow[] = [];
+    blocks.forEach((block) => {
+      const groupKey = block.kind === "group" ? `${block.section}:${block.entry.id}:${virtualRows.length}` : undefined;
+      const rows = block.kind === "group"
+        ? groupRows(block.items, width, state.thumbHeight, galleryLayout)
+        : layoutRows(block.items, width, state.thumbHeight, galleryLayout);
+      let itemOffset = 0;
+      rows.forEach((row, rowIndex) => {
+        const sectionLabel = block.sectionStart && rowIndex === 0 ? block.sectionLabel : undefined;
+        if (block.kind === "run") {
+          virtualRows.push({
+            height: row.height,
+            sectionLabel,
+            cells: row.items.map(({ item, width: cellWidth }, index) => {
+              const itemIndex = itemOffset + index;
+              return {
+                item,
+                width: cellWidth,
+                entry: block.entries[itemIndex] ?? { kind: "media", id: item.id },
+                badge: block.badges[itemIndex],
+                stack: block.stacks[itemIndex],
+              };
+            }),
+          });
+        } else {
+          virtualRows.push({
+            height: row.height,
+            sectionLabel,
+            groupKey,
+            groupStart: rowIndex === 0,
+            groupEnd: rowIndex === rows.length - 1,
+            cells: row.items.map(({ item, width: cellWidth }) => ({
+              item,
+              width: cellWidth,
+              entry: { kind: "media", id: item.id },
+              inGroupId: block.entry.id,
+            })),
+          });
+        }
+        itemOffset += row.items.length;
       });
-      return;
-    }
-    block.items.forEach((item) => {
-      virtualCells.push({
-        item,
-        entry: { kind: "media", id: item.id },
-        inGroupId: block.entry.id,
-        sectionLabel,
-      });
-      sectionLabel = undefined;
     });
-  });
-  const shouldVirtualize = virtualCells.length > 160;
-  const virtualCardHeight = Math.max(100, Math.min(400, state.thumbHeight));
-  const virtualColumns = Math.max(1, Math.floor((width + GAP) / (virtualCardHeight * 1.25 + GAP)));
-  const virtualCardWidth = Math.max(80, (width - GAP * (virtualColumns - 1)) / virtualColumns);
-  const virtualRowHeight = virtualCardHeight + GAP;
-  const virtualRowCount = Math.ceil(virtualCells.length / virtualColumns);
+    let virtualHeight = 0;
+    const positionedVirtualRows = virtualRows.map((row) => {
+      // An expanded Group needs its own inner whitespace in virtualized
+      // Galleries too. Previously we only inset rows horizontally, leaving
+      // the first and last media flush with the Group frame.
+      const leadingPadding = row.groupStart ? GROUP_INSET : 0;
+      const trailingPadding = row.groupEnd ? GROUP_INSET : 0;
+      const top = virtualHeight + leadingPadding;
+      virtualHeight = top + row.height + trailingPadding + (row.sectionLabel ? 28 : 0) + GAP;
+      return { ...row, top };
+    });
+    const groupFrames = new Map<string, { key: string; top: number; bottom: number }>();
+    positionedVirtualRows.forEach((row) => {
+      if (!row.groupKey) return;
+      const frame = groupFrames.get(row.groupKey) ?? { key: row.groupKey, top: row.top - GROUP_INSET, bottom: row.top + row.height };
+      frame.top = Math.min(frame.top, row.top - (row.groupStart ? GROUP_INSET : 0));
+      frame.bottom = Math.max(frame.bottom, row.top + row.height + (row.groupEnd ? GROUP_INSET : 0));
+      groupFrames.set(row.groupKey, frame);
+    });
+    return {
+      positionedVirtualRows,
+      virtualGroupFrames: [...groupFrames.values()],
+      virtualHeight: Math.max(0, virtualHeight - GAP),
+      mediaCount: virtualRows.reduce((total, row) => total + row.cells.length, 0),
+    };
+  }, [blocks, galleryLayout, state.thumbHeight, width]);
+  const { positionedVirtualRows, virtualGroupFrames, virtualHeight } = virtualLayout;
+  const shouldVirtualize = virtualLayout.mediaCount > 160;
   // Two full screens on either side give thumbnail loading enough lead time
   // without allowing a scroll fling to mount the entire Gallery.
-  const virtualScreenRows = Math.max(2, Math.ceil(viewportHeight / virtualRowHeight));
-  const virtualBehind = scrollDirection.current === "down" ? virtualScreenRows : virtualScreenRows * 2;
-  const virtualAhead = scrollDirection.current === "down" ? virtualScreenRows * 2 : virtualScreenRows;
-  const virtualFirstRow = Math.max(0, Math.floor(scrollTop / virtualRowHeight) - virtualBehind);
-  const virtualLastRow = Math.min(virtualRowCount, Math.ceil((scrollTop + viewportHeight) / virtualRowHeight) + virtualAhead);
+  const virtualOverscan = Math.max(viewportHeight * 2, 640);
+  const virtualStart = Math.max(0, scrollTop - (scrollDirection.current === "down" ? virtualOverscan : virtualOverscan * 1.5));
+  const virtualEnd = scrollTop + viewportHeight + (scrollDirection.current === "down" ? virtualOverscan * 1.5 : virtualOverscan);
+  let virtualFirstRow = 0;
+  while (virtualFirstRow < positionedVirtualRows.length && positionedVirtualRows[virtualFirstRow]!.top + positionedVirtualRows[virtualFirstRow]!.height < virtualStart) virtualFirstRow += 1;
+  let virtualLastRow = virtualFirstRow;
+  while (virtualLastRow < positionedVirtualRows.length && positionedVirtualRows[virtualLastRow]!.top < virtualEnd) virtualLastRow += 1;
 
   if (entries.length === 0) {
     return (
@@ -1268,38 +1470,61 @@ export function Gallery({
       onPointerDown={onBackgroundPointerDown}
       onScroll={(event) => {
         const next = event.currentTarget.scrollTop;
-        scrollDirection.current = next < scrollTop ? "up" : "down";
-        setScrollTop(next);
+        pendingScrollTop.current = next;
+        if (scrollFrame.current) return;
+        scrollFrame.current = requestAnimationFrame(() => {
+          scrollFrame.current = 0;
+          const committed = pendingScrollTop.current;
+          scrollDirection.current = committed < committedScrollTop.current ? "up" : "down";
+          committedScrollTop.current = committed;
+          setScrollTop(committed);
+        });
       }}
       className="app-scroll relative min-w-0 flex-1 overflow-y-auto px-5 py-4"
-    >
+      >
       {shouldVirtualize ? (
-        <div ref={innerRef} className="relative w-full min-w-0" style={{ height: Math.max(0, virtualRowCount * virtualRowHeight - GAP) }}>
-          {Array.from({ length: Math.max(0, virtualLastRow - virtualFirstRow) }, (_, offset) => {
+        <div ref={innerRef} className="relative w-full min-w-0" style={{ height: virtualHeight }}>
+          {virtualGroupFrames.map((frame) => (
+            <div
+              key={frame.key}
+              aria-hidden
+              className="pointer-events-none absolute right-0 left-0 box-border rounded-xl border-2 border-primary/40 bg-primary/[0.035] shadow-[inset_0_0_0_1px_rgb(255_255_255_/_0.08)]"
+              style={{ top: frame.top, height: frame.bottom - frame.top }}
+            />
+          ))}
+          {positionedVirtualRows.slice(virtualFirstRow, virtualLastRow).map((row, offset) => {
             const rowIndex = virtualFirstRow + offset;
-            const cells = virtualCells.slice(rowIndex * virtualColumns, (rowIndex + 1) * virtualColumns);
-            const sectionLabel = cells.find((cell) => cell.sectionLabel)?.sectionLabel;
+            const inGroup = Boolean(row.cells[0]?.inGroupId);
+            const priorityThumbnail = row.top + row.height >= scrollTop - 120
+              && row.top <= scrollTop + viewportHeight + 320;
             return (
               <Fragment key={`virtual-${rowIndex}`}>
-                {sectionLabel && (
-                  <div className="absolute right-0 left-0" style={{ top: rowIndex * virtualRowHeight }}>
-                    <GroupDivider label={sectionLabel} />
+                {row.sectionLabel && (
+                  <div className="absolute right-0 left-0" style={{ top: row.top }}>
+                    <GroupDivider label={row.sectionLabel} />
                   </div>
                 )}
                 <div
                   data-library-row
-                  className="absolute right-0 left-0 flex"
-                  style={{ top: rowIndex * virtualRowHeight + (sectionLabel ? 28 : 0), gap: GAP, height: virtualCardHeight }}
+                  className="absolute flex"
+                  style={{
+                    top: row.top + (row.sectionLabel ? 28 : 0),
+                    left: inGroup ? GROUP_INSET : 0,
+                    right: inGroup ? GROUP_INSET : 0,
+                    gap: GAP,
+                    height: row.height,
+                  }}
                 >
-                  {cells.map((cell) => renderMedia(
+                  {row.cells.map((cell) => renderMedia(
                     cell.item,
                     cell.entry,
-                    virtualCardWidth,
-                    Math.max(72, virtualCardHeight - (sectionLabel ? 28 : 0)),
+                    cell.width,
+                    row.height,
                     cell.badge,
                     cell.stack,
                     cell.inGroupId,
-                    true,
+                    priorityThumbnail,
+                    Math.abs(row.top + row.height / 2 - (scrollTop + viewportHeight / 2)),
                   ))}
                 </div>
               </Fragment>
@@ -1310,7 +1535,7 @@ export function Gallery({
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return equalJustifiedRows(block.items, width, state.thumbHeight).map((row, ri) => {
+            return layoutRows(block.items, width, state.thumbHeight, galleryLayout).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1344,7 +1569,7 @@ export function Gallery({
           }
           const group = state.groups.find((g) => g.id === block.entry.id)!;
           const gi = globalIndex(block.entry);
-          const rows = equalJustifiedRows(block.items, Math.max(width - GROUP_PAD * 2, 100), state.thumbHeight);
+          const rows = groupRows(block.items, width, state.thumbHeight, galleryLayout);
           const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
           const insertY =
             drop?.type === "insert" && drop.axis === "y"
@@ -1375,15 +1600,15 @@ export function Gallery({
                     marginBottom: dwelled && insertY === "after" ? SPREAD : undefined,
                   }}
                   className={cn(
-                    "glass-panel group/frame relative w-full rounded-xl transition-all",
+                    "glass-panel group/frame relative box-border w-full rounded-xl border-2 border-primary/40 bg-primary/[0.035] shadow-[inset_0_0_0_1px_rgb(255_255_255_/_0.08)] transition-all",
                     drag?.id === group.id && "opacity-50",
                     holdingGroup && "ring-2 ring-primary/60",
                   )}
                 >
-                  <div className="flex flex-col" style={{ gap: GAP }}>
+                  <div className="flex min-w-0 flex-col" style={{ gap: GAP }}>
                     {!group.collapsed &&
                       rows.map((row, ri) => (
-                        <div key={ri} className="flex" style={{ gap: GAP }}>
+                        <div key={ri} className="flex min-w-0" style={{ gap: GAP }}>
                           {row.items.map(({ item, width: w }) =>
                             renderMedia(
                               item,
@@ -1442,7 +1667,13 @@ export function Gallery({
           className="pointer-events-none fixed z-[80] h-20 w-28 overflow-hidden rounded-lg border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm"
           style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}
         >
-          <img src={mediaById(drag.id)!.url} alt="" draggable={false} className="size-full object-cover" />
+          {selected.includes(drag.id) && selected.length > 1 ? (
+            <span className="grid size-full place-items-center bg-background/70 px-2 text-center text-sm font-medium text-foreground">
+              {selected.length} items
+            </span>
+          ) : (
+            <img src={mediaById(drag.id)!.url} alt="" draggable={false} className="size-full object-cover" />
+          )}
         </div>
       )}
 
@@ -1483,8 +1714,7 @@ export function Gallery({
                 if (!moveToGalleryFor || !currentFolderId) return;
                 // Move is membership-only: keep the original file/source, add
                 // it to the destination, then remove it from this Gallery.
-                addToFolder(folder.id, [moveToGalleryFor]);
-                removeFromFolder(currentFolderId, moveToGalleryFor);
+                moveToFolder(folder.id, [moveToGalleryFor], currentFolderId);
                 setMoveToGalleryFor(null);
               }} className="glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm"><Folder className="size-4 text-muted-foreground" /><span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">Đã có</span> : <FolderInput className="size-4 text-muted-foreground" />}</button>;
             })}

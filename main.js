@@ -2,6 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain, clipboard, nativeImage, shell, scre
 const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { pathToFileURL } = require('url');
@@ -40,6 +41,7 @@ const VAULT_TUNNEL_FILE = path.join(process.env.LOCALAPPDATA || app.getPath('use
 const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
 const APP_ICON_ICO_PATH = path.join(app.getPath('userData'), 'Mosaic.ico');
 const DEFAULT_PROFILE_ID = 'default';
+const ASPECT_INDEX_VERSION = 3;
 // Test and installed applications must never overwrite one another's native
 // messaging registration. The production extension uses com.mosaic.app.
 const NATIVE_HOST_NAME = app.isPackaged ? 'com.mosaic.app' : 'com.mosaictest.app';
@@ -364,6 +366,15 @@ async function configureProfileLibrary(profileId, folder, useExisting) {
   if (!profile) throw new Error('Profile not found');
   const status = await libraryLocationStatus(profileId, folder);
   if (status.exists && !useExisting) throw new Error('A MosaicMedia Library already exists here. Confirm that you want to use it.');
+  const previousMediaPath = profile.mediaPath || profile.lastMediaPath || null;
+  const locationChanged = Boolean(previousMediaPath && normalizedPath(previousMediaPath) !== normalizedPath(status.mediaPath));
+
+  // Moving a Profile Library is a physical Library migration, not merely a
+  // registry edit.  If the target already exists, the user explicitly chose
+  // to use it; this also repairs a Library the user moved manually.  For a
+  // new target, move the complete Mosaic root before changing the Profile
+  // record so a failed cross-drive copy leaves the active Library untouched.
+  if (locationChanged && !status.exists) await moveLibraryRootSafely(previousMediaPath, status.mediaPath);
   await fs.promises.mkdir(status.mediaPath, { recursive: true });
   profile.mediaPath = status.mediaPath;
   profile.lastMediaPath = status.mediaPath;
@@ -371,6 +382,7 @@ async function configureProfileLibrary(profileId, folder, useExisting) {
   profile.initialized = true;
   profile.libraryLocationConfiguredAt = Date.now();
   const stored = await updateProfileInRegistry(profile);
+  if (locationChanged) await relocateManagedProfilePaths(stored, previousMediaPath);
   await recoverProfileLibrary(stored);
   await ensureProfileFolderIcon(status.mediaPath);
   return stored;
@@ -392,6 +404,62 @@ async function relocateManagedProfilePaths(profile, previousMediaPath) {
   for (const gallery of data.collections || []) gallery.defaultSourcePath = relocate(gallery.defaultSourcePath);
   if (changed) await writeStore(profile, data);
   return changed;
+}
+
+async function directoryTransferSummary(folder) {
+  const summary = { files: 0, directories: 0, bytes: 0 };
+  const pending = [folder];
+  while (pending.length) {
+    const current = pending.pop();
+    const entries = await fs.promises.readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const item = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        summary.directories += 1;
+        pending.push(item);
+      } else if (entry.isFile()) {
+        summary.files += 1;
+        summary.bytes += (await fs.promises.stat(item)).size;
+      }
+    }
+  }
+  return summary;
+}
+
+async function moveLibraryRootSafely(from, to) {
+  const source = path.resolve(String(from || ''));
+  const target = path.resolve(String(to || ''));
+  if (!source || !target || normalizedPath(source) === normalizedPath(target)) return false;
+  const sourceExists = await fs.promises.stat(source).then(stat => stat.isDirectory()).catch(() => false);
+  if (!sourceExists) return false;
+  const targetExists = await fs.promises.stat(target).then(stat => stat.isDirectory()).catch(() => false);
+  if (targetExists) return false;
+  await fs.promises.mkdir(path.dirname(target), { recursive: true });
+  try {
+    await fs.promises.rename(source, target);
+    return true;
+  } catch (error) {
+    // Windows only permits a directory rename within one volume. Cross-drive
+    // moves copy into a sibling staging folder, verify it, then remove the old
+    // root. The profile remains pointed at the old root until all three steps
+    // complete, so a failed move cannot make media disappear from Mosaic.
+    if (error?.code !== 'EXDEV') throw error;
+  }
+  const staging = path.join(path.dirname(target), `.${path.basename(target)}.mosaic-moving-${crypto.randomUUID()}`);
+  try {
+    const before = await directoryTransferSummary(source);
+    await fs.promises.cp(source, staging, { recursive: true, force: false, errorOnExist: true });
+    const copied = await directoryTransferSummary(staging);
+    if (before.files !== copied.files || before.directories !== copied.directories || before.bytes !== copied.bytes) {
+      throw new Error('Library copy verification failed');
+    }
+    await fs.promises.rename(staging, target);
+    await fs.promises.rm(source, { recursive: true, force: false, maxRetries: 2, retryDelay: 250 });
+    return true;
+  } catch (error) {
+    await fs.promises.rm(staging, { recursive: true, force: true, maxRetries: 1 }).catch(() => {});
+    throw new Error(`Could not move the Library: ${error.message || error}`);
+  }
 }
 async function trackProfileLibraryLocation(profile) {
   if (!isProfileReady(profile)) return profile;
@@ -600,6 +668,15 @@ async function writeStore(profile, value) {
 }
 function catalogPath(profile) { return path.join(profileDataPath(profile), 'media-catalog.json'); }
 function thumbnailDirectory(profile) { return path.join(profileDataPath(profile), 'thumbnails'); }
+
+async function resetThumbnailCaches(profiles) {
+  const candidates = [...(profiles?.profiles || []), ...(profiles?.discardedProfiles || [])]
+    .map(profile => thumbnailDirectory(profile));
+  // Cache is disposable. This is deliberately available only behind an
+  // explicit launch flag so support/testing can reset every Profile without
+  // touching library metadata or original media.
+  await Promise.all([...new Set(candidates)].map(folder => fs.promises.rm(folder, { recursive: true, force: true }).catch(() => {})));
+}
 const catalogPromises = new Map();
 const catalogWriteQueues = new Map();
 function readCatalog(profile) {
@@ -646,10 +723,51 @@ async function removeCachedSource(profile, sourceId) {
   delete catalog.sources[sourceId];
   await writeCatalog(profile);
 }
-function thumbnailPath(profile, asset) { return path.join(thumbnailDirectory(profile), `${crypto.createHash('sha1').update(`${asset.id}:${asset.modified || 0}`).digest('hex')}.png`); }
-const THUMBNAIL_CACHE_LIMIT = 1600;
+function thumbnailVariantSize(asset) {
+  const requested = Number(asset?.thumbnailSize || 320);
+  if (requested <= 160) return 160;
+  if (requested <= 320) return 320;
+  return 512;
+}
+function thumbnailPath(profile, asset) {
+  const variant = thumbnailVariantSize(asset);
+  const key = `${asset.id}:${asset.modified || 0}:${variant}:jpeg-v2`;
+  return path.join(thumbnailDirectory(profile), `${crypto.createHash('sha1').update(key).digest('hex')}.jpg`);
+}
+// A media Library should keep a warm preview for substantially more than a
+// fixed number of files. JPEG derivatives are small, and an LRU byte budget
+// avoids the old 1,600-file churn in a multi-thousand-media Gallery.
+const THUMBNAIL_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const thumbnailCachePruneCounters = new Map();
 const thumbnailWorkQueues = new Map();
+const thumbnailLatency = new Map();
+function thumbnailDecodeConcurrency() {
+  const available = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+  return Math.max(3, Math.min(8, Math.ceil(available * 0.6)));
+}
+function recordThumbnailLatency(profile, job, startedAt, completedAt, outcome) {
+  const key = String(profile?.id || DEFAULT_PROFILE_ID);
+  const sample = {
+    id: String(job.asset?.id || ''),
+    size: thumbnailVariantSize(job.asset),
+    priority: job.priority,
+    queuedMs: Math.round(startedAt - job.enqueuedAt),
+    decodeMs: Math.round(completedAt - startedAt),
+    totalMs: Math.round(completedAt - job.enqueuedAt),
+    outcome,
+    at: Date.now(),
+  };
+  const samples = thumbnailLatency.get(key) || [];
+  samples.push(sample);
+  if (samples.length > 240) samples.splice(0, samples.length - 240);
+  thumbnailLatency.set(key, samples);
+  if (process.env.MOSAIC_THUMBNAIL_PROFILE === '1') console.debug('[Mosaic thumbnail]', sample);
+}
+function enqueueThumbnail(queue, job) {
+  const pending = job.priority === 'high' ? queue.highPending : queue.bufferPending;
+  pending.push(job);
+  pending.sort((left, right) => Number(left.asset?.thumbnailDistance ?? Number.MAX_SAFE_INTEGER) - Number(right.asset?.thumbnailDistance ?? Number.MAX_SAFE_INTEGER));
+}
 // Thumbnail calls are made by visible cards.  The work queue is shared by the
 // whole profile, not by each IPC request, so a fast scroll cannot multiply
 // image/video decoding work beyond this fixed concurrency.
@@ -657,10 +775,12 @@ function scheduleThumbnail(profile, asset, requestId) {
   const profileKey = String(profile?.id || DEFAULT_PROFILE_ID);
   let queue = thumbnailWorkQueues.get(profileKey);
   if (!queue) {
-    queue = { active: 0, pending: [], jobs: new Map() };
+    const concurrency = thumbnailDecodeConcurrency();
+    queue = { active: 0, activeBuffer: 0, concurrency, bufferLimit: Math.max(1, concurrency - 2), highPending: [], bufferPending: [], jobs: new Map() };
     thumbnailWorkQueues.set(profileKey, queue);
   }
-  const jobKey = `${asset?.id}:${asset?.modified || 0}`;
+  const jobKey = `${asset?.id}:${asset?.modified || 0}:${thumbnailVariantSize(asset)}`;
+  const priority = asset?.thumbnailPriority === 'high' ? 'high' : 'buffer';
   requestId ||= `batch:${crypto.randomUUID()}`;
   let job = queue.jobs.get(jobKey);
   let resolve;
@@ -669,21 +789,37 @@ function scheduleThumbnail(profile, asset, requestId) {
     const consumers = job.consumers.get(requestId) || [];
     consumers.push(resolve);
     job.consumers.set(requestId, consumers);
+    if (!job.started && priority === 'high' && job.priority !== 'high') {
+      queue.bufferPending = queue.bufferPending.filter(item => item !== job);
+      job.priority = 'high';
+      job.asset = { ...job.asset, thumbnailPriority: 'high', thumbnailDistance: Math.min(Number(job.asset?.thumbnailDistance ?? Number.MAX_SAFE_INTEGER), Number(asset?.thumbnailDistance ?? Number.MAX_SAFE_INTEGER)) };
+      enqueueThumbnail(queue, job);
+    }
     return promise;
   }
-  job = { asset, jobKey, consumers: new Map([[requestId, [resolve]]]), started: false };
+  job = { asset, jobKey, priority, enqueuedAt: performance.now(), consumers: new Map([[requestId, [resolve]]]), started: false };
   queue.jobs.set(jobKey, job);
-  queue.pending.push(job);
+  enqueueThumbnail(queue, job);
   const pump = () => {
-    while (queue.active < 3 && queue.pending.length) {
-      const next = queue.pending.shift();
+    while (queue.active < queue.concurrency) {
+      const next = queue.highPending.shift() || (queue.activeBuffer < queue.bufferLimit ? queue.bufferPending.shift() : null);
+      if (!next) break;
       if (!next.consumers.size) { queue.jobs.delete(next.jobKey); continue; }
       queue.active += 1;
+      if (next.priority === 'buffer') queue.activeBuffer += 1;
       next.started = true;
+      const startedAt = performance.now();
       createThumbnail(profile, next.asset)
-        .then(value => { next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(value))); }, () => { next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(null))); })
+        .then(value => {
+          recordThumbnailLatency(profile, next, startedAt, performance.now(), value ? 'ok' : 'empty');
+          next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(value)));
+        }, () => {
+          recordThumbnailLatency(profile, next, startedAt, performance.now(), 'error');
+          next.consumers.forEach(resolvers => resolvers.forEach(resolve => resolve(null)));
+        })
         .finally(() => {
           queue.active -= 1;
+          if (next.priority === 'buffer') queue.activeBuffer -= 1;
           queue.jobs.delete(next.jobKey);
           pump();
         });
@@ -700,6 +836,15 @@ function cancelThumbnailRequest(profile, requestId) {
     const resolvers = job.consumers.get(requestId);
     if (resolvers) { job.consumers.delete(requestId); resolvers.forEach(resolve => resolve(null)); }
   });
+  // Do not let a card that was recycled while scrolling occupy a future slot.
+  // Native image work already running cannot be interrupted safely, but it
+  // has no consumers and its result is discarded when it settles.
+  for (const job of [...queue.jobs.values()]) {
+    if (job.started || job.consumers.size) continue;
+    queue.jobs.delete(job.jobKey);
+    queue.highPending = queue.highPending.filter(item => item !== job);
+    queue.bufferPending = queue.bufferPending.filter(item => item !== job);
+  }
 }
 async function pruneThumbnailCache(profile) {
   const key = String(profile?.id || DEFAULT_PROFILE_ID);
@@ -707,28 +852,36 @@ async function pruneThumbnailCache(profile) {
   thumbnailCachePruneCounters.set(key, count);
   // Pruning occasionally, rather than during every thumbnail lookup, keeps
   // the cache bounded without putting directory enumeration on the scroll path.
-  if (count % 80) return;
+  if (count % 160) return;
   try {
     const folder = thumbnailDirectory(profile);
     const files = (await fs.promises.readdir(folder, { withFileTypes: true }))
-      .filter(entry => entry.isFile() && entry.name.endsWith('.png'));
-    if (files.length <= THUMBNAIL_CACHE_LIMIT) return;
+      .filter(entry => entry.isFile() && /\.(?:png|jpe?g|webp)$/i.test(entry.name));
+    if (!files.length) return;
     const details = await Promise.all(files.map(async entry => ({
       path: path.join(folder, entry.name),
-      mtime: (await fs.promises.stat(path.join(folder, entry.name))).mtimeMs,
+      ...(await fs.promises.stat(path.join(folder, entry.name))),
     })));
+    let totalBytes = details.reduce((total, file) => total + file.size, 0);
+    if (totalBytes <= THUMBNAIL_CACHE_MAX_BYTES) return;
     details.sort((a, b) => a.mtime - b.mtime);
-    await Promise.all(details.slice(0, details.length - THUMBNAIL_CACHE_LIMIT).map(file => fs.promises.rm(file.path, { force: true })));
+    const expired = [];
+    for (const file of details) {
+      if (totalBytes <= THUMBNAIL_CACHE_MAX_BYTES) break;
+      totalBytes -= file.size;
+      expired.push(file);
+    }
+    await Promise.all(expired.map(file => fs.promises.rm(file.path, { force: true })));
   } catch { /* A cache is disposable. */ }
 }
-function createVideoThumbnail(asset, target) {
+function createVideoThumbnail(asset, target, maximum) {
   const source = asset?.vault ? asset.contentUrl : asset?.path;
   if (!ffmpegPath || !source) return Promise.resolve(false);
   return new Promise(resolve => execFile(ffmpegPath, [
     // Do not seek before MPEG-TS input: transport streams often start at a
     // non-zero timestamp, which can otherwise produce no frame at all.
     '-hide_banner', '-loglevel', 'error', '-i', source,
-    '-frames:v', '1', '-vf', 'scale=512:512:force_original_aspect_ratio=decrease', '-y', target
+    '-frames:v', '1', '-vf', `scale=${maximum}:${maximum}:force_original_aspect_ratio=decrease`, '-q:v', '4', '-y', target
   ], { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 }, error => resolve(!error)));
 }
 async function createThumbnail(profile, asset) {
@@ -742,8 +895,9 @@ async function createThumbnail(profile, asset) {
     const exists = await fs.promises.stat(assetPath).then(stat => stat.isFile()).catch(() => false);
     if (!exists) return null;
   }
+  const maximum = thumbnailVariantSize(asset);
   const target = thumbnailPath(profile, asset);
-  const temporary = `${target}.${process.pid}.${Date.now()}.tmp.png`;
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp.jpg`;
   try {
     await fs.promises.access(target);
     // The filesystem timestamp doubles as the LRU access marker.
@@ -753,7 +907,7 @@ async function createThumbnail(profile, asset) {
   try {
     await fs.promises.mkdir(thumbnailDirectory(profile), { recursive: true });
     if (asset.type === 'video') {
-      if (!(await createVideoThumbnail(asset, temporary))) { await fs.promises.rm(temporary, { force: true }).catch(() => {}); return null; }
+      if (!(await createVideoThumbnail(asset, temporary, maximum))) { await fs.promises.rm(temporary, { force: true }).catch(() => {}); return null; }
       await fs.promises.rename(temporary, target);
       void pruneThumbnailCache(profile);
       return pathToFileURL(target).href;
@@ -765,12 +919,15 @@ async function createThumbnail(profile, asset) {
       image = nativeImage.createFromBuffer(Buffer.from(await response.arrayBuffer()));
       if (!image.isEmpty()) {
         const { width, height } = image.getSize();
-        if (width && height) image = width >= height ? image.resize({ width: Math.min(512, width) }) : image.resize({ height: Math.min(512, height) });
+        if (width && height) image = width >= height ? image.resize({ width: Math.min(maximum, width) }) : image.resize({ height: Math.min(maximum, height) });
       }
-    } else if (asset.path) image = await nativeImage.createThumbnailFromPath(asset.path, { width: 512, height: 512 });
+    // This native Electron decode runs in the main process and resolves
+    // asynchronously; no renderer canvas/Image decode is allowed to block
+    // scrolling on the UI thread.
+    } else if (asset.path) image = await nativeImage.createThumbnailFromPath(asset.path, { width: maximum, height: maximum });
     else return null;
     if (image.isEmpty()) return null;
-    await fs.promises.writeFile(temporary, image.toPNG());
+    await fs.promises.writeFile(temporary, image.toJPEG(84));
     await fs.promises.rename(temporary, target);
     void pruneThumbnailCache(profile);
     return pathToFileURL(target).href;
@@ -947,32 +1104,49 @@ async function readVaultBridges() {
     return Array.isArray(document?.vaults) ? document.vaults.filter(bridge => bridge?.id) : [];
   } catch { return []; }
 }
+function isAutomaticallyAttachedVaultSource(source) {
+  // Earlier builds copied every record from the machine-wide Vault tunnel into
+  // every Profile and used this dedicated id shape. A Vault is only a
+  // discoverable source; it belongs to a Profile only after that Profile adds
+  // its folder as a Media Source. Keep manually added sources (src-…) intact.
+  return String(source?.id || '').startsWith('vault:');
+}
+function removeAutomaticallyAttachedVaultSources(data) {
+  const removedSources = (data.sources || []).filter(isAutomaticallyAttachedVaultSource);
+  if (!removedSources.length) return false;
+  const removedIds = new Set(removedSources.map(source => String(source.id)));
+  const removedAssetIds = new Set(removedSources.flatMap(source => (source.assets || []).map(asset => String(asset.id))));
+  data.sources = (data.sources || []).filter(source => !removedIds.has(String(source.id)));
+  data.librarySourceIds = (data.librarySourceIds || []).map(String).filter(id => !removedIds.has(id));
+  data.mainSourceIds = (data.mainSourceIds || []).map(String).filter(id => !removedIds.has(id));
+  for (const gallery of [...(data.collections || []), ...(data.discardedGalleries || [])]) {
+    gallery.sourceIds = (gallery.sourceIds || []).map(String).filter(id => !removedIds.has(id));
+  }
+  removeLibraryAssetReferences(data, removedAssetIds);
+  return true;
+}
+async function removeAutomaticallyAttachedVaultSourcesFromProfiles() {
+  const registry = await readProfileRegistry();
+  for (const profile of registry.profiles) {
+    const data = await readStore(profile);
+    if (removeAutomaticallyAttachedVaultSources(data)) await writeStore(profile, data);
+  }
+}
 async function reconcileVaultBridgeSources(profile, data) {
+  // The tunnel is global to the Windows user, not to a Mosaic Profile. Never
+  // turn tunnel discovery into a Profile membership. This function only keeps
+  // an existing, manually linked Vault source current when its bridge moves or
+  // its in-memory catalog is empty.
+  const removedAutomaticSources = removeAutomaticallyAttachedVaultSources(data);
   const bridges = await readVaultBridges();
-  if (!bridges.length) return false;
-  data.sources ||= [];
-  data.librarySourceIds ||= [];
-  let changed = false;
-  for (const bridge of bridges) {
-    const folder = String(bridge?.folder || '').trim();
-    const bridgeId = String(bridge?.id || '').trim();
-    if (!folder || !bridgeId) continue;
-    let source = data.sources.find(item => String(item.vaultBridgeId || '') === bridgeId)
-      || data.sources.find(item => normalizeFolder(item.path) === normalizeFolder(folder));
-    if (!source) {
-      source = {
-        id: `vault:${bridgeId}`,
-        name: path.basename(folder) || 'Vault',
-        path: folder,
-        assets: [],
-        vaultBridgeId: bridgeId,
-        tracking: bridgeTracking(bridge),
-      };
-      data.sources.push(source);
-      if (!data.librarySourceIds.includes(source.id)) data.librarySourceIds.push(source.id);
-      changed = true;
-    }
-    if (String(source.vaultBridgeId || '') !== bridgeId) { source.vaultBridgeId = bridgeId; changed = true; }
+  if (!bridges.length) return removedAutomaticSources;
+  let changed = removedAutomaticSources;
+  for (const source of data.sources || []) {
+    if (!source?.vaultBridgeId) continue;
+    const bridge = bridges.find(item => String(item.id) === String(source.vaultBridgeId));
+    if (!bridge) continue;
+    const folder = String(bridge.folder || '').trim();
+    if (!folder) continue;
     if (normalizeFolder(source.path) !== normalizeFolder(folder)) {
       source.path = folder;
       source.name = path.basename(folder) || source.name;
@@ -983,15 +1157,9 @@ async function reconcileVaultBridgeSources(profile, data) {
       source.tracking = tracking;
       changed = true;
     }
-    // The React renderer restores only the persisted catalog on startup. A
-    // Vault source has no local filesystem watcher, so populate an empty
-    // catalog here instead of leaving a freshly discovered Vault blank.
     if ((source.assets || []).length === 0) {
       try {
         const result = await scanSource(profile, source);
-        if (result.folder) source.path = result.folder;
-        if (result.tracking) source.tracking = result.tracking;
-        if (result.vaultBridgeId) source.vaultBridgeId = result.vaultBridgeId;
         const assets = result.assets || [];
         if (JSON.stringify(source.assets || []) !== JSON.stringify(assets)) {
           source.assets = assets;
@@ -1040,6 +1208,46 @@ async function scanVaultDirectory(folder, bridge, source) {
     }))
     .sort((a, b) => b.modified - a.modified);
 }
+
+function hasUsableAspect(asset) {
+  return Number(asset?.width) > 4 && Number(asset?.height) > 3;
+}
+
+function exifImageDimensions(files) {
+  if (!files.length || !fs.existsSync(MOSAIC_EXIFTOOL_PATH)) return Promise.resolve(new Map());
+  // Keep each Windows command line comfortably below its length limit. Three
+  // workers are enough to avoid a huge initial Gallery blocking on one serial
+  // process, without saturating disk I/O alongside thumbnail generation.
+  const chunks = [];
+  for (let index = 0; index < files.length; index += 140) chunks.push(files.slice(index, index + 140));
+  const dimensions = new Map();
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < chunks.length) {
+      const batch = chunks[cursor++];
+      const output = await new Promise(resolve => execFile(
+        MOSAIC_EXIFTOOL_PATH,
+        ['-j', '-n', '-ImageWidth', '-ImageHeight', '-Orientation', ...batch],
+        { windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 },
+        (_error, stdout) => resolve(stdout || '[]'),
+      ));
+      try {
+        for (const entry of JSON.parse(output)) {
+          const width = Number(entry.ImageWidth || 0);
+          const height = Number(entry.ImageHeight || 0);
+          const orientation = Number(entry.Orientation || 1);
+          // EXIF orientations 5–8 rotate the displayed image by 90/270°.
+          // ImageWidth/ImageHeight alone describes the encoded bitmap, not
+          // the aspect ratio seen by Chromium and the user.
+          const rotated = orientation >= 5 && orientation <= 8;
+          if (width > 0 && height > 0 && entry.SourceFile) dimensions.set(normalizedPath(entry.SourceFile), rotated ? { width: height, height: width } : { width, height });
+        }
+      } catch { /* A corrupt media file simply keeps the safe fallback ratio. */ }
+    }
+  };
+  return Promise.all(Array.from({ length: Math.min(3, chunks.length) }, worker)).then(() => dimensions);
+}
+
 async function scanDirectory(folder, source) {
   // A folder in the Windows Recycle Bin is deleted content, not a renamed
   // source. Never walk it, even when its NTFS id is still queryable.
@@ -1062,6 +1270,32 @@ async function scanDirectory(folder, source) {
         results.push({ id, path: fullPath, relativePath, name: entry.name, type: imageExtensions.has(path.extname(entry.name).toLowerCase()) ? 'image' : 'video', modified: stat.mtimeMs });
       } catch { /* skipped */ }
     }
+  }
+  // Aspect ratio belongs to the source metadata, never to the thumbnail.
+  // Preserve previous values during an ordinary rescan and index only media
+  // that has not had a real image dimension recorded yet.
+  const previous = new Map((Number(source?.aspectIndexVersion || 0) >= ASPECT_INDEX_VERSION ? source.assets || [] : [])
+    .filter(hasUsableAspect)
+    .map(asset => [normalizedPath(asset.path), { width: Number(asset.width), height: Number(asset.height) }]));
+  const missing = results.filter(asset => asset.type === 'image' && !previous.has(normalizedPath(asset.path)));
+  const detected = await exifImageDimensions(missing.map(asset => asset.path));
+  // A few valid files have metadata that ExifTool cannot read (and filenames
+  // with unusual legacy encoding can be omitted from a batch response).
+  // Decode only those leftovers from the original file — never infer layout
+  // dimensions from a generated thumbnail.
+  for (const asset of missing) {
+    if (detected.has(normalizedPath(asset.path))) continue;
+    try {
+      const image = nativeImage.createFromPath(asset.path);
+      if (!image.isEmpty()) {
+        const { width, height } = image.getSize();
+        if (width > 0 && height > 0) detected.set(normalizedPath(asset.path), { width, height });
+      }
+    } catch { /* Unreadable media keeps only the safe temporary ratio. */ }
+  }
+  for (const asset of results) {
+    const dimensions = previous.get(normalizedPath(asset.path)) || detected.get(normalizedPath(asset.path));
+    if (dimensions) { asset.width = dimensions.width; asset.height = dimensions.height; }
   }
   return results.sort((a, b) => b.modified - a.modified);
 }
@@ -1544,6 +1778,10 @@ async function refreshTrackedSources(profile, folders = []) {
     }
     if (result.tracking) source.tracking = result.tracking;
     if (result.vaultBridgeId) source.vaultBridgeId = result.vaultBridgeId;
+    if (!result.vault && Number(source.aspectIndexVersion || 0) !== ASPECT_INDEX_VERSION) {
+      source.aspectIndexVersion = ASPECT_INDEX_VERSION;
+      changed = true;
+    }
     const nextAssets = migrateScannedAssetIds(data, source, result.assets || []);
     const nextIds = new Set(nextAssets.map(asset => String(asset.id)));
     previousIds.forEach(id => { if (!nextIds.has(id)) removedIds.add(id); });
@@ -1575,6 +1813,20 @@ async function refreshTrackedSources(profile, folders = []) {
   changed = removeLibraryAssetReferences(data, removedIds) || changed;
   if (changed) await writeStore(profile, data);
   return { refreshedSourceIds: targets.map(source => String(source.id)), removedAssetIds: [...removedIds] };
+}
+
+async function ensureProfileAspectRatios(profile) {
+  const data = await readStore(profile);
+  const needsIndex = (data.sources || []).some(source =>
+    (!source.vaultBridgeId && Number(source.aspectIndexVersion || 0) < ASPECT_INDEX_VERSION)
+    || (source.assets || []).some(asset => asset?.type === 'image' && !hasUsableAspect(asset)),
+  );
+  if (!needsIndex) return false;
+  // Run once before this Profile's Gallery is mounted. A justified layout must
+  // have stable source aspect ratios from its first paint, not gradually turn
+  // into equal cells as thumbnails happen to arrive during scrolling.
+  await refreshTrackedSources(profile);
+  return true;
 }
 
 function localMediaSource(profile, source) {
@@ -2092,6 +2344,10 @@ async function createWindow(profileId = null) {
   if (isProfileReady(profile)) profile = await trackProfileLibraryLocation(profile);
   const existing = profileWindows.get(profile.id);
   if (existing && !existing.isDestroyed()) { focusWindow(existing); return existing; }
+  if (isProfileReady(profile)) {
+    try { await ensureProfileAspectRatios(profile); }
+    catch (error) { console.warn('Could not index Gallery aspect ratios:', error.message); }
+  }
   const { isMaximized: restoreMaximized, ...windowBounds } = usableWindowState();
   const window = new BrowserWindow({
     ...windowBounds,
@@ -2163,9 +2419,17 @@ app.whenReady().then(async () => {
     return;
   }
   const startupProfiles = await readProfileRegistry();
+  if (process.env.MOSAIC_RESET_THUMBNAIL_CACHE === '1') {
+    await resetThumbnailCaches(startupProfiles);
+    console.log('Mosaic thumbnail disk cache reset');
+  }
   for (const profile of startupProfiles.profiles) {
     if (isProfileReady(profile)) await restoreProfileLibraryLocation(profile);
   }
+  // Remove the pre-1.1.2 global-Vault migration from every Profile at once.
+  // Waiting until a Profile window is opened would leave stale media visible
+  // in an unopened Profile's Main Gallery.
+  await removeAutomaticallyAttachedVaultSourcesFromProfiles();
   // Shortcuts are created only by the explicit profile actions (create,
   // restore, rename/default change, or the "Create shortcut" button). Do not
   // replace an existing Desktop shortcut every time Mosaic starts.
@@ -2192,10 +2456,8 @@ app.whenReady().then(async () => {
     // stat every known Media.  Source changes are reconciled by the watcher,
     // explicit refresh, import, recovery, and source removal flows instead.
     const defaultSaveChanged = await ensureProfileDefaultSaveSource(profile, data, { scan: false });
-    // Vault discovery belongs in the backend: both the test renderer and the
-    // packaged React renderer consume this same snapshot. This prevents a
-    // fresh production window from showing an empty source until a file event
-    // happens to arrive.
+    // Vault bridge details are refreshed only for sources this Profile has
+    // already linked. Discovery itself must never create Profile membership.
     const vaultChanged = await reconcileVaultBridgeSources(profile, data);
     if (defaultSaveChanged || vaultChanged) await writeStore(profile, data);
     return data;
@@ -2321,6 +2583,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('thumbnails:cancel', async (event, requestId) => {
     cancelThumbnailRequest(await profileForWebContents(event.sender), requestId);
   });
+  // Lightweight profiler for diagnosing whether a slow thumbnail waited in
+  // the queue, was slow to read, or was expensive to decode. Kept in memory
+  // only so normal use does not add I/O to the thumbnail path.
+  ipcMain.handle('thumbnails:metrics', async event => {
+    const profile = await profileForWebContents(event.sender);
+    return thumbnailLatency.get(String(profile?.id || DEFAULT_PROFILE_ID)) || [];
+  });
   ipcMain.handle('vault:bridges', async () => (await readVaultBridges())
     .filter(item => item?.id && item?.folder)
     .map(item => ({ id: String(item.id), folder: String(item.folder), tracking: bridgeTracking(item) })));
@@ -2340,8 +2609,10 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle('image:show-in-folder', (_, asset) => {
-    if (asset?.vault) return false;
-    shell.showItemInFolder(asset?.path || ''); return true;
+    const assetPath = typeof asset?.path === 'string' ? asset.path : '';
+    if (asset?.vault || !assetPath || !fs.existsSync(assetPath)) return false;
+    shell.showItemInFolder(assetPath);
+    return true;
   });
   ipcMain.handle('media:open-default', async (_, asset) => {
     if (asset?.vault || !asset?.path) return false;

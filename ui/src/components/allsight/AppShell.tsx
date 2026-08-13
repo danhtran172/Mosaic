@@ -354,7 +354,7 @@ export function AppShell() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
-      <div className="window-titlebar flex h-[18px] shrink-0 items-center border-b border-border/55">
+      <div className="window-titlebar flex h-6 shrink-0 items-center border-b border-border/55">
         <span className="pl-3 text-[11px] font-medium tracking-wide text-muted-foreground">{currentProfile?.name || "Mosaic"}</span>
         <span className="flex-1" />
         <WindowControls />
@@ -444,6 +444,7 @@ export function AppShell() {
             onOpen={setLightboxId}
             onConfirm={setConfirmReq}
             currentFolderId={folder?.id ?? null}
+            galleryLayout={folder?.layout ?? state.mainGalleryLayout}
             layoutKey={inspectorOpen ? "inspector-open" : "inspector-closed"}
             groupBy={groupBy}
           />
@@ -475,6 +476,7 @@ export function AppShell() {
           index={lightboxIndex}
           onIndex={(i) => setLightboxId(flatMedia[i]?.id ?? null)}
           onClose={() => setLightboxId(null)}
+          currentFolderId={folder?.id ?? null}
         />
       )}
 

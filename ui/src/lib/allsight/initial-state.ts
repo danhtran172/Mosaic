@@ -29,6 +29,7 @@ export function buildEmptyState(): AllsightState {
     appLockEnabled: false,
     requirePasswordToUnlockGallery: false,
     thumbHeight: 200,
+    mainGalleryLayout: "square",
     inspectorAutoOpen: true,
     lightboxFitMedia: false,
   };

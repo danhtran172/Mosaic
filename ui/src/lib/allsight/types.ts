@@ -9,6 +9,8 @@ export interface MediaItem {
   url: string;
   /** Full media URL. Grid rendering must prefer the cached thumbnail in url. */
   originalUrl?: string;
+  /** Pixel edge of the current cached preview; lets a larger card request a sharper variant. */
+  previewSize?: number;
   modified?: number;
   vault?: boolean;
   contentUrl?: string;
@@ -26,6 +28,10 @@ export interface MediaSource {
   id: string;
   name: string;
   path: string;
+  /** Present only when this Profile explicitly links the source to a Vault bridge. */
+  vaultBridgeId?: string;
+  /** Stable Windows folder identity used if the linked Vault folder is moved. */
+  tracking?: { volume: string; fileId: string };
 }
 
 export interface PersonalFolder {
@@ -44,6 +50,8 @@ export interface PersonalFolder {
   discardedMediaIds?: string[];
   coverId: string | null;
   locked: boolean;
+  /** Saved display layout for this Gallery. */
+  layout?: GalleryLayout;
   /** General + gallery-exclusive tag groups available in this gallery. */
   managedGroupIds?: string[];
   /** General Property Groups are enabled by default; these are explicit opt-outs. */
@@ -83,6 +91,7 @@ export type Appearance = "light" | "dark" | "system";
 export type ThemeColor = "green" | "blue" | "teal" | "pink" | "orange";
 export type Language = "en" | "vi";
 export type FilterKind = "all" | "favorites" | "images" | "videos";
+export type GalleryLayout = "justified" | "square";
 
 export interface AllsightState {
   sources: MediaSource[];
@@ -115,6 +124,8 @@ export interface AllsightState {
   appLockEnabled: boolean;
   requirePasswordToUnlockGallery: boolean;
   thumbHeight: number;
+  /** Display layout saved independently for Main Gallery. */
+  mainGalleryLayout: GalleryLayout;
   inspectorAutoOpen: boolean;
   /** Lightbox: preserve natural pixels, or enlarge inside a fixed contain box. */
   lightboxFitMedia: boolean;
