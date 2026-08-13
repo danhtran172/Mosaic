@@ -312,6 +312,7 @@ export function Gallery({
     addPropValue,
     toggleFavorite,
   } = useAllsight();
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
@@ -363,7 +364,7 @@ export function Gallery({
   };
   const openInFolder = async (media: MediaItem) => {
     const opened = await getInDeckBridge()?.showInFolder(media) ?? false;
-    if (!opened) toast.error("Unable to open the file location.");
+    if (!opened) toast.error(c("Không thể mở vị trí tệp.", "Unable to open the file location."));
   };
 
   const pointerStart = useRef<{ x: number; y: number; entry: OrderEntry } | null>(null);
@@ -898,10 +899,10 @@ export function Gallery({
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids); setSelected([]); }}>
-          <Shapes className="size-4 text-[#A56F63]" /> Tạo group từ {ids.length} ảnh đã chọn
+          <Shapes className="size-4 text-[#A56F63]" /> {c(`Tạo group từ ${ids.length} ảnh đã chọn`, `Create group from ${ids.length} selected images`)}
         </ContextMenuItem>
         <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(ids); }}>
-          <FolderPlus className="size-4 text-[#C59A18]" /> Thêm {ids.length} ảnh vào Gallery
+          <FolderPlus className="size-4 text-[#C59A18]" /> {c(`Thêm ${ids.length} ảnh vào Gallery`, `Add ${ids.length} images to Gallery`)}
         </ContextMenuItem>
         {hasClipboard && (
           <ContextMenuItem
@@ -912,7 +913,7 @@ export function Gallery({
               }
             }}
           >
-            <ClipboardPaste className="size-4 text-[#5F839A]" /> Dán tag vào ảnh đã chọn
+            <ClipboardPaste className="size-4 text-[#5F839A]" /> {c("Dán thẻ vào ảnh đã chọn", "Paste tags to selected images")}
           </ContextMenuItem>
         )}
         {currentFolderId ? (
@@ -921,15 +922,15 @@ export function Gallery({
             <ContextMenuItem
               className={menuItem}
               onSelect={() => onConfirm({
-                title: `Ẩn ${ids.length} ảnh khỏi Gallery?`,
-                description: "Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.",
+                title: c(`Ẩn ${ids.length} ảnh khỏi Gallery?`, `Hide ${ids.length} images from this Gallery?`),
+                description: c("Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.", "The images will enter this Gallery's trash. Original files in source folders are kept."),
                 onConfirm: () => {
                   ids.forEach((id) => discardFromFolder(currentFolderId, id));
                   setSelected([]);
                 },
               })}
             >
-              <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn {ids.length} ảnh khỏi Gallery
+              <EyeOff className="size-4 text-[#FB6C00]" /> {c(`Ẩn ${ids.length} ảnh khỏi Gallery`, `Hide ${ids.length} images from Gallery`)}
             </ContextMenuItem>
           </>
         ) : (
@@ -938,12 +939,12 @@ export function Gallery({
             <ContextMenuItem
               className={menuItem}
               onSelect={() => onConfirm({
-                title: `Ẩn ${ids.length} media khỏi Main Gallery?`,
-                description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
+                title: c(`Ẩn ${ids.length} media khỏi Main Gallery?`, `Hide ${ids.length} media from Main Gallery?`),
+                description: c("Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.", "Media will enter Mosaic trash and can be restored. Original files are unchanged."),
                 onConfirm: () => { hideMedia(ids); setSelected([]); },
               })}
             >
-              <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn {ids.length} media khỏi Main Gallery
+              <EyeOff className="size-4 text-[#FB6C00]" /> {c(`Ẩn ${ids.length} media khỏi Main Gallery`, `Hide ${ids.length} media from Main Gallery`)}
             </ContextMenuItem>
           </>
         )}
@@ -993,7 +994,7 @@ export function Gallery({
         )}
         {group && group.coverId !== m.id && (
           <ContextMenuItem className={menuItem} onSelect={() => updateGroup(group.id, { coverId: m.id })}>
-            <LayersIcon className="size-4" /> Đặt làm ảnh đại diện group
+            <LayersIcon className="size-4" /> {c("Đặt làm ảnh đại diện group", "Set as group cover")}
           </ContextMenuItem>
         )}
         <ContextMenuSeparator />
@@ -1035,7 +1036,7 @@ export function Gallery({
         </ContextMenuItem>
         {currentFolderId && (
           <ContextMenuItem className={menuItem} onSelect={() => setMoveToGalleryFor(m.id)}>
-            <FolderInput className="size-4 text-[#FF9A00]" /> Move to Gallery
+            <FolderInput className="size-4 text-[#FF9A00]" /> {c("Chuyển vào Gallery", "Move to Gallery")}
           </ContextMenuItem>
         )}
         <ContextMenuSeparator />
@@ -1043,31 +1044,31 @@ export function Gallery({
           <ContextMenuItem
             className={menuItem}
             onSelect={() => onConfirm({
-              title: "Ẩn ảnh khỏi Gallery?",
-              description: "Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.",
+              title: c("Ẩn ảnh khỏi Gallery?", "Hide image from Gallery?"),
+              description: c("Ảnh sẽ vào thùng rác của Gallery này. File gốc trong Folder nguồn vẫn được giữ.", "The image will enter this Gallery's trash. Original files in source folders are kept."),
               onConfirm: () => discardFromFolder(currentFolderId, m.id),
             })}
           >
-            <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn ảnh khỏi Gallery
+            <EyeOff className="size-4 text-[#FB6C00]" /> {c("Ẩn ảnh khỏi Gallery", "Hide image from Gallery")}
           </ContextMenuItem>
         )}
         {!currentFolderId && (
           <ContextMenuItem
             className={menuItem}
             onSelect={() => onConfirm({
-              title: "Ẩn media khỏi Main Gallery?",
-              description: "Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.",
+              title: c("Ẩn media khỏi Main Gallery?", "Hide media from Main Gallery?"),
+              description: c("Media sẽ vào thùng rác Mosaic và có thể khôi phục. File gốc không bị thay đổi.", "Media will enter Mosaic trash and can be restored. Original files are unchanged."),
               onConfirm: () => hideMedia([m.id]),
             })}
           >
-            <EyeOff className="size-4 text-[#FB6C00]" /> Ẩn media khỏi Main Gallery
+            <EyeOff className="size-4 text-[#FB6C00]" /> {c("Ẩn media khỏi Main Gallery", "Hide media from Main Gallery")}
           </ContextMenuItem>
         )}
         <ContextMenuItem
           className={menuItem}
           onSelect={() => onConfirm({
-            title: "Đưa file vào Thùng rác máy tính?",
-            description: "File gốc sẽ được chuyển vào Recycle Bin của Windows để có thể khôi phục.",
+            title: c("Đưa file vào Thùng rác máy tính?", "Move file to the Windows Recycle Bin?"),
+            description: c("File gốc sẽ được chuyển vào Thùng rác của Windows để có thể khôi phục.", "The original file will be moved to the Windows Recycle Bin and can be restored."),
             onConfirm: () => {
               const bridge = getInDeckBridge();
               if (!bridge) return;
@@ -1080,7 +1081,7 @@ export function Gallery({
             },
           })}
         >
-          <Trash2 className="size-4 text-[#B81E2D]" /> Đưa file vào Thùng rác máy tính
+          <Trash2 className="size-4 text-[#B81E2D]" /> {c("Đưa file vào Thùng rác máy tính", "Move file to Windows Recycle Bin")}
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -1704,21 +1705,21 @@ export function Gallery({
       <Dialog open={!!addToGalleryFor} onOpenChange={(open) => !open && setAddToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addToFolder")}</DialogTitle></DialogHeader>
-          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder="Tìm Gallery" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
+          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder={t("searchGallery")} className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {galleryPickerFolders.map((folder) => {
               const alreadyAdded = !!addToGalleryFor && folder.mediaIds.includes(addToGalleryFor);
               const cover = galleryCover(folder.id);
-              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">Đã thêm</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
+              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">{t("added")}</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
             })}
-            {state.folders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Chưa có Gallery.</p>}
-            {state.folders.length > 0 && galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy Gallery.</p>}
+            {state.folders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("noGalleries")}</p>}
+            {state.folders.length > 0 && galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("galleryNotFound")}</p>}
           </div>
         </DialogContent>
       </Dialog>
       <Dialog open={!!moveToGalleryFor} onOpenChange={(open) => !open && setMoveToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
-          <DialogHeader><DialogTitle className="font-display">Move to Gallery</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle className="font-display">{c("Chuyển vào Gallery", "Move to Gallery")}</DialogTitle></DialogHeader>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {state.folders.filter((folder) => folder.id !== currentFolderId).map((folder) => {
               const alreadyAdded = !!moveToGalleryFor && folder.mediaIds.includes(moveToGalleryFor);
@@ -1728,16 +1729,16 @@ export function Gallery({
                 // it to the destination, then remove it from this Gallery.
                 moveToFolder(folder.id, [moveToGalleryFor], currentFolderId);
                 setMoveToGalleryFor(null);
-              }} className="glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm"><Folder className="size-4 text-muted-foreground" /><span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">Đã có</span> : <FolderInput className="size-4 text-muted-foreground" />}</button>;
+              }} className="glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm"><Folder className="size-4 text-muted-foreground" /><span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">{t("alreadyAdded")}</span> : <FolderInput className="size-4 text-muted-foreground" />}</button>;
             })}
-            {state.folders.filter((folder) => folder.id !== currentFolderId).length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Chưa có Gallery khác.</p>}
+            {state.folders.filter((folder) => folder.id !== currentFolderId).length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("noOtherGalleries")}</p>}
           </div>
         </DialogContent>
       </Dialog>
       <Dialog open={!!addGroupToGalleryFor} onOpenChange={(open) => !open && setAddGroupToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addGroupToFolder")}</DialogTitle></DialogHeader>
-          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder="Tìm Gallery" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
+          <label className="glass-btn flex items-center gap-2 rounded-xl px-3 py-2"><Search className="size-3.5 text-muted-foreground" /><input autoFocus value={galleryPickerQuery} onChange={(event) => setGalleryPickerQuery(event.target.value)} placeholder={t("searchGallery")} className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>
           <div className="max-h-72 space-y-1 overflow-y-auto">
             {galleryPickerFolders.map((folder) => {
               const mediaIds = addGroupToGalleryFor ?? [];
@@ -1745,7 +1746,7 @@ export function Gallery({
               const cover = galleryCover(folder.id);
               return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (mediaIds.length) addToFolder(folder.id, mediaIds); setAddGroupToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span><FolderPlus className="size-4 text-muted-foreground" /></button>;
             })}
-            {galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">Không tìm thấy Gallery.</p>}
+            {galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("galleryNotFound")}</p>}
           </div>
         </DialogContent>
       </Dialog>

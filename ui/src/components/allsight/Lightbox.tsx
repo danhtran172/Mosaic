@@ -28,6 +28,7 @@ export function Lightbox({
 }) {
   const t = useT();
   const { state, setLightboxFitMedia, toggleFavorite, updateFolder } = useAllsight();
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
   const item = items[index];
   const videoRef = useRef<HTMLVideoElement>(null);
   const hideSpeedTimer = useRef<number | null>(null);
@@ -215,12 +216,12 @@ export function Lightbox({
           <button
             type="button"
             onClick={() => setLightboxFitMedia(!state.lightboxFitMedia)}
-            title={state.lightboxFitMedia ? "Ảnh gốc" : "Phóng to"}
-            aria-label={state.lightboxFitMedia ? "Ảnh gốc" : "Phóng to"}
+            title={state.lightboxFitMedia ? c("Kích thước gốc", "Original size") : c("Phóng to", "Zoom in")}
+            aria-label={state.lightboxFitMedia ? c("Kích thước gốc", "Original size") : c("Phóng to", "Zoom in")}
             className={"glass-panel inline-flex h-10 items-center gap-2 rounded-xl px-3 text-xs font-medium transition-all hover:scale-[1.04] " + (state.lightboxFitMedia ? "text-primary" : "text-foreground")}
           >
             {state.lightboxFitMedia ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
-            <span>{state.lightboxFitMedia ? "Ảnh gốc" : "Phóng to"}</span>
+            <span>{state.lightboxFitMedia ? c("Kích thước gốc", "Original size") : c("Phóng to", "Zoom in")}</span>
           </button>
         </div>
       </div>

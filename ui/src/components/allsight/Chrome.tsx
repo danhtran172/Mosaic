@@ -154,7 +154,7 @@ export function Header({
           <input
             value={query}
             onChange={(e) => onQuery(e.target.value)}
-            placeholder="Search..."
+            placeholder={t("search")}
             className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
         </div>
@@ -531,7 +531,7 @@ export function BulkBar({
       {availableProperties.map((group) => (
         <PropertyPicker
           key={group.id}
-          label={`Add ${group.name}`}
+        label={`${t("add")} ${group.name}`}
           align="center"
           options={group.values.map((value) => ({ id: value, label: value }))}
           onSelect={(value) => addPropValue(selected, group.id, value)}

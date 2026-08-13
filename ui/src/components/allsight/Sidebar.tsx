@@ -220,11 +220,11 @@ export function Sidebar({
         <ContextMenuContent className="glass-float w-60 rounded-xl">
           {selectedGroup ? (
             <ContextMenuItem className={menuItem} onSelect={() => { selection.forEach(removeGalleryFromGroup); setNavSelectedFolders([]); }}>
-              <Ungroup className="size-4" /> Loại {selection.length} Gallery khỏi group
+              <Ungroup className="size-4" /> {c(`Loại ${selection.length} Gallery khỏi group`, `Remove ${selection.length} Galleries from group`)}
             </ContextMenuItem>
           ) : (
             <ContextMenuItem className={menuItem} onSelect={() => { createGalleryGroup(selection); setNavSelectedFolders([]); }}>
-              <Layers className="size-4" /> Tạo group từ {selection.length} Gallery
+              <Layers className="size-4" /> {c(`Tạo group từ ${selection.length} Gallery`, `Create group from ${selection.length} Galleries`)}
             </ContextMenuItem>
           )}
         </ContextMenuContent>
@@ -244,7 +244,7 @@ export function Sidebar({
       </ContextMenuItem>
       {f.locked && unlockedFolderIds.includes(f.id) && (
         <ContextMenuItem className={menuItem} onSelect={() => onRelockGallery(f.id)}>
-          <Lock className="size-4" /> Lock Now
+          <Lock className="size-4" /> {c("Khóa ngay", "Lock now")}
         </ContextMenuItem>
       )}
       <ContextMenuItem
@@ -258,7 +258,7 @@ export function Sidebar({
       </ContextMenuItem>
       {containingGroup && (
         <ContextMenuItem className={menuItem} onSelect={() => removeGalleryFromGroup(f.id)}>
-          <Ungroup className="size-4" /> Loại khỏi group
+          <Ungroup className="size-4" /> {c("Loại khỏi group", "Remove from group")}
         </ContextMenuItem>
       )}
       <ContextMenuSeparator />
@@ -290,7 +290,7 @@ export function Sidebar({
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem className={cn(menuItem, "text-destructive")} onSelect={() => group.folderIds.forEach(removeGalleryFromGroup)}>
-          <Trash2 className="size-4" /> Xóa group
+          <Trash2 className="size-4" /> {c("Xóa group", "Delete group")}
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -735,7 +735,7 @@ export function Sidebar({
             >
               <FolderCog className="size-4 text-muted-foreground" />
               <span className="flex-1 text-left">{c("Quản lý Profile", "Manage profiles")}</span>
-              <span className="text-xs text-muted-foreground">Library & shortcut</span>
+              <span className="text-xs text-muted-foreground">{c("Library và lối tắt", "Library and shortcut")}</span>
             </button>
             <button
               onClick={() => {
@@ -752,14 +752,14 @@ export function Sidebar({
             <div className="flex w-full items-center gap-3 rounded-lg border border-border/70 bg-secondary/40 px-3 py-2 hover:bg-accent/60">
               <Lock className="size-4 text-muted-foreground" />
               <span className="min-w-0 flex-1 text-left">
-                <span className="block text-sm">Không yêu cầu mật khẩu để mở Gallery</span>
-                <span className="block text-xs text-muted-foreground">Khi bật, chỉ cần bấm Unlock. Muốn yêu cầu mật khẩu thì hãy tạo mật khẩu ứng dụng trước.</span>
+                <span className="block text-sm">{t("passwordRequiredForGallery")}</span>
+                <span className="block text-xs text-muted-foreground">{t("passwordRequiredForGalleryHint")}</span>
               </span>
               <button
                 type="button"
                 role="switch"
                 aria-checked={!state.requirePasswordToUnlockGallery}
-                aria-label="Không yêu cầu mật khẩu để mở Gallery"
+                aria-label={t("passwordRequiredForGallery")}
                 onClick={() => {
                   if (state.requirePasswordToUnlockGallery) {
                     if (state.password) {
@@ -873,12 +873,12 @@ export function Sidebar({
                     <div className="min-w-0">
                       <DialogTitle className="font-display text-lg">{t("discardPile")}</DialogTitle>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {total ? `${total} mục có thể khôi phục` : t("discardEmpty")}
+                        {total ? c(`${total} mục có thể khôi phục`, `${total} recoverable items`) : t("discardEmpty")}
                       </p>
                     </div>
                     {trashSelection.length > 0 && (
                       <div className="ml-auto flex shrink-0 items-center gap-2">
-                        <span className="hidden text-xs text-muted-foreground sm:inline">{trashSelection.length} đã chọn</span>
+                        <span className="hidden text-xs text-muted-foreground sm:inline">{c(`${trashSelection.length} đã chọn`, `${trashSelection.length} selected`)}</span>
                         <button onClick={restoreSelected} className="glass-btn flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
                         <button onClick={purgeSelected} className="flex h-8 items-center gap-1.5 rounded-lg border border-destructive/30 px-2.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /> {t("deleteForever")}</button>
                       </div>
@@ -892,7 +892,7 @@ export function Sidebar({
                     </span>
                     <div>
                       <p className="text-sm font-medium">{t("discardEmpty")}</p>
-                      <p className="mt-1 text-xs text-muted-foreground">Ảnh ẩn khỏi Gallery và Gallery đã xóa sẽ xuất hiện ở đây.</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{c("Ảnh ẩn khỏi Gallery và Gallery đã xóa sẽ xuất hiện ở đây.", "Images hidden from Galleries and deleted Galleries appear here.")}</p>
                     </div>
                   </div>
                 ) : (
@@ -915,7 +915,7 @@ export function Sidebar({
                           <div className="space-y-3 p-3">
                             <div className="min-w-0">
                               <p className="truncate text-sm font-medium">{f.name}</p>
-                              <p className="mt-0.5 text-xs text-muted-foreground">Gallery đã xóa</p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">{c("Gallery đã xóa", "Deleted Galleries")}</p>
                             </div>
                             <div className="flex gap-2">
                               <button onClick={(event) => { event.stopPropagation(); restoreFolder(f.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium">
@@ -958,7 +958,7 @@ export function Sidebar({
                 )}
                 {galleryTrash.length > 0 && (
                   <section className="space-y-2">
-                    <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">Ảnh ẩn khỏi Gallery</h3>
+                    <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">{c("Ảnh ẩn khỏi Gallery", "Images hidden from Galleries")}</h3>
                     <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
                       {galleryTrash.map(({ gallery, media }) => (
                         <div
@@ -974,7 +974,7 @@ export function Sidebar({
                             <p className="truncate text-sm font-medium">{media.name}</p>
                             <div className="flex gap-2">
                               <button onClick={(event) => { event.stopPropagation(); restoreFromFolderTrash(gallery.id, media.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
-                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(media.id); }} title="Bỏ ảnh khỏi Mosaic (không xóa file nguồn)" className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
+                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(media.id); }} title={c("Bỏ ảnh khỏi Mosaic (không xóa file nguồn)", "Remove image from Mosaic (source file is kept)")} className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
                             </div>
                           </div>
                         </div>
@@ -1099,7 +1099,7 @@ export function Sidebar({
                       <span className="block truncate text-[11px] text-muted-foreground" title={path}>{path}</span>
                       <span className="mt-0.5 block text-[11px] text-muted-foreground">{count == null ? "Sẽ scan khi tạo Gallery" : `${count} media`}</span>
                     </span>
-                    <button type="button" aria-label={`Bỏ ${name}`} title="Bỏ folder" onClick={() => {
+                <button type="button" aria-label={c(`Bỏ ${name}`, `Remove ${name}`)} title={c("Bỏ folder", "Remove folder")} onClick={() => {
                       setNewFolderNameError(null);
                       setNewFolder((draft) => {
                         if (!draft) return draft;
@@ -1328,7 +1328,7 @@ export function Sidebar({
             type="password"
             value={noGalleryPassword}
             onChange={(event) => { setNoGalleryPassword(event.target.value); setNoGalleryPasswordError(""); }}
-            placeholder="Mật khẩu ứng dụng"
+            placeholder={t("password")}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
           {noGalleryPasswordError && <p className="text-xs text-destructive">{noGalleryPasswordError}</p>}
@@ -1358,7 +1358,7 @@ export function Sidebar({
               type="password"
               value={pwdCurrent}
               onChange={(e) => { setPwdCurrent(e.target.value); setPwdError(""); }}
-              placeholder="Mật khẩu hiện tại"
+              placeholder={t("currentPassword")}
               className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
             />
           )}
@@ -1366,14 +1366,14 @@ export function Sidebar({
             type="password"
             value={pwd}
             onChange={(e) => { setPwd(e.target.value); setPwdError(""); }}
-            placeholder={state.password ? "Mật khẩu mới" : t("password")}
+            placeholder={state.password ? t("newPassword") : t("password")}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
           <input
             type="password"
             value={pwdConfirm}
             onChange={(e) => { setPwdConfirm(e.target.value); setPwdError(""); }}
-            placeholder="Xác nhận mật khẩu mới"
+            placeholder={t("confirmNewPassword")}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
           {pwdError && <p className="text-xs text-destructive">{pwdError}</p>}
