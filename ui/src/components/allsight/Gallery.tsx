@@ -57,6 +57,15 @@ const GROUP_INSET = GROUP_PAD + GROUP_BORDER;
 // Keep a small safety gutter at row end. Browser sub-pixel rounding can
 // otherwise consume the visual right padding when a Group row fills exactly.
 const GROUP_ROW_END_GUTTER = 8;
+// A collapsed Group is drawn as a small pile of tilted photos behind its
+// cover. Each edge of the frame is sized on its own: see stackInsets.
+const STACK_MAX_ITEMS = 4;
+// Maximum lean, in degrees, of a photo behind the cover. This is the main
+// knob for how much frame the effect asks for — a tilted photo reaches past
+// the cover by roughly (other side) x sin(tilt).
+const STACK_TILT = 4;
+// How far apart consecutive photos in the pile sit.
+const STACK_STEP = 2.5;
 const MAIN_GALLERY_DROP_ID = "__mosaic-main-gallery__";
 const EDGE = 50; // reorder hot zone on each side of a cell
 const HOLD_MS = 1500;
@@ -67,15 +76,23 @@ const menuItem = "gap-2";
 
 type Row = { height: number; items: { item: MediaItem; width: number }[] };
 
+function justifiedMaxHeight(targetHeight: number) {
+  return Math.max(100, Math.min(400, targetHeight));
+}
+
 function mediaRatio(item: MediaItem) {
   const width = Number.isFinite(item.width) && item.width > 0 ? item.width : 4;
   const height = Number.isFinite(item.height) && item.height > 0 ? item.height : 3;
   return Math.max(0.12, Math.min(8, width / height));
 }
 
-function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: number): Row[] {
+// `extraWidth` reports the horizontal room a cell needs on top of its image
+// width — currently only collapsed Groups, whose frame grows to host the
+// tilted pile. Charging it to the row here keeps the row filling the Gallery
+// exactly instead of spilling past the right edge.
+function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: number, extraWidth?: (item: MediaItem, index: number) => number): Row[] {
   if (!items.length) return [];
-  const maxHeight = Math.max(100, Math.min(400, targetHeight));
+  const maxHeight = justifiedMaxHeight(targetHeight);
   // At 175%/200% the old fixed five-card minimum kept the calculated row
   // height below the selected value, making zoom-in appear broken. Fewer
   // cards are allowed as the requested thumbnail height grows.
@@ -85,30 +102,36 @@ function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: num
   // to fill a wide Gallery without exceeding the visual max height. A fixed
   // five-card row plus a height cap leaves a large empty strip for portrait
   // media whenever Inspector is closed (the usable width is then wider).
-  const rows: MediaItem[][] = [];
-  let row: MediaItem[] = [];
+  type Cell = { item: MediaItem; extra: number };
+  const rows: Cell[][] = [];
+  let row: Cell[] = [];
   let ratio = 0;
-  for (const item of items) {
-    row.push(item);
+  let extras = 0;
+  items.forEach((item, index) => {
+    const extra = extraWidth?.(item, index) ?? 0;
+    row.push({ item, extra });
     ratio += mediaRatio(item);
+    extras += extra;
     const gaps = GAP * (row.length - 1);
-    const fillsAtMaxHeight = ratio * maxHeight + gaps >= width;
+    const fillsAtMaxHeight = ratio * maxHeight + gaps + extras >= width;
     if (row.length >= minItemsPerRow && fillsAtMaxHeight) {
       rows.push(row);
       row = [];
       ratio = 0;
+      extras = 0;
     }
-  }
+  });
   if (row.length) rows.push(row);
 
   return rows.map((row) => {
     const gaps = GAP * (row.length - 1);
-    const availableWidth = Math.max(width - gaps, 80);
-    const totalRatio = row.reduce((sum, item) => sum + mediaRatio(item), 0);
+    const rowExtras = row.reduce((sum, cell) => sum + cell.extra, 0);
+    const availableWidth = Math.max(width - gaps - rowExtras, 80);
+    const totalRatio = row.reduce((sum, cell) => sum + mediaRatio(cell.item), 0);
     const height = Math.min(availableWidth / totalRatio, maxHeight);
     return {
       height,
-      items: row.map((item) => ({ item, width: mediaRatio(item) * height })),
+      items: row.map(({ item }) => ({ item, width: mediaRatio(item) * height })),
     };
   });
 }
@@ -133,9 +156,16 @@ function squareRows(items: MediaItem[], width: number, targetHeight: number, fix
   return rows;
 }
 
-function layoutRows(items: MediaItem[], width: number, targetHeight: number, layout: GalleryLayout, fixedSquareColumns?: number) {
+function layoutRows(
+  items: MediaItem[],
+  width: number,
+  targetHeight: number,
+  layout: GalleryLayout,
+  fixedSquareColumns?: number,
+  extraWidth?: (item: MediaItem, index: number) => number,
+) {
   return layout === "justified"
-    ? equalJustifiedRows(items, width, targetHeight)
+    ? equalJustifiedRows(items, width, targetHeight, extraWidth)
     : squareRows(items, width, targetHeight, fixedSquareColumns);
 }
 
@@ -175,6 +205,88 @@ function placeholderColor(id: string) {
   let value = 0;
   for (let index = 0; index < id.length; index += 1) value = (value * 31 + id.charCodeAt(index)) >>> 0;
   return `hsl(${value % 360} 28% 32% / 0.72)`;
+}
+
+function stackJitter(id: string) {
+  let value = 2166136261;
+  for (let index = 0; index < id.length; index += 1) {
+    value ^= id.charCodeAt(index);
+    value = Math.imul(value, 16777619);
+  }
+  return ((value >>> 16) & 0xff) / 255 - 0.5;
+}
+
+// Photos behind the cover alternate which way they lean so two neighbours
+// never land on the same angle, and the hash decides how far each one leans
+// within STACK_TILT. Never exceeds STACK_TILT, which stackBleed relies on.
+function stackTilt(id: string, depth: number) {
+  const magnitude = STACK_TILT * (0.5 + Math.abs(stackJitter(id)));
+  return depth % 2 === 0 ? magnitude : -magnitude;
+}
+
+// How far the tilted photos reach past each edge of the cover. Measured at
+// the STACK_TILT cap rather than at each card's actual angles, so every
+// collapsed Group of the same cell size asks for the same frame and a row
+// cannot end up with cards of slightly different heights.
+function stackBleed(coverWidth: number, coverHeight: number, count: number) {
+  const layers = Math.max(1, Math.min(count, STACK_MAX_ITEMS));
+  if (layers < 2) return { left: 0, right: 0, top: 0, bottom: 0 };
+  const radians = (STACK_TILT * Math.PI) / 180;
+  // A rectangle rotated by t occupies (w·cos t + h·sin t) x (w·sin t + h·cos t).
+  const halfWidth = (coverWidth * Math.cos(radians) + coverHeight * Math.sin(radians)) / 2;
+  const halfHeight = (coverWidth * Math.sin(radians) + coverHeight * Math.cos(radians)) / 2;
+  // The fan runs down-right, so the deepest photo sets the right/bottom reach
+  // while the shallowest one sets left/top.
+  const far = (layers - 1) * STACK_STEP;
+  const near = STACK_STEP;
+  return {
+    left: Math.max(0, halfWidth - near - coverWidth / 2),
+    right: Math.max(0, halfWidth + far - coverWidth / 2),
+    top: Math.max(0, halfHeight - near - coverHeight / 2),
+    bottom: Math.max(0, halfHeight + far - coverHeight / 2),
+  };
+}
+
+// Distance from the frame edge to the cover edge, decided per edge. An edge
+// the effect barely reaches into keeps the full default padding and simply
+// contains the effect within it. Once the effect would take half that padding
+// or more, the padding on that edge halves and the frame is pushed out so the
+// effect gets its own room on top of the remaining padding.
+function stackInsets(coverWidth: number, coverHeight: number, count: number) {
+  const bleed = stackBleed(coverWidth, coverHeight, count);
+  // max() expresses both halves of that rule at once, and is continuous at
+  // the crossover: below GROUP_PAD / 2 of bleed the first term wins.
+  const edge = (reach: number) => Math.max(GROUP_PAD, reach + GROUP_PAD / 2);
+  return {
+    left: edge(bleed.left),
+    right: edge(bleed.right),
+    top: edge(bleed.top),
+    bottom: edge(bleed.bottom),
+  };
+}
+
+// A justified frame may grow, so the cover keeps the full cell size and the
+// frame absorbs the effect. A square frame is locked to the cell, so the
+// cover shrinks until it plus its insets fit. The insets depend on the cover
+// size, so the square case is iterated — it settles within a few rounds
+// because the effect grows far slower than the cover it is measured against.
+function stackFrame(cellWidth: number, cellHeight: number, count: number, grow: boolean) {
+  if (grow) {
+    return { width: cellWidth, height: cellHeight, insets: stackInsets(cellWidth, cellHeight, count) };
+  }
+  let width = cellWidth;
+  let height = cellHeight;
+  let insets = stackInsets(width, height, count);
+  for (let round = 0; round < 8; round += 1) {
+    const nextWidth = Math.max(16, cellWidth - insets.left - insets.right);
+    const nextHeight = Math.max(16, cellHeight - insets.top - insets.bottom);
+    const settled = Math.abs(nextWidth - width) < 0.05 && Math.abs(nextHeight - height) < 0.05;
+    width = nextWidth;
+    height = nextHeight;
+    insets = stackInsets(width, height, count);
+    if (settled) break;
+  }
+  return { width, height, insets };
 }
 function BitmapThumbnail({ resource, className, style }: { resource: ThumbnailResource; className: string; style?: CSSProperties }) {
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -558,6 +670,12 @@ export function Gallery({
       const targetGroupId = groupEl?.dataset['groupId'] ?? mediaEl?.dataset['inGroup'];
       const sourceGroupId = drag.kind === "media" ? state.groups.find((group) => group.memberIds.includes(drag.id))?.id : undefined;
       const isDraggingWithinOwnGroup = Boolean(sourceGroupId && targetGroupId === sourceGroupId);
+      // An expanded Group owns whole rows, so it can only be dropped between
+      // rows. A collapsed one is a single card sitting in a row of cards, so
+      // it positions exactly like an image: left/right seams and an x rail.
+      const draggingCollapsedGroup =
+        drag.kind === "group" && (state.groups.find((group) => group.id === drag.id)?.collapsed ?? false);
+      const dragActsAsCard = drag.kind === "media" || draggingCollapsedGroup;
       // A member dragged inside its own expanded group must use the same
       // left/right 50px seams as Library, but reorder `memberIds` instead of
       // accidentally moving the whole group in the global Library order.
@@ -653,7 +771,7 @@ export function Gallery({
           );
         })
         .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-      for (let i = 0; !next && drag.kind !== "group" && !isDraggingWithinOwnGroup && i < rowCards.length - 1; i += 1) {
+      for (let i = 0; !next && dragActsAsCard && !isDraggingWithinOwnGroup && i < rowCards.length - 1; i += 1) {
         const left = rowCards[i]!;
         const right = rowCards[i + 1]!;
         const leftRect = left.getBoundingClientRect();
@@ -670,7 +788,7 @@ export function Gallery({
         break;
       }
 
-      if (!next && drag.kind !== "group" && !isDraggingWithinOwnGroup && mediaEl && mediaEl.dataset['mediaId'] !== drag.id && mediaEl.dataset['entryId'] !== drag.id) {
+      if (!next && dragActsAsCard && !isDraggingWithinOwnGroup && mediaEl && mediaEl.dataset['mediaId'] !== drag.id && mediaEl.dataset['entryId'] !== drag.id) {
         const rect = mediaEl.getBoundingClientRect();
         const entryId = mediaEl.dataset['entryId']!;
         const entryKind = (mediaEl.dataset['entryKind'] ?? "media") as "media" | "group";
@@ -685,15 +803,19 @@ export function Gallery({
       } else if (!isDraggingWithinOwnGroup && groupEl && groupEl.dataset['groupId'] !== drag.id) {
         const rect = groupEl.getBoundingClientRect();
         const idx = globalIndex({ kind: "group", id: groupEl.dataset['groupId']! });
-        if (drag.kind === "group") {
+        if (drag.kind === "group" && !draggingCollapsedGroup) {
           next =
             e.clientY < rect.top + rect.height / 2
               ? { type: "insert", index: idx, axis: "y" }
               : { type: "insert", index: idx + 1, axis: "y" };
         } else if (e.clientX - rect.left <= EDGE) next = { type: "insert", index: idx, axis: "x" };
         else if (rect.right - e.clientX <= EDGE) next = { type: "insert", index: idx + 1, axis: "x" };
-        else next = { type: "hold", kind: "group", id: groupEl.dataset['groupId']! };
-      } else if (drag.kind === "group" && rowEl) {
+        // A collapsed Group cannot be nested into another Group, so the hold
+        // target does not apply — it falls back to the nearer side instead.
+        else if (draggingCollapsedGroup) {
+          next = { type: "insert", index: e.clientX < rect.left + rect.width / 2 ? idx : idx + 1, axis: "x" };
+        } else next = { type: "hold", kind: "group", id: groupEl.dataset['groupId']! };
+      } else if (drag.kind === "group" && !draggingCollapsedGroup && rowEl) {
         const rowEntries = [...rowEl.querySelectorAll<HTMLElement>("[data-entry-id]")]
           .map((node) => ({
             index: globalIndex({ kind: (node.dataset['entryKind'] ?? "media") as "media" | "group", id: node.dataset['entryId']! }),
@@ -706,8 +828,9 @@ export function Gallery({
             ? { type: "insert", index: Math.min(...rowEntries), axis: "y" }
             : { type: "insert", index: Math.max(...rowEntries) + 1, axis: "y" };
         }
-      } else if (!isDraggingWithinOwnGroup && drag.kind === "media" && sourceGroupId) {
-        // Dragging a member out must behave exactly like positioning an
+      } else if (!isDraggingWithinOwnGroup && ((drag.kind === "media" && sourceGroupId) || draggingCollapsedGroup)) {
+        // Dragging a member out — or dragging a collapsed Group, which is a
+        // card like any other — must behave exactly like positioning an
         // ordinary Library card. Even a blank part of a row resolves to the
         // nearest top-level item and shows an insertion rail — never a hold.
         const candidates = [
@@ -718,6 +841,8 @@ export function Gallery({
             ? { kind: "group" as const, id: node.dataset['groupId']! }
             : { kind: (node.dataset['entryKind'] ?? "media") as "media" | "group", id: node.dataset['entryId']! };
           const rect = node.getBoundingClientRect();
+          // The card being dragged is not a target for itself.
+          if (entry.id === drag.id) return false;
           return globalIndex(entry) >= 0 && rect.width > 0 && rect.height > 0;
         });
         const nearest = candidates.reduce<HTMLElement | null>((closest, node) => {
@@ -733,7 +858,9 @@ export function Gallery({
           const rect = nearest.getBoundingClientRect();
           if (index >= 0) next = { type: "insert", index: e.clientX < rect.left + rect.width / 2 ? index : index + 1, axis: "x" };
         }
-        if (!next) next = { type: "hold", kind: "ungroup", id: drag.id };
+        // Only a media card can be pulled out of its Group; a Group itself has
+        // nothing to ungroup into, so it simply finds no target.
+        if (!next && drag.kind === "media") next = { type: "hold", kind: "ungroup", id: drag.id };
       }
 
       const key = next?.type === "hold" && needsHold(next) ? `${next.kind}:${next.id}` : "";
@@ -982,22 +1109,26 @@ export function Gallery({
           </ContextMenuItem>
         )}
         {group && (
-          <ContextMenuItem
-            className={menuItem}
-            onSelect={() => {
-              if (group.memberIds.length <= 2) dissolveGroup(group.id);
-              else removeFromGroup(m.id);
-            }}
-          >
-            <Ungroup className="size-4" /> {t("removeFromGroup")}
-          </ContextMenuItem>
+          <>
+            <ContextMenuSeparator className="bg-gradient-to-r from-[#B81E2D]/45 via-border to-[#A5D6A7]/45" />
+            <ContextMenuItem
+              className={menuItem}
+              onSelect={() => {
+                if (group.memberIds.length <= 2) dissolveGroup(group.id);
+                else removeFromGroup(m.id);
+              }}
+            >
+              <Ungroup className="size-4" /> {t("removeFromGroup")}
+            </ContextMenuItem>
+            {group.coverId !== m.id && (
+              <ContextMenuItem className={menuItem} onSelect={() => updateGroup(group.id, { coverId: m.id })}>
+                <ImageIcon className="size-4 text-[#A5D6A7]" /> {c("Đặt làm ảnh đại diện group", "Set as group cover")}
+              </ContextMenuItem>
+            )}
+            <ContextMenuSeparator className="bg-gradient-to-r from-[#B81E2D]/45 via-border to-[#A5D6A7]/45" />
+          </>
         )}
-        {group && group.coverId !== m.id && (
-          <ContextMenuItem className={menuItem} onSelect={() => updateGroup(group.id, { coverId: m.id })}>
-            <LayersIcon className="size-4" /> {c("Đặt làm ảnh đại diện group", "Set as group cover")}
-          </ContextMenuItem>
-        )}
-        <ContextMenuSeparator />
+        {!group && <ContextMenuSeparator />}
         {state.propertyGroups.map((g) => (
           <ContextMenuItem
             key={g.id}
@@ -1016,7 +1147,7 @@ export function Gallery({
                 for (const v of values) addPropValue([m.id], gid, v);
             }}
           >
-            <ClipboardPaste className="size-4" /> {t("pasteTags")}
+            <ClipboardPaste className="size-4 text-[#24B1B1]" /> {t("pasteTags")}
           </ContextMenuItem>
         )}
         <ContextMenuSeparator />
@@ -1093,26 +1224,26 @@ export function Gallery({
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => setSelected(group.memberIds)}>
-          <Users className="size-4" /> {t("selectGroupImages")}
+          <Users className="size-4 text-[#86BCBD]" /> {t("selectGroupImages")}
         </ContextMenuItem>
         <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(group.memberIds); }}>
-          <FolderPlus className="size-4" /> {t("addGroupToFolder")}
+          <FolderPlus className="size-4 text-[#FFC349]" /> {t("addGroupToFolder")}
         </ContextMenuItem>
         <ContextMenuItem
           className={menuItem}
           onSelect={() => updateGroup(group.id, { collapsed: !group.collapsed })}
         >
-          {group.collapsed ? <Maximize2 className="size-4" /> : <Minimize2 className="size-4" />}
+          {group.collapsed ? <Maximize2 className="size-4 text-[#6FCF97]" /> : <Minimize2 className="size-4 text-[#325E6A]" />}
           {group.collapsed ? t("expandGroup") : t("collapseGroup")}
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
-          className={cn(menuItem, "text-destructive")}
+          className={menuItem}
           onSelect={() =>
             onConfirm({ title: t("dissolveGroup"), onConfirm: () => dissolveGroup(group.id) })
           }
         >
-          <Ungroup className="size-4" /> {t("dissolveGroup")}
+          <Ungroup className="size-4 text-[#7B2525]" /> {t("dissolveGroup")}
         </ContextMenuItem>
       </ContextMenuContent>
     );
@@ -1132,6 +1263,7 @@ export function Gallery({
     thumbnailDistance = Number.MAX_SAFE_INTEGER,
   ) => {
     const isSelected = selected.includes(m.id);
+    const pile = stack ? stackFrame(w, h, stack.length, galleryLayout === "justified") : null;
     const holding =
       drop?.type === "hold" &&
       ((drop.kind === "media" && drop.id === m.id) || (drop.kind === "group" && drop.id === entry.id));
@@ -1144,11 +1276,19 @@ export function Gallery({
             data-entry-id={entry.id}
             data-entry-kind={entry.kind}
             data-in-group={inGroupId}
-            style={{
-              width: w,
-              height: h,
-              ...(stack ? { padding: `${GROUP_PAD}px ${GROUP_PAD / 2}px ${GROUP_PAD / 2}px ${GROUP_PAD}px` } : null),
-            }}
+            style={pile
+              ? {
+                  width: pile.width + pile.insets.left + pile.insets.right,
+                  height: pile.height + pile.insets.top + pile.insets.bottom,
+                  // The frame is border-box and carries a 1px border, so the
+                  // padding is the inset less that border. The content box is
+                  // then exactly the cover.
+                  paddingTop: pile.insets.top - 1,
+                  paddingRight: pile.insets.right - 1,
+                  paddingBottom: pile.insets.bottom - 1,
+                  paddingLeft: pile.insets.left - 1,
+                }
+              : { width: w, height: h }}
 
             onPointerDown={(e) => startPointer(e, entry, m.id)}
             onClick={(e) => handleSelect(e, m.id)}
@@ -1166,7 +1306,7 @@ export function Gallery({
               // gesture is handled in the renderer so Gallery reordering,
               // hover-to-group, and dropping onto the Sidebar share it.
               "select-none group relative shrink-0 rounded-lg border transition-all duration-200 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-              stack ? "glass-panel overflow-visible" : "overflow-hidden",
+              stack ? "glass-panel box-border overflow-visible" : "overflow-hidden",
               isSelected
                 ? "border-primary ring-[3px] ring-primary/90 shadow-[0_0_0_1px_rgb(255_255_255_/_0.7)]"
                 : "border-border/60 hover:shadow-lg",
@@ -1175,34 +1315,33 @@ export function Gallery({
             )}
 
           >
-            {stack ? (
+            {stack && pile ? (
+              // The content box is exactly the cover, so every photo is
+              // `inset-0` and the photos behind simply lean and fan out of it
+              // into the padding the insets already reserved for them.
               <div className="relative size-full">
-                {stack
-                  .slice(1, 4)
-                  .map((s, i) => (
+                {stack.map((s, depth) => ({ s, depth })).reverse().map(({ s, depth }) => {
+                  const isCover = depth === 0;
+                  return (
                     <LazyThumbnail
                       key={s.id}
-                      className="absolute inset-0 size-full rounded-md border border-border/50 object-cover shadow-soft"
+                      media={s}
+                      className={cn(
+                        "absolute inset-0 size-full rounded-md border object-cover",
+                        isCover ? "border-border/70 shadow-lg" : "border-border/50 shadow-soft",
+                      )}
                       priority={priorityThumbnail}
                       thumbnailDistance={thumbnailDistance}
-                      thumbnailSize={thumbnailSizeForBox(w, h)}
-                      media={s}
+                      thumbnailSize={thumbnailSizeForBox(pile.width, pile.height)}
                       style={{
-                        transform: `translate(${(3 - i) * 2.25}px, ${(3 - i) * 2.25}px) rotate(${(3 - i) * 1.2}deg)`,
-                        opacity: 0.55 + i * 0.1,
-                        zIndex: i,
+                        transform: isCover
+                          ? undefined
+                          : `translate(${depth * STACK_STEP}px, ${depth * STACK_STEP}px) rotate(${stackTilt(s.id, depth)}deg)`,
+                        zIndex: stack.length - depth,
                       }}
                     />
-
-                  ))
-                  .reverse()}
-                <LazyThumbnail
-                  media={m}
-                  className="relative z-10 size-full rounded-md border border-border/60 object-cover"
-                  priority={priorityThumbnail}
-                  thumbnailDistance={thumbnailDistance}
-                  thumbnailSize={thumbnailSizeForBox(w, h)}
-                />
+                  );
+                })}
               </div>
             ) : (
               <LazyThumbnail media={m} className="size-full object-cover" priority={priorityThumbnail} thumbnailDistance={thumbnailDistance} thumbnailSize={thumbnailSizeForBox(w, h)} />
@@ -1233,9 +1372,8 @@ export function Gallery({
                   updateGroup(entry.id, { collapsed: false });
                 }}
                 title={t("expandGroup")}
-                className="glass-float absolute right-2 bottom-2 z-20 flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium"
+                className="glass-float absolute right-2 bottom-2 z-20 flex items-center rounded-md px-[6.6px] py-[2.2px] text-[11px] font-medium"
               >
-                <Boxes className="size-3" />
                 {badge}
               </button>
             )}
@@ -1343,7 +1481,7 @@ export function Gallery({
           const cover = items.find((media) => media.id === group.coverId) ?? items[0];
           if (!cover) return;
           const rest = items.filter((media) => media.id !== cover.id);
-          pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, 4));
+          pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, STACK_MAX_ITEMS));
         } else {
           nextBlocks.push({ kind: "group", entry, items, section, sectionStart: false, sectionLabel: "" });
         }
@@ -1367,6 +1505,26 @@ export function Gallery({
   // Window the same justified rows used by ordinary Galleries instead of
   // switching to a fixed-card grid: Gallery size must never change image
   // aspect ratios or visual layout.
+  // Collapsed Groups in a justified row occupy a wider frame than their image
+  // so the tilted pile gets its own room. The row solver has to know that
+  // width up front or the row overflows the Gallery. The cell size is not
+  // known until the row is solved, so this charges the row for the widest the
+  // insets can get — at the row's height cap. The frame drawn later is never
+  // wider than that, so a row can come up a couple of px short but never over.
+  const runStackExtra = useCallback(
+    (block: Extract<Block, { kind: "run" }>) => {
+      if (galleryLayout !== "justified") return undefined;
+      const capHeight = justifiedMaxHeight(state.thumbHeight);
+      return (item: MediaItem, index: number) => {
+        const stack = block.stacks[index];
+        if (!stack) return 0;
+        const { insets } = stackFrame(mediaRatio(item) * capHeight, capHeight, stack.length, true);
+        return insets.left + insets.right;
+      };
+    },
+    [galleryLayout, state.thumbHeight],
+  );
+
   type VirtualCell = {
     item: MediaItem;
     entry: OrderEntry;
@@ -1379,6 +1537,9 @@ export function Gallery({
   type VirtualLayoutRow = {
     cells: VirtualCell[];
     height: number;
+    // Height of the media itself. Smaller than `height` on justified rows
+    // that hold a collapsed Group, whose frame is grown to fit its pile.
+    cellHeight: number;
     sectionLabel?: string;
     groupKey?: string;
     groupStart?: boolean;
@@ -1393,28 +1554,41 @@ export function Gallery({
       const groupKey = block.kind === "group" ? `${block.section}:${block.entry.id}:${virtualRows.length}` : undefined;
       const rows = block.kind === "group"
         ? groupRows(block.items, width, state.thumbHeight, galleryLayout)
-        : layoutRows(block.items, width, state.thumbHeight, galleryLayout);
+        : layoutRows(block.items, width, state.thumbHeight, galleryLayout, undefined, runStackExtra(block));
       let itemOffset = 0;
       rows.forEach((row, rowIndex) => {
         const sectionLabel = block.sectionStart && rowIndex === 0 ? block.sectionLabel : undefined;
         if (block.kind === "run") {
+          const cells = row.items.map(({ item, width: cellWidth }, index) => {
+            const itemIndex = itemOffset + index;
+            return {
+              item,
+              width: cellWidth,
+              entry: block.entries[itemIndex] ?? { kind: "media", id: item.id },
+              badge: block.badges[itemIndex],
+              stack: block.stacks[itemIndex],
+            };
+          });
+          // Square frames stay exactly one cell tall; justified ones grow by
+          // whatever their top and bottom insets ask for, and the row takes
+          // the tallest of them so every card still shares a baseline.
+          const stackExtra = galleryLayout === "justified"
+            ? cells.reduce((tallest, cell) => {
+                if (!cell.stack) return tallest;
+                const { insets } = stackFrame(cell.width, row.height, cell.stack.length, true);
+                return Math.max(tallest, insets.top + insets.bottom);
+              }, 0)
+            : 0;
           virtualRows.push({
-            height: row.height,
+            height: row.height + stackExtra,
+            cellHeight: row.height,
             sectionLabel,
-            cells: row.items.map(({ item, width: cellWidth }, index) => {
-              const itemIndex = itemOffset + index;
-              return {
-                item,
-                width: cellWidth,
-                entry: block.entries[itemIndex] ?? { kind: "media", id: item.id },
-                badge: block.badges[itemIndex],
-                stack: block.stacks[itemIndex],
-              };
-            }),
+            cells,
           });
         } else {
           virtualRows.push({
             height: row.height,
+            cellHeight: row.height,
             sectionLabel,
             groupKey,
             groupStart: rowIndex === 0,
@@ -1455,7 +1629,7 @@ export function Gallery({
       virtualHeight: Math.max(0, virtualHeight - GAP),
       mediaCount: virtualRows.reduce((total, row) => total + row.cells.length, 0),
     };
-  }, [blocks, galleryLayout, state.thumbHeight, width]);
+  }, [blocks, galleryLayout, runStackExtra, state.thumbHeight, width]);
   const { positionedVirtualRows, virtualGroupFrames, virtualHeight } = virtualLayout;
   const shouldVirtualize = virtualLayout.mediaCount > 160;
   // Two full screens on either side give thumbnail loading enough lead time
@@ -1519,7 +1693,7 @@ export function Gallery({
                 )}
                 <div
                   data-library-row
-                  className="absolute flex"
+                  className="absolute flex items-center"
                   style={{
                     top: row.top + (row.sectionLabel ? 28 : 0),
                     left: inGroup ? GROUP_INSET : 0,
@@ -1532,7 +1706,7 @@ export function Gallery({
                     cell.item,
                     cell.entry,
                     cell.width,
-                    row.height,
+                    row.cellHeight,
                     cell.badge,
                     cell.stack,
                     cell.inGroupId,
@@ -1548,7 +1722,7 @@ export function Gallery({
       <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
         {blocks.map((block, bi) => {
           if (block.kind === "run") {
-            return layoutRows(block.items, width, state.thumbHeight, galleryLayout).map((row, ri) => {
+            return layoutRows(block.items, width, state.thumbHeight, galleryLayout, undefined, runStackExtra(block)).map((row, ri) => {
               const cells = row.items.map(({ item, width: w }) => {
                 const i = block.items.indexOf(item);
                 const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
@@ -1565,7 +1739,7 @@ export function Gallery({
               return (
                 <Fragment key={`${bi}-${ri}`}>
                   {block.sectionStart && ri === 0 && <GroupDivider label={block.sectionLabel} />}
-                  <div data-library-row className="relative flex" style={{ gap: GAP }}>
+                  <div data-library-row className="relative flex items-center" style={{ gap: GAP }}>
                     {cells.map(({ item, w, entry, badge, stack }) =>
                       renderMedia(item, entry, w, row.height, badge, stack),
                     )}
