@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoxekLSXWZvQO6n/myI7HYABUig8HXtl6TTZgOhDC7D5X5gDHray3FPKcOmpEy/WI7cOxQ5IAdQBInZ0rA4m6dBBAN9AU8yBtzcZjKS33lMY2rUB7jX5QAU6aMBDSO6JYp/c+iFXiqRkT+FRHj5jmU6u1ndNKgxIaHxiC9WtNSzAxo4MrJjnbW4zbA3tVMMd0jNB9FD0CM8XXLew/X/W6XBZ5u/YCCMt9kazPbtK+riuKo7Cvf8gVkL8WBy14Z25m2Bgq2C7ufyOFiMlUAKzUjltHr3WFFM/Cc17Ank5+HXBbXTZB/SBR/joua1NaNKsAsIapKq2FNX2pBszyvg5UOQIDAQAB",
   "name": "Mosaic Extension",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Save web images to Mosaic.",
   "permissions": ["contextMenus", "notifications", "clipboardWrite", "offscreen", "storage", "nativeMessaging"],
   "host_permissions": ["<all_urls>"],
