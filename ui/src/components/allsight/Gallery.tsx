@@ -162,6 +162,15 @@ function thumbnailSizeForBox(width: number, height: number) {
   if (devicePixels <= 320) return 320;
   return 512;
 }
+
+function DragPreviewImage({ media }: { media: MediaItem }) {
+  const sources = [media.url, media.originalUrl, media.contentUrl].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
+  const [sourceIndex, setSourceIndex] = useState(0);
+  useEffect(() => setSourceIndex(0), [media.id]);
+  const source = sources[sourceIndex];
+  if (!source) return <span className="grid size-full place-items-center bg-muted text-xs text-muted-foreground">Preview</span>;
+  return <img src={source} alt="" draggable={false} onError={() => setSourceIndex((index) => Math.min(index + 1, sources.length - 1))} className="size-full object-cover" />;
+}
 function placeholderColor(id: string) {
   let value = 0;
   for (let index = 0; index < id.length; index += 1) value = (value * 31 + id.charCodeAt(index)) >>> 0;
@@ -318,6 +327,7 @@ export function Gallery({
   const committedScrollTop = useRef(0);
   const [drag, setDrag] = useState<OrderEntry | null>(null);
   const [dragPoint, setDragPoint] = useState<{ x: number; y: number } | null>(null);
+  const [dragPreviewId, setDragPreviewId] = useState<string | null>(null);
   const [drop, setDrop] = useState<DropInfo>(null);
   // Keep a single, top-level rail for Library reordering.  Card-local rails
   // are fine for a group, but can be clipped by a justified Library row.
@@ -787,6 +797,7 @@ export function Gallery({
       setDrop(null);
       setDrag(null);
       setDragPoint(null);
+      setDragPreviewId(null);
       // Sidebar also observes the same pointer drag as a reliable fallback
       // for Electron builds that suppress native HTML drag/drop events.
       finishMediaDrag();
@@ -801,7 +812,7 @@ export function Gallery({
     };
   }, [applyDrop, currentFolderId, drag, finishHold, globalIndex, moveToFolder, needsHold, removeFromFolder, selected, state.groups]);
 
-  const startPointer = (e: React.PointerEvent, entry: OrderEntry) => {
+  const startPointer = (e: React.PointerEvent, entry: OrderEntry, previewMediaId?: string) => {
     if (e.button !== 0) return;
     pointerStart.current = { x: e.clientX, y: e.clientY, entry };
     const onMove = (ev: PointerEvent) => {
@@ -814,6 +825,7 @@ export function Gallery({
         }
         setDrag(entry);
         setDragPoint({ x: ev.clientX, y: ev.clientY });
+        setDragPreviewId(previewMediaId ?? null);
         window.removeEventListener("pointermove", onMove);
       }
     };
@@ -1137,7 +1149,7 @@ export function Gallery({
               ...(stack ? { padding: `${GROUP_PAD}px ${GROUP_PAD / 2}px ${GROUP_PAD / 2}px ${GROUP_PAD}px` } : null),
             }}
 
-            onPointerDown={(e) => startPointer(e, entry)}
+            onPointerDown={(e) => startPointer(e, entry, m.id)}
             onClick={(e) => handleSelect(e, m.id)}
             onDoubleClick={() => onOpen(m.id)}
             tabIndex={0}
@@ -1230,7 +1242,7 @@ export function Gallery({
               <span
                 onPointerDown={(e) => {
                   e.stopPropagation();
-                  startPointer(e, entry);
+                  startPointer(e, entry, m.id);
                 }}
                 title={t("dragToReorder")}
                 className="glass-float absolute bottom-2 left-2 z-20 grid size-6 cursor-grab place-items-center rounded-md opacity-0 transition-opacity group-hover:opacity-100"
@@ -1661,18 +1673,18 @@ export function Gallery({
         />
       )}
 
-      {drag?.kind === "media" && dragPoint && mediaById(drag.id) && (
+      {dragPreviewId && dragPoint && mediaById(dragPreviewId) && (
         <div
           aria-hidden
           className="pointer-events-none fixed z-[80] h-20 w-28 overflow-hidden rounded-lg border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm"
           style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}
         >
-          {selected.includes(drag.id) && selected.length > 1 ? (
+          {selected.includes(dragPreviewId) && selected.length > 1 ? (
             <span className="grid size-full place-items-center bg-background/70 px-2 text-center text-sm font-medium text-foreground">
               {selected.length} items
             </span>
           ) : (
-            <img src={mediaById(drag.id)!.url} alt="" draggable={false} className="size-full object-cover" />
+            <DragPreviewImage media={mediaById(dragPreviewId)!} />
           )}
         </div>
       )}

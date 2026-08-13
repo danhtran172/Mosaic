@@ -1,6 +1,6 @@
 {
   "name": "master-vision",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "A private visual library desktop app",
   "productName": "Mosaic",
   "main": "main.js",
@@ -71,7 +71,7 @@
     "publish": {
       "provider": "github",
       "owner": "danhtran172",
-      "repo": "AllSight",
+      "repo": "Mosaic",
       "releaseType": "release"
     }
   }
