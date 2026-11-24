@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { FolderCog, FolderOpen, Keyboard, LoaderCircle, Pencil, Plus, RefreshCw, RotateCcw, Star, Trash2, UserRound } from "lucide-react";
+import { FolderCog, FolderOpen, Keyboard, LoaderCircle, Pencil, Plus, RefreshCw, Star, Trash2, UserRound } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { getInDeckBridge, type InDeckProfile } from "@/lib/indeck/bridge";
@@ -97,7 +97,6 @@ export function ProfileManager({ open, onOpenChange }: { open: boolean; onOpenCh
   const { state } = useAllsight();
   const c = (vi: string, en: string) => state.language === "en" ? en : vi;
   const [profiles, setProfiles] = useState<InDeckProfile[]>([]);
-  const [discarded, setDiscarded] = useState<InDeckProfile[]>([]);
   const [newName, setNewName] = useState("");
   const [newNameError, setNewNameError] = useState<string | null>(null);
   const [rename, setRename] = useState<InDeckProfile | null>(null);
@@ -110,9 +109,7 @@ export function ProfileManager({ open, onOpenChange }: { open: boolean; onOpenCh
     const bridge = getInDeckBridge();
     if (!bridge) return;
     try {
-      const [nextProfiles, nextDiscarded] = await Promise.all([bridge.listProfiles(), bridge.listDiscardedProfiles()]);
-      setProfiles(nextProfiles);
-      setDiscarded(nextDiscarded);
+      setProfiles(await bridge.listProfiles());
     } catch (error) {
       toast.error(errorMessage(error, c("Không thể tải danh sách profile.", "Could not load profiles.")));
     }
@@ -185,9 +182,7 @@ export function ProfileManager({ open, onOpenChange }: { open: boolean; onOpenCh
     finally { setWorking(null); }
   };
 
-  const discardedIds = new Set(discarded.map((profile) => profile.id));
   const activeProfiles = profiles
-    .filter((profile) => !discardedIds.has(profile.id))
     .sort((a, b) => Number(b.isDefault) - Number(a.isDefault));
 
   return <>
@@ -220,10 +215,6 @@ export function ProfileManager({ open, onOpenChange }: { open: boolean; onOpenCh
                 <button disabled={activeProfiles.length < 2} onClick={() => { setDeleteTarget(profile); setTypedName(""); setReplacementId(""); }} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-destructive/25 px-2.5 text-xs text-destructive transition hover:bg-destructive hover:text-destructive-foreground disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="size-3.5" />{c("Xóa", "Delete")}</button>
               </div>
             </div>)}
-          </section>
-          <section className="space-y-2">
-            <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{c("Thùng rác Profile", "Profile Discard Pile")}</p>
-            {discarded.length === 0 ? <p className="rounded-xl border border-dashed border-border/70 px-3 py-4 text-center text-xs text-muted-foreground">{c("Chưa có Profile đã xóa.", "No deleted Profiles.")}</p> : discarded.map((profile) => <div key={profile.id} className="flex items-center gap-3 rounded-2xl border border-border/60 bg-secondary/25 p-3"><RotateCcw className="size-4 text-muted-foreground" /><div className="min-w-0 flex-1"><p className="text-sm font-medium">{profile.name}</p><p className="truncate text-xs text-muted-foreground">{profile.mediaPath || c("Chưa thiết lập Library", "Library is not configured")}</p></div><button onClick={() => void action(`restore:${profile.id}`, () => getInDeckBridge()!.recoverProfile(profile.id), c("Đã khôi phục Profile.", "Profile restored."))} className="glass-btn h-8 rounded-lg px-2.5 text-xs">{c("Khôi phục", "Restore")}</button></div>)}
           </section>
         </div>
       </DialogContent>

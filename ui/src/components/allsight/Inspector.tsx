@@ -1,14 +1,62 @@
-import { useEffect, useState } from "react";
-import { Check, Eye, EyeOff, Folder, FolderPlus, HardDrive, Heart, PanelRightClose, Pencil, Play, Search, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { Check, Copy, Eye, EyeOff, Folder, FolderOpen, FolderPlus, HardDrive, Heart, Lock, PanelRightClose, Pencil, Play, Search, Trash2 } from "lucide-react";
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
 import { Chip, PropertyPicker } from "./PropertyPicker";
 import { AutoTagEditor } from "./AutoTagEditor";
 import { LockOverlay } from "./LockOverlay";
+import type { MediaItem } from "@/lib/allsight/types";
+import { LazyThumbnail } from "./Thumbnail";
+import { subscribeThumbnailStore, thumbnailPalette, thumbnailStoreVersion } from "@/lib/allsight/thumbnail-resource-manager";
+import { aspectLabel, canDragOut, copyText, formatBytes, paletteText, startExternalDrag } from "@/lib/allsight/designer-tools";
 
 import { cn } from "@/lib/utils";
 import type { ConfirmRequest } from "./ConfirmDialog";
+
+/**
+ * A note field that edits a local draft and commits it after a short pause
+ * (and on blur). Writing straight into the Library on every keystroke rebuilt
+ * the whole Gallery layout per key, which made typing lag on large Libraries.
+ */
+function DraftTextarea({ value, onCommit, ...props }: { value: string; onCommit: (value: string) => void } & Omit<React.TextareaHTMLAttributes<HTMLTextAreaElement>, "value" | "onChange">) {
+  const [draft, setDraft] = useState(value);
+  const focused = useRef(false);
+  const timer = useRef(0);
+  const latest = useRef({ draft: value, onCommit, value });
+  latest.current = { draft, onCommit, value };
+  // Follow outside changes (another media selected, an undo) while not typing.
+  useEffect(() => { if (!focused.current) setDraft(value); }, [value]);
+  const commit = () => {
+    window.clearTimeout(timer.current);
+    const current = latest.current;
+    if (current.draft !== current.value) current.onCommit(current.draft);
+  };
+  // Never lose a pending edit when the panel switches target or unmounts.
+  useEffect(() => () => commit(), []);
+  return (
+    <textarea
+      {...props}
+      value={draft}
+      onFocus={() => { focused.current = true; }}
+      onBlur={() => { focused.current = false; commit(); }}
+      onChange={(event) => {
+        setDraft(event.target.value);
+        window.clearTimeout(timer.current);
+        timer.current = window.setTimeout(commit, 450);
+      }}
+    />
+  );
+}
+
+function formatDate(timestamp: number, language: string) {
+  if (!timestamp) return "—";
+  try {
+    return new Date(timestamp).toLocaleString(language === "en" ? "en-GB" : "vi-VN", { dateStyle: "medium", timeStyle: "short" });
+  } catch {
+    return "—";
+  }
+}
 
 export type InspectorTarget = { kind: "all" } | { kind: "media"; id: string } | { kind: "folder"; id: string };
 
@@ -18,12 +66,15 @@ export function Inspector({
   currentFolderId,
   onClose,
   onConfirm,
+  onFilterColor,
 }: {
   target: InspectorTarget | null;
   unlockedFolderIds: string[];
   currentFolderId?: string | null;
   onClose: () => void;
   onConfirm: (request: ConfirmRequest) => void;
+  /** Clicking a palette colour filters the Gallery by it. */
+  onFilterColor?: (hex: string) => void;
 }) {
   const t = useT();
   const { state, setInspectorAutoOpen } = useAllsight();
@@ -45,7 +96,7 @@ export function Inspector({
         {target?.kind === "folder" ? (
           <FolderPanel folderId={target.id} unlockedFolderIds={unlockedFolderIds} onConfirm={onConfirm} />
         ) : target?.kind === "media" ? (
-          <MediaPanel mediaId={target.id} currentFolderId={currentFolderId} />
+          <MediaPanel mediaId={target.id} currentFolderId={currentFolderId} onFilterColor={onFilterColor} />
         ) : target?.kind === "all" ? (
           <MainGalleryPanel onConfirm={onConfirm} />
         ) : (
@@ -94,38 +145,45 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
   const visibleFolders = state.folders.filter((folder) => folder.name.toLowerCase().includes(galleryQuery.trim().toLowerCase()));
   const excludedFolders = state.folders.filter((folder) => excluded.has(folder.id));
   const includesLockedGallery = excludedFolders.some((folder) => folder.locked);
-  const isDefaultMedia = (mediaId: string) => {
-    const media = state.media.find((item) => item.id === mediaId);
-    if (!media) return false;
-    const source = state.sources.find((item) => item.id === media.sourceId);
-    return media.sourceId === "allsight-web-imports" || /^default\s*save$/i.test(source?.name ?? "");
-  };
-  const isDiscardedMedia = (mediaId: string) => state.media.find((item) => item.id === mediaId)?.sourceId === "indeck-discards";
-  const isOtherMedia = (mediaId: string) => {
-    const media = state.media.find((item) => item.id === mediaId);
-    if (!media || isDefaultMedia(mediaId) || isDiscardedMedia(mediaId)) return false;
-    if (state.trashFolders.some((folder) => folder.mediaIds.includes(media.id))) return false;
-    const source = state.sources.find((item) => item.id === media.sourceId);
-    const sourceIsManaged = !!source && (state.mainSourceIds.includes(media.sourceId) || state.folders.some((folder) =>
-      (folder.sourceIds ?? []).includes(media.sourceId),
-    ));
-    if (!sourceIsManaged) return true;
-    return false;
-  };
-  // A locked Gallery deliberately conceals its count.  Do not leak that count
-  // through the total at the top of the inspector.
-  const knownHiddenCount = state.media.filter((media) => {
-    const providers = state.folders.filter((folder) => folder.mediaIds.includes(media.id));
-    const other = isOtherMedia(media.id);
-    const defaultMedia = isDefaultMedia(media.id);
-    const mainMediaSource = state.mainSourceIds.includes(media.sourceId);
-    return (providers.length > 0 || other || defaultMedia)
-      && providers.every((folder) => excluded.has(folder.id))
-      && (!mainMediaSource || state.ignoreMediaSourcesWhenExcluded)
-      && (!other || state.excludeOtherMedia)
-      && (!defaultMedia || state.excludeDefaultMedia)
-      && !providers.some((folder) => excluded.has(folder.id) && folder.locked);
-  }).length;
+  // Every count below used to rescan all media, all Galleries and all sources
+  // for each media in turn — quadratic, and re-run on every Library change.
+  const counts = useMemo(() => {
+    const sourceById = new Map(state.sources.map((source) => [source.id, source]));
+    const providersByMedia = new Map<string, typeof state.folders>();
+    for (const folder of state.folders) for (const id of folder.mediaIds) {
+      const list = providersByMedia.get(id);
+      if (list) list.push(folder); else providersByMedia.set(id, [folder]);
+    }
+    const trashed = new Set(state.trashFolders.flatMap((folder) => folder.mediaIds));
+    const managed = new Set([...state.folders.flatMap((folder) => folder.sourceIds ?? []), ...state.mainSourceIds]);
+    const mainSources = new Set(state.mainSourceIds);
+    const excludedIds = new Set(state.excludedFolderIds);
+    const isDefault = (media: typeof state.media[number]) => media.sourceId === "allsight-web-imports" || /^default\s*save$/i.test(sourceById.get(media.sourceId)?.name ?? "");
+    const isOther = (media: typeof state.media[number]) => {
+      if (isDefault(media) || media.sourceId === "indeck-discards" || trashed.has(media.id)) return false;
+      return !(sourceById.has(media.sourceId) && managed.has(media.sourceId));
+    };
+    let hidden = 0;
+    let other = 0;
+    let defaults = 0;
+    const perSource = new Map<string, number>();
+    for (const media of state.media) {
+      perSource.set(media.sourceId, (perSource.get(media.sourceId) ?? 0) + 1);
+      const providers = providersByMedia.get(media.id) ?? [];
+      const otherMedia = isOther(media);
+      const defaultMedia = isDefault(media);
+      if (otherMedia) other += 1;
+      if (defaultMedia) defaults += 1;
+      if ((providers.length > 0 || otherMedia || defaultMedia)
+        && providers.every((folder) => excludedIds.has(folder.id))
+        && (!mainSources.has(media.sourceId) || state.ignoreMediaSourcesWhenExcluded)
+        && (!otherMedia || state.excludeOtherMedia)
+        && (!defaultMedia || state.excludeDefaultMedia)
+        && !providers.some((folder) => excludedIds.has(folder.id) && folder.locked)) hidden += 1;
+    }
+    return { hidden, other, defaults, perSource };
+  }, [state.excludeDefaultMedia, state.excludeOtherMedia, state.excludedFolderIds, state.folders, state.ignoreMediaSourcesWhenExcluded, state.mainSourceIds, state.media, state.sources, state.trashFolders]);
+  const knownHiddenCount = counts.hidden;
   const hiddenCountLabel = includesLockedGallery
     ? [knownHiddenCount > 0 ? String(knownHiddenCount) : "", "?"].filter(Boolean).join(" + ")
     : String(knownHiddenCount);
@@ -163,7 +221,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           </button>;
         })}
         {(() => {
-          const otherCount = state.media.filter((media) => isOtherMedia(media.id)).length;
+          const otherCount = counts.other;
           const off = state.excludeOtherMedia;
           return <button onClick={toggleExcludeOtherMedia} className="glass-btn flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm">
             {off ? <EyeOff className="size-4 text-muted-foreground" /> : <Eye className="size-4 text-primary" />}
@@ -186,14 +244,19 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
               if (!bridge) { setSourceMessage(t("onlyDesktopApp")); return; }
-              const path = await bridge.pickFolder();
+              const path = await bridge.pickFolder().catch(() => null);
               if (!path) return;
               setAddingSource(true);
               setSourceMessage("");
-              const result = await attachMainSource(path);
-              setAddingSource(false);
-              if (result === "exists") setSourceMessage(t("sourceAlreadyAdded"));
-              if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
+              try {
+                const result = await attachMainSource(path);
+                if (result === "exists") setSourceMessage(t("sourceAlreadyAdded"));
+                if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
+              } catch {
+                setSourceMessage(t("sourceUnavailable"));
+              } finally {
+                setAddingSource(false);
+              }
             })()}
             className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
           >
@@ -205,7 +268,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           {(() => {
             const source = state.sources.find((item) => item.id === "allsight-web-imports" || /^default\s*save$/i.test(item.name))
               ?? (defaultSavePath ? { path: defaultSavePath } : undefined);
-            const count = state.media.filter((media) => isDefaultMedia(media.id)).length;
+            const count = counts.defaults;
             return <div className="flex min-w-0 items-center gap-2.5 border-b border-border/55 px-2.5 py-2.5">
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><HardDrive className="size-4" /></span>
               <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{t("defaultSource")}</span><span className="block truncate text-[11px] text-muted-foreground" title={source?.path}>{source?.path ?? "—"}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{t("mediaCount", { count })}</span></span>
@@ -214,7 +277,7 @@ function MainGalleryPanel({ onConfirm }: { onConfirm: (request: ConfirmRequest) 
           {state.mainSourceIds.map((sourceId) => {
             const source = state.sources.find((item) => item.id === sourceId);
             if (!source) return null;
-            const count = state.media.filter((media) => media.sourceId === source.id).length;
+            const count = counts.perSource.get(source.id) ?? 0;
             return <div key={source.id} className="flex min-w-0 items-center gap-2.5 border-b border-border/55 px-2.5 py-2.5 last:border-b-0">
               <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><HardDrive className="size-4" /></span>
               <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{source.name}</span><span className="block truncate text-[11px] text-muted-foreground" title={source.path}>{source.path}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{t("mediaCount", { count })}</span></span>
@@ -241,8 +304,24 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
 
   const cover = state.media.find((m) => m.id === (folder.coverId ?? folder.mediaIds[0]));
   const isLocked = folder.locked && !unlockedFolderIds.includes(folder.id);
+  // A locked Gallery conceals its contents everywhere else (count, cover,
+  // media); the Inspector showed its count, notes and sources regardless.
+  if (isLocked) {
+    return (
+      <div className="space-y-4 px-4 pb-8">
+        <div className="relative grid h-36 place-items-center overflow-hidden rounded-xl border border-border/70 bg-muted/40">
+          <Lock className="size-7 text-muted-foreground" />
+        </div>
+        <div className="space-y-1">
+          <p className="truncate text-sm font-medium">{folder.name}</p>
+          <p className="text-xs text-muted-foreground">{t("lockedFolderHint")}</p>
+        </div>
+      </div>
+    );
+  }
   const managedSourceIds = new Set(folder.sourceIds ?? []);
-  const folderMedia = state.media.filter((media) => folder.mediaIds.includes(media.id));
+  const memberIds = new Set(folder.mediaIds);
+  const folderMedia = state.media.filter((media) => memberIds.has(media.id));
   // "Khác" keeps the original physical source intact. It only groups media
   // that this Gallery owns without adopting their source as a Media Source.
   const otherMedia = folderMedia.filter((media) => !managedSourceIds.has(media.sourceId));
@@ -251,9 +330,10 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
     <div className="space-y-5 px-4 pb-8">
       {cover && (
         <div className="relative overflow-hidden rounded-xl border border-border/70">
-          <img
-            src={cover.url || cover.originalUrl || cover.contentUrl || ""}
-            alt={folder.name}
+          <LazyThumbnail
+            media={cover}
+            priority
+            thumbnailSize={512}
             className={cn("h-36 w-full object-cover", isLocked && "scale-105 opacity-70 blur-[7px]")}
           />
           {isLocked && <LockOverlay />}
@@ -273,6 +353,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && draft.trim()) {
+                e.preventDefault();
                   void renameFolder(folder.id, draft.trim());
                   setEditing(false);
                 }
@@ -306,16 +387,17 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             </button>
           </div>
         )}
-        <p className="text-xs text-muted-foreground">{t("count", { count: folder.mediaIds.length })}</p>
+        <p className="text-xs text-muted-foreground">{t("count", { count: folderMedia.filter((media) => !media.hidden).length })}</p>
       </div>
 
       <section className="space-y-2">
         <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
           {t("description")}
         </h3>
-        <textarea
+        <DraftTextarea
+          key={folder.id}
           value={folder.notes}
-          onChange={(e) => updateFolder(folder.id, { notes: e.target.value })}
+          onCommit={(notes) => updateFolder(folder.id, { notes })}
           placeholder={t("descriptionPlaceholder")}
           rows={3}
           className="w-full resize-none rounded-lg border border-border bg-background/50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
@@ -341,14 +423,19 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
             onClick={() => void (async () => {
               const bridge = getInDeckBridge();
               if (!bridge) { setSourceMessage(t("onlyDesktopApp")); return; }
-              const path = await bridge.pickFolder();
+              const path = await bridge.pickFolder().catch(() => null);
               if (!path) return;
               setAddingSource(true);
               setSourceMessage("");
-              const result = await attachSourceFolder(folder.id, path);
-              setAddingSource(false);
-              if (result === "exists") setSourceMessage(t("sourceAlreadyInGallery"));
-              if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
+              try {
+                const result = await attachSourceFolder(folder.id, path);
+                if (result === "exists") setSourceMessage(t("sourceAlreadyInGallery"));
+                if (result === "unavailable") setSourceMessage(t("sourceUnavailable"));
+              } catch {
+                setSourceMessage(t("sourceUnavailable"));
+              } finally {
+                setAddingSource(false);
+              }
             })()}
             className="glass-btn inline-flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:cursor-wait disabled:opacity-60"
           >
@@ -408,7 +495,7 @@ function FolderPanel({ folderId, unlockedFolderIds, onConfirm }: { folderId: str
   );
 }
 
-function MediaPanel({ mediaId, currentFolderId }: { mediaId: string; currentFolderId?: string | null }) {
+function MediaPanel({ mediaId, currentFolderId, onFilterColor }: { mediaId: string; currentFolderId?: string | null | undefined; onFilterColor?: ((hex: string) => void) | undefined }) {
   const t = useT();
   const {
     state,
@@ -446,25 +533,64 @@ function MediaPanel({ mediaId, currentFolderId }: { mediaId: string; currentFold
 
   return (
     <div className="space-y-5 px-4 pb-8">
-      <div className="relative overflow-hidden rounded-xl border border-border/70">
-        <img src={media.url} alt={media.name} className="w-full object-contain" />
+      <div
+        className={cn("relative overflow-hidden rounded-xl border border-border/70", canDragOut(media) && "cursor-grab")}
+        // Drag the preview into Figma, Photoshop or Explorer to drop the file there.
+        draggable={canDragOut(media)}
+        onDragStart={(event) => { event.preventDefault(); startExternalDrag([media]); }}
+        title={canDragOut(media) ? (state.language === "en" ? "Drag into another app" : "Kéo vào ứng dụng khác") : undefined}
+        data-inspector-preview
+      >
+        <LazyThumbnail media={media} priority thumbnailSize={512} className="w-full" style={{ aspectRatio: `${media.width || 4} / ${media.height || 3}` }} />
         {media.type === "video" && (
           <span className="glass-panel absolute bottom-2 left-2 grid size-6 place-items-center rounded-full">
             <Play className="size-3" />
           </span>
         )}
       </div>
+      <MediaPalette media={media} onFilterColor={onFilterColor} />
 
       <div className="space-y-1.5">
-        <p className="truncate text-sm font-medium" title={media.name}>
-          {media.name}
-        </p>
+        <div className="flex items-start gap-2">
+          <p className="min-w-0 flex-1 truncate text-sm font-medium" title={media.name}>
+            {media.name}
+          </p>
+          <button
+            type="button"
+            onClick={() => { void getInDeckBridge()?.showInFolder(media).catch(() => false); }}
+            title={t("openInFolder")}
+            aria-label={t("openInFolder")}
+            className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <FolderOpen className="size-3.5" />
+          </button>
+        </div>
         <p className="truncate text-xs text-muted-foreground" title={media.path}>
           {media.path}
         </p>
-        <p className="text-xs text-muted-foreground">
-          {t("source")}: <span className="text-foreground">{source?.name ?? "—"}</span>
-        </p>
+        {/* The facts people look for first: kind, pixels, when it changed. */}
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 pt-1 text-xs">
+          <dt className="text-muted-foreground">{t("source")}</dt>
+          <dd className="truncate text-foreground" title={source?.name}>{source?.name ?? "—"}</dd>
+          <dt className="text-muted-foreground">{state.language === "en" ? "Type" : "Loại"}</dt>
+          <dd className="text-foreground">{media.type === "video" ? "Video" : (media.name.split(".").pop() ?? "").toUpperCase() || "Image"}{media.vault ? " · Vault" : ""}</dd>
+          <dt className="text-muted-foreground">{state.language === "en" ? "Size" : "Kích thước"}</dt>
+          <dd className="text-foreground tabular-nums">{media.width > 4 && media.height > 3 ? `${media.width} × ${media.height}` : "—"}</dd>
+          {media.width > 4 && media.height > 3 && (
+            <>
+              <dt className="text-muted-foreground">{state.language === "en" ? "Ratio" : "Tỉ lệ"}</dt>
+              <dd className="text-foreground tabular-nums">{aspectLabel(media.width, media.height)}</dd>
+            </>
+          )}
+          {Boolean(media.size) && (
+            <>
+              <dt className="text-muted-foreground">{state.language === "en" ? "File size" : "Dung lượng"}</dt>
+              <dd className="text-foreground tabular-nums">{formatBytes(media.size)}</dd>
+            </>
+          )}
+          <dt className="text-muted-foreground">{state.language === "en" ? "Modified" : "Sửa lần cuối"}</dt>
+          <dd className="text-foreground">{formatDate(media.modified ?? 0, state.language)}</dd>
+        </dl>
       </div>
 
       <button
@@ -528,14 +654,74 @@ function MediaPanel({ mediaId, currentFolderId }: { mediaId: string; currentFold
         <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
           {t("notes")}
         </h3>
-        <textarea
+        <DraftTextarea
+          key={media.id}
           value={media.notes}
-          onChange={(e) => updateMedia(media.id, { notes: e.target.value })}
+          onCommit={(notes) => updateMedia(media.id, { notes })}
           placeholder={t("notesPlaceholder")}
           rows={4}
           className="w-full resize-none rounded-lg border border-border bg-background/50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
         />
       </section>
+    </div>
+  );
+}
+
+/**
+ * The media's dominant colours, widest share first, as Eagle shows them. Each
+ * swatch is as wide as the share it covers; clicking one filters by it.
+ */
+function MediaPalette({ media, onFilterColor }: { media: MediaItem; onFilterColor?: ((hex: string) => void) | undefined }) {
+  const { state } = useAllsight();
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
+  // Re-render when this media's palette is measured.
+  useSyncExternalStore(subscribeThumbnailStore, thumbnailStoreVersion);
+  const palette = thumbnailPalette(media);
+  if (!palette?.length) return null;
+  const total = palette.reduce((sum, [, share]) => sum + share, 0) || 1;
+  const label = c("Lọc theo màu này", "Filter by this colour");
+  return (
+    <div className="space-y-1.5" data-media-palette>
+      <div className="flex h-5 overflow-hidden rounded-md border border-border/70" data-palette-strip>
+        {palette.map(([hex, share]) => (
+          <button
+            key={hex}
+            type="button"
+            title={`${hex} · ${Math.round(share * 100)}% — ${label}`}
+            aria-label={`${label} ${hex}`}
+            disabled={!onFilterColor}
+            onClick={() => onFilterColor?.(hex)}
+            className="h-full transition-[filter] hover:brightness-110 disabled:cursor-default"
+            style={{ backgroundColor: hex, flexGrow: share / total, flexBasis: 0 }}
+          />
+        ))}
+      </div>
+      {/* Hex codes to paste into a design tool: click one, or take them all. */}
+      <div className="flex flex-wrap items-center gap-1">
+        {palette.map(([hex]) => (
+          <button
+            key={hex}
+            type="button"
+            data-palette-hex={hex}
+            onClick={() => { void copyText(hex.toUpperCase(), state.language); }}
+            title={c("Sao chép mã màu", "Copy colour code")}
+            className="inline-flex items-center gap-1 rounded-md border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <span className="size-2.5 rounded-full border border-black/10" style={{ backgroundColor: hex }} />
+            {hex.toUpperCase()}
+          </button>
+        ))}
+        <button
+          type="button"
+          data-palette-copy-all
+          onClick={() => { void copyText(paletteText(palette), state.language, c("bảng màu", "the palette")); }}
+          title={c("Sao chép cả bảng màu", "Copy the whole palette")}
+          aria-label={c("Sao chép cả bảng màu", "Copy the whole palette")}
+          className="grid size-5 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        >
+          <Copy className="size-3" />
+        </button>
+      </div>
     </div>
   );
 }

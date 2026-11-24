@@ -1,3 +1,7 @@
 node_modules/
 dist/
 release/
+
+# Local scratch / OS files
+.tmp-*/
+desktop.ini

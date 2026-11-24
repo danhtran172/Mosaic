@@ -10,4 +10,5 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "./src") } },
   build: { outDir: "dist", emptyOutDir: true },
+  server: process.env.PORT ? { port: Number(process.env.PORT), strictPort: true } : undefined,
 });

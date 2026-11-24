@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Folder, Layers, Lock, LockOpen, Pencil, Ungroup } from "lucide-react";
+import { Folder, FolderOpen, FolderPlus, Layers, Lock, LockOpen, Pencil, Ungroup } from "lucide-react";
+import { toast } from "sonner";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -11,6 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
 import { LockOverlay } from "./LockOverlay";
+import { LazyThumbnail } from "./Thumbnail";
 import { cn } from "@/lib/utils";
 import type { GalleryGroup, GalleryOrderEntry, PersonalFolder } from "@/lib/allsight/types";
 import type { View } from "./Sidebar";
@@ -54,7 +56,27 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
   const pendingPointer = useRef<{ entry: DragEntry; x: number; y: number } | null>(null);
   const suppressClick = useRef(false);
   const boardRef = useRef<HTMLDivElement>(null);
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
   const openedGroup = state.galleryGroups.find((group) => group.id === openedGroupId) ?? null;
+  const mediaById = useMemo(() => new Map(state.media.map((media) => [media.id, media])), [state.media]);
+  const folderMap = useMemo(() => new Map(state.folders.map((folder) => [folder.id, folder])), [state.folders]);
+  const isSessionLocked = (folder: PersonalFolder) => folder.locked && !unlockedFolderIds.includes(folder.id);
+  // What the Gallery actually shows, not raw membership.
+  const galleryCount = (folder: PersonalFolder) => folder.mediaIds.reduce((count, id) => {
+    const media = mediaById.get(id);
+    return media && !media.hidden ? count + 1 : count;
+  }, 0);
+  // Removing the lock of a password-protected Gallery is as good as opening
+  // it, so a Gallery still locked in this session is opened (and asks for the
+  // password) instead.
+  const toggleLock = (folder: PersonalFolder) => {
+    if (folder.locked && isSessionLocked(folder) && state.password && state.requirePasswordToUnlockGallery) {
+      onOpen({ kind: "folder", id: folder.id });
+      toast.info(c("Mở khóa Gallery bằng mật khẩu trước khi gỡ khóa.", "Unlock the Gallery with the password before removing its lock."));
+      return;
+    }
+    updateFolder(folder.id, { locked: !folder.locked });
+  };
   const entries = useMemo(() => {
     const groupedIds = new Set(state.galleryGroups.flatMap((group) => group.folderIds));
     const ordered: DragEntry[] = state.galleryOrder.filter((entry) =>
@@ -111,7 +133,7 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     suppressClick.current = false;
     return true;
   };
-  const folderById = (id: string) => state.folders.find((folder) => folder.id === id);
+  const folderById = (id: string) => folderMap.get(id);
 
   const startPointer = (event: React.PointerEvent, entry: DragEntry) => {
     if (event.button !== 0) return;
@@ -229,20 +251,23 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     const menuSelection = selectedRef.current.includes(folder.id) ? selectedRef.current : selected;
     const selectedGroup = menuSelection.length > 1 && state.galleryGroups.find((item) => menuSelection.every((id) => item.folderIds.includes(id)));
     if (menuSelection.length > 1 && menuSelection.includes(folder.id)) {
-      return <ContextMenuContent className="glass-float w-56 rounded-xl">
-        <ContextMenuItem onSelect={() => { menuSelection.forEach(removeGalleryFromGroup); selectedRef.current = []; setSelected([]); }}>
-          <Ungroup className="size-4" /> Remove {menuSelection.length} Galleries from group
-        </ContextMenuItem>
-        {!selectedGroup && <ContextMenuItem onSelect={() => { createGalleryGroup([...menuSelection]); selectedRef.current = []; setSelected([]); }}>
-          <Layers className="size-4" /> Create group from {menuSelection.length} Galleries
+      return <ContextMenuContent className="glass-float w-60 rounded-xl">
+        {selectedGroup && <ContextMenuItem className="gap-2" onSelect={() => { menuSelection.forEach(removeGalleryFromGroup); selectedRef.current = []; setSelected([]); }}>
+          <Ungroup className="size-4" /> {c(`Loại ${menuSelection.length} Gallery khỏi group`, `Remove ${menuSelection.length} Galleries from group`)}
+        </ContextMenuItem>}
+        {!selectedGroup && <ContextMenuItem className="gap-2" onSelect={() => { createGalleryGroup([...menuSelection]); selectedRef.current = []; setSelected([]); }}>
+          <Layers className="size-4" /> {c(`Tạo group từ ${menuSelection.length} Gallery`, `Create group from ${menuSelection.length} Galleries`)}
         </ContextMenuItem>}
       </ContextMenuContent>;
     }
     return <ContextMenuContent className="glass-float w-56 rounded-xl">
-      <ContextMenuItem onSelect={() => updateFolder(folder.id, { locked: !folder.locked })}>
-        {folder.locked ? <LockOpen className="size-4" /> : <Lock className="size-4" />}{folder.locked ? "Unlock" : "Lock"}
+      <ContextMenuItem className="gap-2" onSelect={() => { setOpenedGroupId(null); onOpen({ kind: "folder", id: folder.id }); }}>
+        <FolderOpen className="size-4" /> {t("open")}
       </ContextMenuItem>
-      {group && <ContextMenuItem onSelect={() => removeGalleryFromGroup(folder.id)}><Ungroup className="size-4" /> Remove from group</ContextMenuItem>}
+      <ContextMenuItem className="gap-2" onSelect={() => toggleLock(folder)}>
+        {folder.locked ? <LockOpen className="size-4" /> : <Lock className="size-4" />}{folder.locked ? t("unlockFolder") : t("lockFolder")}
+      </ContextMenuItem>
+      {group && <ContextMenuItem className="gap-2" onSelect={() => removeGalleryFromGroup(folder.id)}><Ungroup className="size-4" /> {c("Loại khỏi group", "Remove from group")}</ContextMenuItem>}
     </ContextMenuContent>;
   };
 
@@ -250,24 +275,28 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
     const group = state.galleryGroups.find((item) => item.id === groupId);
     if (!group) return null;
     return <ContextMenuContent className="glass-float w-56 rounded-xl">
-      <ContextMenuItem onSelect={() => setOpenedGroupId(groupId)}><Layers className="size-4" /> Open group</ContextMenuItem>
-      <ContextMenuItem onSelect={() => setRenamingGalleryGroup(group)}><Pencil className="size-4" /> Rename</ContextMenuItem>
+      <ContextMenuItem className="gap-2" onSelect={() => setOpenedGroupId(groupId)}><Layers className="size-4" /> {c("Mở group", "Open group")}</ContextMenuItem>
+      <ContextMenuItem className="gap-2" onSelect={() => setRenamingGalleryGroup(group)}><Pencil className="size-4" /> {t("rename")}</ContextMenuItem>
       <ContextMenuSeparator />
-      <ContextMenuItem className="text-destructive" onSelect={() => group.folderIds.forEach(removeGalleryFromGroup)}><Ungroup className="size-4" /> Delete group</ContextMenuItem>
+      <ContextMenuItem className="gap-2 text-destructive" onSelect={() => group.folderIds.forEach(removeGalleryFromGroup)}><Ungroup className="size-4" /> {c("Bỏ group (giữ các Gallery)", "Ungroup (keeps the Galleries)")}</ContextMenuItem>
     </ContextMenuContent>;
   };
 
-  const Tile = ({ folder, mini = false }: { folder: PersonalFolder; mini?: boolean }) => {
-    const cover = state.media.find((media) => media.id === (folder.coverId ?? folder.mediaIds[0]));
-    const locked = folder.locked && !unlockedFolderIds.includes(folder.id);
-    return <div className={cn("relative overflow-hidden bg-muted", mini ? "size-full rounded-md" : "aspect-square rounded-xl")}>
-      {cover ? <img src={cover.url || cover.originalUrl || cover.contentUrl || ""} alt="" draggable={false} className={cn("size-full object-cover", locked && "scale-105 blur-md")} /> : <span className="grid size-full place-items-center text-muted-foreground"><Folder className={mini ? "size-4" : "size-8"} /></span>}
+  // Plain render functions, not components: a component declared inside this
+  // render is a new type every time, so React remounted every card — and
+  // reloaded every thumbnail — on each render, including each pointer move of
+  // a drag.
+  const tile = (folder: PersonalFolder, mini = false) => {
+    const cover = mediaById.get(folder.coverId ?? folder.mediaIds[0] ?? "");
+    const locked = isSessionLocked(folder);
+    return <div key={mini ? folder.id : undefined} className={cn("relative overflow-hidden bg-muted", mini ? "size-full rounded-md" : "aspect-square rounded-xl")}>
+      {cover ? <LazyThumbnail media={cover} thumbnailSize={512} className={cn("size-full object-cover", locked && "scale-105 blur-md")} /> : <span className="grid size-full place-items-center text-muted-foreground"><Folder className={mini ? "size-4" : "size-8"} /></span>}
       {locked && <LockOverlay size={mini ? "sm" : "md"} />}
     </div>;
   };
 
-  const FolderCard = ({ folder }: { folder: PersonalFolder }) => {
-    const locked = folder.locked && !unlockedFolderIds.includes(folder.id);
+  const folderCard = (folder: PersonalFolder) => {
+    const locked = isSessionLocked(folder);
     const creatingGroup = drop?.type === "create-group" && drop.folderId === folder.id;
     return <ContextMenu key={folder.id}><ContextMenuTrigger asChild>
       <button
@@ -278,14 +307,14 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         onDoubleClick={() => onOpen({ kind: "folder", id: folder.id })}
         className={cn("relative group text-left", selected.includes(folder.id) && "rounded-xl ring-2 ring-primary", dragged?.kind === "folder" && dragged.id === folder.id && "opacity-45", creatingGroup && "rounded-xl ring-2 ring-primary/60")}
       >
-        <Tile folder={folder} />
+        {tile(folder)}
         {creatingGroup && <HoldRing progress={holdProgress} />}
-        <div className="px-2.5 pt-3 pb-1"><p className="truncate text-sm font-medium">{folder.name}</p><p className="text-xs text-muted-foreground">{locked ? t("locked") : t("count", { count: folder.mediaIds.length })}</p></div>
+        <div className="px-2.5 pt-3 pb-1"><p className="truncate text-sm font-medium">{folder.name}</p><p className="text-xs text-muted-foreground">{locked ? t("locked") : t("count", { count: galleryCount(folder) })}</p></div>
       </button>
     </ContextMenuTrigger>{folderMenu(folder)}</ContextMenu>;
   };
 
-  const GroupCard = ({ group }: { group: GalleryGroup }) => {
+  const groupCard = (group: GalleryGroup) => {
     const members = group.folderIds.map(folderById).filter((folder): folder is PersonalFolder => !!folder);
     return <ContextMenu key={group.id}><ContextMenuTrigger asChild>
       <button
@@ -296,28 +325,58 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
         className={cn("relative group text-left", dragged?.kind === "group" && dragged.id === group.id && "opacity-45")}
       >
         <div className="grid aspect-square grid-cols-2 grid-rows-2 gap-1 overflow-hidden rounded-xl border border-border/65 bg-secondary/30 p-1 transition-transform group-hover:-translate-y-0.5">
-          {members.slice(0, 4).map((folder) => <Tile key={folder.id} folder={folder} mini />)}
+          {members.slice(0, 4).map((folder) => tile(folder, true))}
           {Array.from({ length: Math.max(0, 4 - members.length) }).map((_, memberIndex) => <span key={memberIndex} className="rounded-md bg-muted/50" />)}
         </div>
-        <div className="px-2.5 pt-3 pb-1"><p className="truncate text-sm font-medium">{group.name}</p><p className="mt-0.5 text-xs text-muted-foreground">{members.length} Galleries</p></div>
+        <div className="px-2.5 pt-3 pb-1"><p className="truncate text-sm font-medium">{group.name}</p><p className="mt-0.5 text-xs text-muted-foreground">{members.length} Gallery</p></div>
       </button>
     </ContextMenuTrigger>{galleryGroupMenu(group.id)}</ContextMenu>;
   };
 
+  const saveGroupName = () => {
+    const name = renamingGalleryGroup?.name.trim();
+    if (renamingGalleryGroup && name) updateGalleryGroup(renamingGalleryGroup.id, { name });
+    setRenamingGalleryGroup(null);
+  };
+
+  const newGallery = () => window.dispatchEvent(new Event("mosaic:new-gallery"));
+
   return <div ref={boardRef} className="app-scroll relative flex-1 overflow-y-auto p-5">
-    <div className="grid grid-cols-5 gap-x-4 gap-y-5">
-      {entries.map((entry) => entry.kind === "folder"
-        ? <FolderCard key={entry.id} folder={folderById(entry.id)!} />
-        : <GroupCard key={entry.id} group={state.galleryGroups.find((group) => group.id === entry.id)!} />,
-      )}
+    {state.folders.length > 0 && (
+      <div className="mb-4 flex items-center gap-2">
+        <p className="text-xs text-muted-foreground">{c(`${state.folders.length} Gallery · ${state.galleryGroups.length} group`, `${state.folders.length} Galleries · ${state.galleryGroups.length} groups`)}</p>
+        <span className="flex-1" />
+        <button onClick={newGallery} className="glass-btn inline-flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs font-medium">
+          <FolderPlus className="size-3.5" /> {t("newFolder")}
+        </button>
+      </div>
+    )}
+    {/* Columns follow the window instead of a fixed five. */}
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(168px,1fr))] gap-x-4 gap-y-5">
+      {entries.map((entry) => {
+        if (entry.kind === "folder") {
+          const folder = folderById(entry.id);
+          return folder ? folderCard(folder) : null;
+        }
+        const group = state.galleryGroups.find((item) => item.id === entry.id);
+        return group ? groupCard(group) : null;
+      })}
     </div>
     {libraryRail && <span aria-hidden className="pointer-events-none absolute z-30 block w-1 rounded-full border border-white/35 bg-primary shadow-[0_0_0_2px_rgb(255_255_255_/_0.16),0_0_12px_hsl(var(--primary))]" style={{ left: libraryRail.x, top: libraryRail.y, height: libraryRail.height }} />}
-    {dragged && dragPoint && (() => { const folder = dragged.kind === "folder" ? folderById(dragged.id) : folderById(state.galleryGroups.find((group) => group.id === dragged.id)?.folderIds[0] ?? ""); const cover = folder && state.media.find((media) => media.id === (folder.coverId ?? folder.mediaIds[0])); return <div aria-hidden className="pointer-events-none fixed z-[80] w-28 overflow-hidden rounded-xl border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm" style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}><div className="aspect-square bg-muted">{cover ? <img src={cover.url || cover.originalUrl || ""} alt="" className="size-full object-cover" /> : <Folder className="m-auto mt-8 size-6 text-muted-foreground" />}</div><p className="truncate px-2 py-1 text-xs font-medium">{folder?.name ?? "Gallery group"}</p></div>; })()}
-    {!state.folders.length && <p className="text-sm text-muted-foreground">{t("noMediaHint")}</p>}
+    {dragged && dragPoint && (() => { const folder = dragged.kind === "folder" ? folderById(dragged.id) : folderById(state.galleryGroups.find((group) => group.id === dragged.id)?.folderIds[0] ?? ""); const cover = folder && mediaById.get(folder.coverId ?? folder.mediaIds[0] ?? ""); return <div aria-hidden className="pointer-events-none fixed z-[80] w-28 overflow-hidden rounded-xl border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm" style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}><div className="aspect-square bg-muted">{cover ? <LazyThumbnail media={cover} priority thumbnailSize={160} className="size-full object-cover" /> : <Folder className="m-auto mt-8 size-6 text-muted-foreground" />}</div><p className="truncate px-2 py-1 text-xs font-medium">{folder?.name ?? "Gallery"}</p></div>; })()}
+    {!state.folders.length && (
+      <div className="flex min-h-72 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border px-6 text-center">
+        <Folder className="size-8 text-muted-foreground" />
+        <p className="text-sm text-muted-foreground">{c("Chưa có Gallery nào. Gallery giúp gom media theo chủ đề, mỗi Gallery có thể lấy media từ một hoặc nhiều thư mục.", "No Galleries yet. A Gallery collects media by theme and can draw from one or more folders.")}</p>
+        <button onClick={newGallery} className="inline-flex items-center gap-1.5 rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary">
+          <FolderPlus className="size-4" /> {t("newFolder")}
+        </button>
+      </div>
+    )}
 
     <Dialog open={!!openedGroup} onOpenChange={(open) => !open && setOpenedGroupId(null)}>
       <DialogContent className="max-w-3xl rounded-2xl" style={{ background: "rgb(24 34 35 / .26)", backdropFilter: "blur(26px) saturate(135%)", borderColor: "rgb(255 255 255 / .18)", boxShadow: "0 20px 58px rgb(0 0 0 / .22), inset 0 1px rgb(255 255 255 / .14)" }}>
-        <DialogHeader><div className="flex items-center gap-2"><DialogTitle className="font-display">{openedGroup?.name}</DialogTitle>{openedGroup && <button onClick={() => setRenamingGalleryGroup(openedGroup)} title="Rename group" className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"><Pencil className="size-3.5" /></button>}</div></DialogHeader>
+        <DialogHeader><div className="flex items-center gap-2"><DialogTitle className="font-display">{openedGroup?.name}</DialogTitle>{openedGroup && <button onClick={() => setRenamingGalleryGroup(openedGroup)} title={t("rename")} className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"><Pencil className="size-3.5" /></button>}</div></DialogHeader>
         <div className="grid grid-cols-4 gap-4">
           {openedGroup?.folderIds.map(folderById).filter((folder): folder is PersonalFolder => !!folder).map((folder, index) => <ContextMenu key={folder.id}><ContextMenuTrigger asChild>
             <button
@@ -328,14 +387,14 @@ export function FolderGallery({ onOpen, unlockedFolderIds }: Props) {
               onDoubleClick={() => { setOpenedGroupId(null); onOpen({ kind: "folder", id: folder.id }); }}
               className={cn("relative rounded-xl text-left", selected.includes(folder.id) && "ring-2 ring-primary", dragged?.kind === "folder" && dragged.id === folder.id && "opacity-45")}
             >
-              {memberRail?.index === index && <span className={cn("pointer-events-none absolute inset-y-2 z-20 w-1 rounded-full border border-white/35 bg-primary shadow-[0_0_10px_hsl(var(--primary))]", memberRail.side === "left" ? "-left-2" : "-right-2")} />}<Tile folder={folder} /><p className="mt-1.5 truncate text-sm font-medium">{folder.name}</p>
+              {memberRail?.index === index && <span className={cn("pointer-events-none absolute inset-y-2 z-20 w-1 rounded-full border border-white/35 bg-primary shadow-[0_0_10px_hsl(var(--primary))]", memberRail.side === "left" ? "-left-2" : "-right-2")} />}{tile(folder)}<p className="mt-1.5 truncate text-sm font-medium">{folder.name}</p>
             </button>
           </ContextMenuTrigger>{folderMenu(folder)}</ContextMenu>)}
         </div>
       </DialogContent>
     </Dialog>
     <Dialog open={!!renamingGalleryGroup} onOpenChange={(open) => !open && setRenamingGalleryGroup(null)}>
-      <DialogContent className="glass-float rounded-2xl"><DialogHeader><DialogTitle className="font-display">Rename group</DialogTitle></DialogHeader><input autoFocus value={renamingGalleryGroup?.name ?? ""} onChange={(event) => setRenamingGalleryGroup((group) => group ? { ...group, name: event.target.value } : group)} className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" /><button onClick={() => { if (renamingGalleryGroup?.name.trim()) updateGalleryGroup(renamingGalleryGroup.id, { name: renamingGalleryGroup.name.trim() }); setRenamingGalleryGroup(null); }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">Save</button></DialogContent>
+      <DialogContent className="glass-float rounded-2xl"><DialogHeader><DialogTitle className="font-display">{t("rename")}</DialogTitle></DialogHeader><input autoFocus value={renamingGalleryGroup?.name ?? ""} onChange={(event) => setRenamingGalleryGroup((group) => group ? { ...group, name: event.target.value } : group)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); saveGroupName(); } }} className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" /><button disabled={!renamingGalleryGroup?.name.trim()} onClick={saveGroupName} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary disabled:opacity-45">{t("save")}</button></DialogContent>
     </Dialog>
   </div>;
 }

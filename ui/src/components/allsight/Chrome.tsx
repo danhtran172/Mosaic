@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  ArrowUpToLine,
   CheckSquare,
   Grid2X2,
   Heart,
@@ -22,6 +23,8 @@ import {
   Minimize2,
   Minus,
   Group,
+  EyeOff,
+  Shapes,
 } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
@@ -34,7 +37,14 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAllsight } from "@/lib/allsight/store";
 import { useT } from "@/lib/allsight/i18n";
-import type { FilterKind, GalleryLayout, PersonalFolder } from "@/lib/allsight/types";
+import type { FilterKind, GalleryLayout, MediaItem, PersonalFolder } from "@/lib/allsight/types";
+import { designFilterCount, formatGroup, mediaExtension, type DesignFilter, type MediaShape } from "@/lib/allsight/designer-tools";
+
+/** A colour filter: the colour, and how far (CIE76 ΔE) a palette colour may be from it. */
+export type ColorFilter = { hex: string; tolerance: number };
+export const DEFAULT_COLOR_TOLERANCE = 22;
+// Hue presets in colour-wheel order, then the neutrals.
+const COLOR_PRESETS = ["#e53935", "#fb8c00", "#fdd835", "#7cb342", "#43a047", "#00897b", "#00acc1", "#1e88e5", "#3949ab", "#8e24aa", "#d81b60", "#6d4c41", "#212121", "#9e9e9e", "#fafafa"];
 import { mediaGroupById, type MediaGroupBy } from "@/lib/allsight/grouping";
 
 const OTHER_MEDIA_SOURCE_ID = "__indeck-other-media__";
@@ -81,6 +91,11 @@ export function Header({
   invertAdvancedFilters,
   onToggleInvertAdvancedFilters,
   onClearAdvancedFilters,
+  colorFilter,
+  onColorFilter,
+  colorAnalysis,
+  designFilter,
+  onDesignFilter,
   groupBy,
   onToggleGroupBy,
 }: {
@@ -107,13 +122,18 @@ export function Header({
   invertAdvancedFilters: boolean;
   onToggleInvertAdvancedFilters: () => void;
   onClearAdvancedFilters: () => void;
+  colorFilter: ColorFilter | null;
+  onColorFilter: (filter: ColorFilter | null) => void;
+  colorAnalysis: { done: number; total: number } | null;
+  designFilter: DesignFilter;
+  onDesignFilter: (filter: DesignFilter) => void;
   groupBy: MediaGroupBy[];
   onToggleGroupBy: (groupBy: MediaGroupBy) => void;
 }) {
   const t = useT();
-  const { state, setThumbHeight, setGalleryLayout } = useAllsight();
+  const { state, setThumbHeight, setGalleryLayout, pushUngroupedToFront } = useAllsight();
   const zoomPct = Math.round((state.thumbHeight / BASE_THUMB) * 100);
-  const activeCount = Object.values(propFilters).reduce((n, v) => n + v.length, 0) + galleryFilterIds.length + sourceFilterIds.length;
+  const activeCount = Object.values(propFilters).reduce((n, v) => n + v.length, 0) + galleryFilterIds.length + sourceFilterIds.length + (colorFilter ? 1 : 0) + designFilterCount(designFilter);
 
   return (
     <header className="library-header glass-panel flex items-center gap-x-3 rounded-none border-x-0 border-t-0 px-5 py-2">
@@ -152,11 +172,23 @@ export function Header({
         <div className="glass-btn flex w-[18vw] max-w-[18rem] min-w-24 shrink items-center gap-2 rounded-xl px-3 py-1.5 focus-within:ring-2 focus-within:ring-ring">
           <Search className="size-4 shrink-0 text-muted-foreground" />
           <input
+            data-library-search
             value={query}
             onChange={(e) => onQuery(e.target.value)}
-            placeholder={t("search")}
+            onKeyDown={(e) => { if (e.key === "Escape") { onQuery(""); e.currentTarget.blur(); } }}
+            placeholder={`${t("search")}  (Ctrl+F)`}
             className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
+          {query && (
+            <button
+              type="button"
+              onClick={() => onQuery("")}
+              aria-label={t("clearFilters")}
+              className="grid size-4 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="size-3.5" />
+            </button>
+          )}
         </div>
 
         {showFilters && (
@@ -173,6 +205,11 @@ export function Header({
             inverted={invertAdvancedFilters}
             onToggleInvert={onToggleInvertAdvancedFilters}
             onClearAll={onClearAdvancedFilters}
+            colorFilter={colorFilter}
+            onColorFilter={onColorFilter}
+            colorAnalysis={colorAnalysis}
+            designFilter={designFilter}
+            onDesignFilter={onDesignFilter}
           />
         )}
 
@@ -185,7 +222,7 @@ export function Header({
           />
         )}
 
-        {showFilters && <LayoutPopover layout={folder?.layout ?? state.mainGalleryLayout} onChange={(layout) => setGalleryLayout(folder?.id ?? null, layout)} />}
+        {showFilters && <LayoutPopover layout={folder?.layout ?? state.mainGalleryLayout} onChange={(layout) => setGalleryLayout(folder?.id ?? null, layout)} onPushUngrouped={pushUngroupedToFront} pushLabel={state.language === "en" ? "Ungrouped media to top" : "Đẩy ảnh chưa có group lên trên"} />}
 
         {showFilters && (
           <TooltipProvider delayDuration={200}>
@@ -233,7 +270,7 @@ export function Header({
   );
 }
 
-function LayoutPopover({ layout, onChange }: { layout: GalleryLayout; onChange: (layout: GalleryLayout) => void }) {
+function LayoutPopover({ layout, onChange, onPushUngrouped, pushLabel }: { layout: GalleryLayout; onChange: (layout: GalleryLayout) => void; onPushUngrouped: () => void; pushLabel: string }) {
   const t = useT();
   const item = (value: GalleryLayout, label: string, Icon: typeof Grid2X2) => (
     <button
@@ -261,6 +298,15 @@ function LayoutPopover({ layout, onChange }: { layout: GalleryLayout; onChange: 
         <p className="px-2.5 py-1.5 text-xs font-semibold">{t("galleryLayout")}</p>
         {item("justified", t("justifiedLayout"), Rows3)}
         {item("square", t("squareLayout"), Grid2X2)}
+        <div className="my-1 h-px bg-border/60" />
+        <button
+          type="button"
+          onClick={onPushUngrouped}
+          className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors hover:bg-accent"
+        >
+          <ArrowUpToLine className="size-3.5" />
+          <span className="min-w-0 flex-1">{pushLabel}</span>
+        </button>
       </PopoverContent>
     </Popover>
   );
@@ -271,7 +317,14 @@ export function WindowControls() {
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
-    void getInDeckBridge()?.isWindowMaximized().then(setIsMaximized);
+    const sync = () => { void getInDeckBridge()?.isWindowMaximized().then(setIsMaximized).catch(() => {}); };
+    sync();
+    // Maximising by double-clicking the title bar or snapping the window does
+    // not go through these buttons; a resize is the one signal all of them give.
+    let timer = 0;
+    const onResize = () => { window.clearTimeout(timer); timer = window.setTimeout(sync, 120); };
+    window.addEventListener("resize", onResize);
+    return () => { window.clearTimeout(timer); window.removeEventListener("resize", onResize); };
   }, []);
 
   return (
@@ -379,6 +432,11 @@ function FilterPopover({
   inverted,
   onToggleInvert,
   onClearAll,
+  colorFilter,
+  onColorFilter,
+  colorAnalysis,
+  designFilter,
+  onDesignFilter,
 }: {
   propFilters: Record<string, string[]>;
   onToggle: (groupId: string, value: string) => void;
@@ -392,10 +450,21 @@ function FilterPopover({
   inverted: boolean;
   onToggleInvert: () => void;
   onClearAll: () => void;
+  colorFilter: ColorFilter | null;
+  onColorFilter: (filter: ColorFilter | null) => void;
+  colorAnalysis: { done: number; total: number } | null;
+  designFilter: DesignFilter;
+  onDesignFilter: (filter: DesignFilter) => void;
 }) {
   const t = useT();
   const { state } = useAllsight();
   const [tagQuery, setTagQuery] = useState("");
+  // Formats offered are the ones this view actually holds.
+  const scopeMedia = useMemo(() => {
+    if (!folder) return state.media;
+    const members = new Set(folder.mediaIds);
+    return state.media.filter((media) => members.has(media.id));
+  }, [folder, state.media]);
   const q = tagQuery.trim().toLowerCase();
 
   const groups = state.propertyGroups
@@ -406,10 +475,12 @@ function FilterPopover({
   const managedSources = state.sources.filter((source) =>
     !folder || (folder.sourceIds ?? []).includes(source.id),
   );
-  const otherInFolder = !!folder && folder.mediaIds.some((mediaId) => {
-    const media = state.media.find((item) => item.id === mediaId);
-    return media && !(folder.sourceIds ?? []).includes(media.sourceId);
-  });
+  const otherInFolder = useMemo(() => {
+    if (!folder) return false;
+    const managed = new Set(folder.sourceIds ?? []);
+    const members = new Set(folder.mediaIds);
+    return state.media.some((media) => members.has(media.id) && !managed.has(media.sourceId));
+  }, [folder, state.media]);
   const availableSources = otherInFolder
     ? [...managedSources, { id: OTHER_MEDIA_SOURCE_ID, name: t("other"), path: "" }]
     : managedSources;
@@ -430,6 +501,7 @@ function FilterPopover({
           )}
         >
           <Filter className="size-4" />
+          {colorFilter && <span className="size-3 rounded-full border border-white/40" style={{ backgroundColor: colorFilter.hex }} />}
           {activeCount > 0 && <span className="tabular-nums">{activeCount}</span>}
         </button>
       </PopoverTrigger>
@@ -454,6 +526,9 @@ function FilterPopover({
             </button>
           )}
         </div>
+
+        <ColorFilterSection value={colorFilter} onChange={onColorFilter} analysis={colorAnalysis} language={state.language} />
+        <DesignFilterSection value={designFilter} onChange={onDesignFilter} media={scopeMedia} language={state.language} />
 
         <div className="app-scroll max-h-72 space-y-3 overflow-auto pr-1">
           {groups.length === 0 && <p className="py-4 text-center text-xs text-muted-foreground">{t("noTagsFound")}</p>}
@@ -501,17 +576,160 @@ function FilterPopover({
 }
 
 
+/**
+ * Pick a colour to keep only media whose palette contains it. Palettes come
+ * from thumbnails; media not measured yet are analysed in the background
+ * while the filter is on, and join the results as they are measured.
+ */
+function ColorFilterSection({ value, onChange, analysis, language }: {
+  value: ColorFilter | null;
+  onChange: (filter: ColorFilter | null) => void;
+  analysis: { done: number; total: number } | null;
+  language: string;
+}) {
+  const c = (vi: string, en: string) => language === "en" ? en : vi;
+  const tolerance = value?.tolerance ?? DEFAULT_COLOR_TOLERANCE;
+  const pick = (hex: string) => onChange(value?.hex === hex ? null : { hex, tolerance });
+  const ring = "ring-2 ring-primary ring-offset-1 ring-offset-background";
+  return (
+    <div className="mb-3 space-y-2 border-b border-border/60 pb-3">
+      <div className="flex items-center justify-between">
+        <p className="text-[11px] font-medium text-muted-foreground">{c("Màu", "Colour")}</p>
+        {value && <button onClick={() => onChange(null)} className="text-[11px] text-muted-foreground transition-colors hover:text-foreground">{c("Bỏ màu", "Clear colour")}</button>}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {COLOR_PRESETS.map((hex) => (
+          <button
+            key={hex}
+            type="button"
+            data-color-preset={hex}
+            onClick={() => pick(hex)}
+            aria-label={hex}
+            aria-pressed={value?.hex === hex}
+            className={cn("size-5 rounded-full border border-white/25 shadow-soft transition-transform hover:scale-110", value?.hex === hex && ring)}
+            style={{ backgroundColor: hex }}
+          />
+        ))}
+        <label
+          title={c("Chọn màu khác", "Pick another colour")}
+          className={cn("relative grid size-5 cursor-pointer place-items-center overflow-hidden rounded-full border border-white/25 bg-[conic-gradient(red,yellow,lime,cyan,blue,magenta,red)]", value && !COLOR_PRESETS.includes(value.hex) && ring)}
+        >
+          <input
+            type="color"
+            value={value?.hex ?? "#808080"}
+            onChange={(event) => onChange({ hex: event.target.value, tolerance })}
+            className="absolute inset-0 cursor-pointer opacity-0"
+          />
+        </label>
+      </div>
+      {value && (
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-muted-foreground">{c("Chính xác", "Exact")}</span>
+            <input
+              type="range"
+              min={8}
+              max={45}
+              step={1}
+              value={tolerance}
+              onChange={(event) => onChange({ hex: value.hex, tolerance: Number(event.target.value) })}
+              aria-label={c("Độ gần của màu", "Colour tolerance")}
+              className="h-1 flex-1 accent-primary"
+            />
+            <span className="text-[11px] text-muted-foreground">{c("Rộng", "Broad")}</span>
+          </div>
+          {analysis && analysis.total > 0 && analysis.done < analysis.total && (
+            <p className="text-[11px] text-muted-foreground tabular-nums">
+              {c("Đang phân tích màu", "Analysing colours")} {analysis.done}/{analysis.total}…
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Orientation, a minimum long edge and the file format. */
+function DesignFilterSection({ value, onChange, media, language }: {
+  value: DesignFilter;
+  onChange: (filter: DesignFilter) => void;
+  media: MediaItem[];
+  language: string;
+}) {
+  const c = (vi: string, en: string) => language === "en" ? en : vi;
+  const formats = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of media) {
+      const format = formatGroup(mediaExtension(item));
+      if (format) counts.set(format, (counts.get(format) ?? 0) + 1);
+    }
+    return [...counts].sort((left, right) => right[1] - left[1]);
+  }, [media]);
+  const toggle = <T,>(list: T[], item: T) => (list.includes(item) ? list.filter((entry) => entry !== item) : [...list, item]);
+  const shapes: Array<[MediaShape, string]> = [
+    ["landscape", c("Ngang", "Landscape")],
+    ["portrait", c("Dọc", "Portrait")],
+    ["square", c("Vuông", "Square")],
+    ["panorama", c("Toàn cảnh", "Panorama")],
+  ];
+  const sizes: Array<[number, string]> = [[0, c("Mọi cỡ", "Any size")], [1080, "≥ 1080"], [1920, "≥ 1920"], [3840, "≥ 4K"]];
+  const chip = (active: boolean) => cn(
+    "rounded-full border px-2 py-0.5 text-[11px] transition-colors",
+    active ? "border-primary/60 bg-primary/20 text-foreground" : "border-border/60 text-muted-foreground hover:bg-accent hover:text-foreground",
+  );
+  return (
+    <div className="mb-3 space-y-2 border-b border-border/60 pb-3" data-design-filter>
+      <p className="text-[11px] font-medium text-muted-foreground">{c("Hình dạng & kích thước", "Shape & size")}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {shapes.map(([shape, label]) => (
+          <button key={shape} type="button" data-shape={shape} aria-pressed={value.shapes.includes(shape)} className={chip(value.shapes.includes(shape))} onClick={() => onChange({ ...value, shapes: toggle(value.shapes, shape) })}>
+            {label}
+          </button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1.5" title={c("Cạnh dài tối thiểu, tính bằng pixel", "Minimum long edge, in pixels")}>
+        {sizes.map(([side, label]) => (
+          <button key={side} type="button" data-min-side={side} aria-pressed={value.minSide === side} className={chip(value.minSide === side)} onClick={() => onChange({ ...value, minSide: side })}>
+            {label}
+          </button>
+        ))}
+      </div>
+      {(formats.length > 1 || value.formats.length > 0) && (
+        <>
+          <p className="pt-1 text-[11px] font-medium text-muted-foreground">{c("Định dạng", "Format")}</p>
+          <div className="flex flex-wrap gap-1.5">
+            {formats.map(([format, count]) => (
+              <button key={format} type="button" data-format={format} aria-pressed={value.formats.includes(format)} className={chip(value.formats.includes(format))} onClick={() => onChange({ ...value, formats: toggle(value.formats, format) })}>
+                {format.toUpperCase()} <span className="tabular-nums opacity-60">{count}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function BulkBar({
   selected,
   folder,
   onClear,
+  onHide,
+  onFavorite,
+  onGroup,
 }: {
   selected: string[];
   folder: PersonalFolder | null;
   onClear: () => void;
+  onHide: () => void;
+  onFavorite: (favorite: boolean) => void;
+  onGroup: () => void;
 }) {
   const t = useT();
   const { state, addPropValue } = useAllsight();
+  const c = (vi: string, en: string) => state.language === "en" ? en : vi;
+  const chosen = new Set(selected);
+  const allFavorite = selected.length > 0 && state.media.every((media) => !chosen.has(media.id) || media.favorite);
   const inherited = state.galleryGroups
     .filter((galleryGroup) => !!folder && galleryGroup.folderIds.includes(folder.id))
     .flatMap((galleryGroup) => galleryGroup.propertyGroupIds ?? []);
@@ -526,8 +744,20 @@ export function BulkBar({
 
   return (
     <div className="glass-float pointer-events-auto absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-2xl px-2.5 py-2">
-      <span className="px-2 text-xs font-medium">{t("itemsSelected", { count: selected.length })}</span>
+      <span className="px-2 text-xs font-medium tabular-nums">{t("itemsSelected", { count: selected.length })}</span>
       <span className="h-5 w-px bg-border" />
+      <button
+        type="button"
+        onClick={() => onFavorite(!allFavorite)}
+        title={allFavorite ? c("Bỏ yêu thích", "Unfavorite") : t("favorite")}
+        aria-label={allFavorite ? c("Bỏ yêu thích", "Unfavorite") : t("favorite")}
+        className={cn(iconBtn, allFavorite && "text-favorite")}
+      >
+        <Heart className={cn("size-4", allFavorite && "fill-favorite")} />
+      </button>
+      <button type="button" onClick={onGroup} title={`${t("createGroupSelected")} (Ctrl+G)`} aria-label={t("createGroupSelected")} className={iconBtn}>
+        <Shapes className="size-4" />
+      </button>
       {availableProperties.map((group) => (
         <PropertyPicker
           key={group.id}
@@ -539,7 +769,17 @@ export function BulkBar({
           trigger={<button type="button" className="glass-btn inline-flex h-8 max-w-32 items-center gap-1.5 rounded-xl px-2 text-xs font-medium"><Tag className="size-3.5 shrink-0" /><span className="truncate">{group.name}</span></button>}
         />
       ))}
-      <button onClick={onClear} aria-label={t("clearSelection")} className={iconBtn}>
+      <span className="h-5 w-px bg-border" />
+      <button
+        type="button"
+        onClick={onHide}
+        title={`${folder ? c("Ẩn khỏi Gallery", "Hide from Gallery") : c("Ẩn khỏi Main Gallery", "Hide from Main Gallery")} (Delete)`}
+        aria-label={folder ? c("Ẩn khỏi Gallery", "Hide from Gallery") : c("Ẩn khỏi Main Gallery", "Hide from Main Gallery")}
+        className={cn(iconBtn, "hover:text-destructive")}
+      >
+        <EyeOff className="size-4" />
+      </button>
+      <button onClick={onClear} title={`${t("clearSelection")} (Esc)`} aria-label={t("clearSelection")} className={iconBtn}>
         <X className="size-4" />
       </button>
     </div>

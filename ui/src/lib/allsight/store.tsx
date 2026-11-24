@@ -23,7 +23,6 @@ import type {
 } from "./types";
 import { I18nContext, makeTranslate } from "./i18n";
 import { getInDeckBridge } from "../indeck/bridge";
-import { rememberMemoryPreview } from "./thumbnail-memory-cache";
 
 // Kept only for the browser-only preview. Desktop state is persisted by the
 // Electron backend, never by Lovable's old localStorage key.
@@ -31,6 +30,136 @@ const KEY = "indeck.browser-state.v1";
 
 let desktopLibrary: Record<string, any> | null = null;
 let desktopWriteQueue = Promise.resolve();
+
+// Serializing a large Library and sending it over IPC costs tens of
+// milliseconds. Doing that synchronously after every state change landed the
+// cost inside the interaction itself — a drop, a favourite click — so a burst
+// of edits is coalesced into one write instead, and never held back for long.
+const PERSIST_DEBOUNCE_MS = 300;
+const PERSIST_MAX_WAIT_MS = 1200;
+let persistTimer: number | null = null;
+let persistDirtySince = 0;
+let pendingPersist: (() => void) | null = null;
+/**
+ * Number of backend operations (rescan, import reload, folder sync) in flight.
+ * While one runs, debounced saves are held back: a save carries the whole
+ * Library, including the source catalogue as it was before the operation, and
+ * landing it mid-way would overwrite what the backend just wrote.
+ */
+let backendSyncDepth = 0;
+
+/**
+ * Write any edit still waiting in the debounce window now. Anything that is
+ * about to replace the in-memory state with a fresh backend snapshot must call
+ * this first, or the snapshot would silently discard that edit.
+ */
+function flushPendingWrite() {
+  if (persistTimer !== null) {
+    window.clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  const run = pendingPersist;
+  pendingPersist = null;
+  persistDirtySince = 0;
+  run?.();
+  return desktopWriteQueue.catch(() => {});
+}
+
+/** `local ∪ (fresh − base)`: keep local edits, take only what the backend added. */
+function mergeIdList(base: readonly string[] | undefined, local: readonly string[] | undefined, fresh: readonly string[] | undefined) {
+  const known = new Set(base ?? []);
+  const result = [...(local ?? [])];
+  const present = new Set(result);
+  for (const id of fresh ?? []) {
+    if (known.has(id) || present.has(id)) continue;
+    present.add(id);
+    result.push(id);
+  }
+  return result;
+}
+
+/**
+ * Three-way merge by id. Entities the user changed locally (a new object
+ * since `base`) keep the local version, merged with the backend's via
+ * `combine`; untouched ones take the backend version; ones deleted locally
+ * stay deleted; ones the backend added or removed follow the backend.
+ */
+function mergeEntities<T extends { id: string }>(
+  base: readonly T[],
+  local: readonly T[],
+  fresh: readonly T[],
+  combine: (local: T, fresh: T, base: T | undefined) => T = (own) => own,
+): T[] {
+  const baseById = new Map(base.map((item) => [item.id, item]));
+  const freshById = new Map(fresh.map((item) => [item.id, item]));
+  const result: T[] = [];
+  for (const own of local) {
+    const original = baseById.get(own.id);
+    const theirs = freshById.get(own.id);
+    if (!theirs) {
+      // Removed by the backend, unless the user created it meanwhile.
+      if (!original) result.push(own);
+      continue;
+    }
+    result.push(own === original ? theirs : combine(own, theirs, original));
+  }
+  const localIds = new Set(local.map((item) => item.id));
+  for (const theirs of fresh) {
+    if (!localIds.has(theirs.id) && !baseById.has(theirs.id)) result.push(theirs);
+  }
+  return result;
+}
+
+/**
+ * Apply the user's edits made while a backend operation ran (`base` → `local`)
+ * on top of the snapshot that operation produced (`fresh`), so neither side's
+ * work is lost.
+ */
+function rebaseLocalEdits(base: AllsightState, local: AllsightState, fresh: AllsightState): AllsightState {
+  const merged = { ...fresh } as Record<string, unknown>;
+  // Everything not merged field by field below: local wins only if it changed.
+  for (const key of Object.keys(local) as (keyof AllsightState)[]) {
+    merged[key] = local[key] !== base[key] ? local[key] : fresh[key];
+  }
+  const removed = new Set([...local.removedMediaIds, ...fresh.removedMediaIds]);
+  merged["removedMediaIds"] = [...removed];
+  merged["media"] = mergeEntities(base.media, local.media, fresh.media, (own, theirs) => ({
+    // Catalogue fields come from the scan, the user's own fields from the edit.
+    ...theirs,
+    favorite: own.favorite,
+    hidden: own.hidden,
+    notes: own.notes,
+    props: own.props,
+  })).filter((media) => !removed.has(media.id));
+  merged["sources"] = mergeEntities(base.sources, local.sources, fresh.sources);
+  merged["folders"] = mergeEntities(base.folders, local.folders, fresh.folders, (own, theirs, original) => ({
+    ...own,
+    mediaIds: mergeIdList(original?.mediaIds, own.mediaIds, theirs.mediaIds),
+    sourceIds: mergeIdList(original?.sourceIds, own.sourceIds, theirs.sourceIds),
+    defaultSourceId: own.defaultSourceId ?? theirs.defaultSourceId,
+    defaultSourcePath: own.defaultSourcePath ?? theirs.defaultSourcePath,
+  }) as PersonalFolder);
+  if (local.order !== base.order) {
+    // Keep the user's arrangement; slot in entries only the backend knows,
+    // right after the entry that precedes them in the backend order.
+    const key = (entry: OrderEntry) => `${entry.kind}:${entry.id}`;
+    const localKeys = new Set(local.order.map(key));
+    const baseKeys = new Set(base.order.map(key));
+    const inserts = new Map<string, OrderEntry[]>();
+    let anchor = "";
+    for (const entry of fresh.order) {
+      const entryKey = key(entry);
+      if (localKeys.has(entryKey)) { anchor = entryKey; continue; }
+      if (baseKeys.has(entryKey)) continue; // removed locally
+      inserts.set(anchor, [...(inserts.get(anchor) ?? []), entry]);
+    }
+    const order = [...(inserts.get("") ?? [])];
+    for (const entry of local.order) order.push(entry, ...(inserts.get(key(entry)) ?? []));
+    const mediaIds = new Set((merged["media"] as MediaItem[]).map((media) => media.id));
+    merged["order"] = order.filter((entry) => entry.kind !== "media" || mediaIds.has(entry.id));
+  }
+  return merged as unknown as AllsightState;
+}
 
 const fileUrl = (value: string) => `file:///${encodeURI(value.replace(/\\/g, "/"))}`;
 
@@ -85,7 +214,7 @@ function libraryToState(library: Record<string, any>): AllsightState {
       ? { volume: String(source.tracking.volume), fileId: String(source.tracking.fileId) }
       : undefined,
   }));
-  const media = (library.sources ?? []).flatMap((source: Record<string, any>) =>
+  const allMedia: MediaItem[] = (library.sources ?? []).flatMap((source: Record<string, any>) =>
     (source.assets ?? []).map((asset: Record<string, any>) => {
       const meta = library.assetMeta?.[asset.id] ?? {};
       const originalUrl = asset.contentUrl || fileUrl(String(asset.path ?? ""));
@@ -116,9 +245,10 @@ function libraryToState(library: Record<string, any>): AllsightState {
         path: String(asset.path ?? ""),
         sourceId: String(source.id),
         type: asset.type === "video" ? "video" : "image",
-        url: "",
         originalUrl,
         modified: Number(asset.modified ?? 0),
+        size: Number(asset.size ?? 0),
+        ...(asset.duration !== undefined ? { duration: Number(asset.duration) } : {}),
         vault: Boolean(asset.vault),
         contentUrl: asset.contentUrl ? String(asset.contentUrl) : undefined,
         width: Number(asset.width ?? 4),
@@ -131,6 +261,10 @@ function libraryToState(library: Record<string, any>): AllsightState {
       };
     }),
   );
+  // Media the user deleted from Mosaic stay in their source's catalogue (so a
+  // rescan does not see them as new) but never come back into the Library.
+  const removedMediaIds = new Set<string>((Array.isArray(library["removedAssetIds"]) ? library["removedAssetIds"] : []).map(String));
+  const media = allMedia.filter((item: MediaItem) => !removedMediaIds.has(item.id));
   const toFolder = (gallery: Record<string, any>) => {
     const storedMediaIds = (gallery.items ?? [])
       .filter((id: string) => !(gallery.discardedIds ?? []).includes(id))
@@ -229,9 +363,11 @@ function libraryToState(library: Record<string, any>): AllsightState {
     propertyGroups,
     groups: grouped.map((group: Record<string, any>) => ({
       id: String(group.id),
+      name: String(group.name ?? group.title ?? "").trim(),
       memberIds: (group.assets ?? []).map(String),
       collapsed: Boolean(group.collapsed),
       coverId: group.coverId ? String(group.coverId) : null,
+      fit: Boolean(group.fit),
     })),
     galleryGroups,
     extensionGallerySlotIds: Array.from({ length: 4 }, (_, index) => library.extensionGallerySlots?.[index] == null ? null : String(library.extensionGallerySlots[index])),
@@ -248,22 +384,35 @@ function libraryToState(library: Record<string, any>): AllsightState {
     mainGalleryLayout: library.mainGalleryLayout === "justified" || (!library.mainGalleryLayout && library.galleryLayout === "justified") ? "justified" : "square",
     inspectorAutoOpen: library.inspectorAutoOpen !== false,
     lightboxFitMedia: Boolean(library.lightboxFitMedia),
+    removedMediaIds: [...removedMediaIds],
   };
 }
 
 function stateToLibrary(state: AllsightState, library: Record<string, any>) {
-  const next = JSON.parse(JSON.stringify(library)) as Record<string, any>;
-  next.assetMeta ??= {};
-  // A permanently removed file must not reappear from the persisted source
-  // catalog on the next launch. Source rescans can still add existing files.
-  const activeMediaIds = new Set(state.media.map((media) => media.id));
-  const storedSources = new Map((next.sources ?? []).map((source: Record<string, any>) => [String(source.id), source]));
+  // Shallow on purpose. Every field this function writes is rebuilt as a new
+  // object below, and the ones it leaves alone are never mutated, so sharing
+  // them with the previous snapshot is safe. A deep JSON clone of a multi-MB
+  // library used to run after every single edit and stalled the UI thread.
+  const next = { ...library } as Record<string, any>;
+  const assetMeta: Record<string, any> = { ...(library["assetMeta"] ?? {}) };
+  next["assetMeta"] = assetMeta;
+  const storedSources = new Map((library.sources ?? []).map((source: Record<string, any>) => [String(source.id), source]));
+  // One pass over the media instead of one full scan per source.
+  const mediaBySource = new Map<string, MediaItem[]>();
+  for (const media of state.media) {
+    const bucket = mediaBySource.get(media.sourceId);
+    if (bucket) bucket.push(media);
+    else mediaBySource.set(media.sourceId, [media]);
+  }
   // The UI can introduce a source through the Gallery inspector.  Serialize
   // from state rather than only filtering the old catalog, otherwise a source
-  // that was just picked would disappear after the next restart.
+  // that was just picked would disappear after the next restart. A
+  // permanently removed file is simply absent from `state.media`, so it does
+  // not reappear from the persisted source catalog on the next launch.
+  const removedIds = new Set(state.removedMediaIds);
   next.sources = state.sources.map((source) => {
-    const old = storedSources.get(source.id) ?? {};
-    const oldAssets = new Map((old.assets ?? []).map((asset: Record<string, any>) => [String(asset.id), asset]));
+    const old = (storedSources.get(source.id) ?? {}) as Record<string, any>;
+    const oldAssets = new Map((old["assets"] ?? []).map((asset: Record<string, any>) => [String(asset.id), asset]));
     return {
       ...old,
       id: source.id,
@@ -271,8 +420,7 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
       path: source.path,
       vaultBridgeId: source.vaultBridgeId,
       tracking: source.tracking,
-      assets: state.media
-        .filter((media) => media.sourceId === source.id && activeMediaIds.has(media.id))
+      assets: [...(mediaBySource.get(source.id) ?? [])
         .map((media) => ({
           ...(oldAssets.get(media.id) ?? {}),
           id: media.id,
@@ -280,11 +428,17 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
           path: media.path,
           type: media.type,
           modified: media.modified ?? media.createdAt,
+          ...(media.size ? { size: media.size } : {}),
+          ...(media.duration !== undefined ? { duration: media.duration } : {}),
           vault: media.vault,
           contentUrl: media.contentUrl,
           width: media.width,
           height: media.height,
         })),
+        // A media deleted from Mosaic keeps its catalogue entry, so the next
+        // rescan recognises the file instead of importing it again.
+        ...[...oldAssets.values()].filter((asset) => removedIds.has(String((asset as Record<string, any>)["id"]))),
+      ],
     };
   });
   next.tagGroups = state.propertyGroups.filter((group) => !group.id.startsWith("exclusive:") && !group.id.startsWith("gallery-group:")).map((group) => {
@@ -293,8 +447,17 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   });
   next.tagDefinitions = state.propertyGroups.find((group) => group.id === "theme")?.values.map((name) => ({ name })) ?? next.tagDefinitions ?? [];
   next.personDefinitions = state.propertyGroups.find((group) => group.id === "character")?.values.map((name) => ({ name })) ?? next.personDefinitions ?? [];
+  // Persist the visible order as a timestamp per media. Folded into the same
+  // per-media pass below so every meta record is copied exactly once.
+  const orderTimestamp = Date.now();
+  const mediaOrder = new Map<string, number>();
+  state.order.forEach((entry, index) => {
+    if (entry.kind === "media") mediaOrder.set(entry.id, orderTimestamp - index);
+  });
   for (const media of state.media) {
-    const meta = (next.assetMeta[media.id] ??= {});
+    // A fresh record, never the previous snapshot's: that one is still
+    // referenced by `library` and must stay untouched.
+    const meta = { ...(assetMeta[media.id] ?? {}) };
     meta.favorite = media.favorite;
     meta.note = media.notes;
     meta.tags = media.props.theme ?? [];
@@ -302,12 +465,20 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
     meta.tagGroups = Object.fromEntries(Object.entries(media.props)
       .filter(([id]) => id !== "theme" && id !== "character")
       .map(([id, values]) => [id.startsWith("exclusive:") ? id.split(":").at(-1)! : id, values]));
+    const order = mediaOrder.get(media.id);
+    if (order !== undefined) meta.order = order;
+    assetMeta[media.id] = meta;
+  }
+  // Order entries for media that are not (or no longer) in `state.media`
+  // still keep their timestamp, exactly as before.
+  for (const [id, order] of mediaOrder) {
+    if (assetMeta[id]?.order === order) continue;
+    assetMeta[id] = { ...(assetMeta[id] ?? {}), order };
   }
   const collectionsById = new Map((library.collections ?? []).map((item: Record<string, any>) => [item.id, item]));
   // `state.order` is the exact visible sequence. Persist a timestamp for a
   // Group entry as well as individual Media so backend folder sync can expand
   // the Group at its real position instead of appending it after loose Media.
-  const orderTimestamp = Date.now();
   const groupOrderById = new Map(state.order
     .map((entry, index) => entry.kind === "group" ? [entry.id, orderTimestamp - index] as const : null)
     .filter((entry): entry is readonly [string, number] => entry !== null));
@@ -368,9 +539,11 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   }));
   next.libraryGroups = state.groups.filter((group) => group.memberIds.length > 1).map((group) => ({
     id: group.id,
+    name: group.name.trim() || undefined,
     assets: group.memberIds,
     collapsed: group.collapsed,
     coverId: group.coverId ?? undefined,
+    fit: group.fit || undefined,
     order: groupOrderById.get(group.id) ?? Math.max(...group.memberIds.map((id) => next.assetMeta[id]?.order ?? 0), 0),
   }));
   next.galleryGroups = state.galleryGroups.filter((group) => group.folderIds.length > 1).map((group, index) => ({
@@ -388,9 +561,6 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   }));
   next.galleryOrder = state.galleryOrder;
   next.extensionGallerySlots = Array.from({ length: 4 }, (_, index) => state.extensionGallerySlotIds[index] ?? null);
-  state.order.forEach((entry, index) => {
-    if (entry.kind === "media") (next.assetMeta[entry.id] ??= {}).order = orderTimestamp - index;
-  });
   next.language = state.language;
   next.appearance = state.appearance;
   next.themeColor = state.themeColor;
@@ -399,6 +569,10 @@ function stateToLibrary(state: AllsightState, library: Record<string, any>) {
   next.requirePasswordToUnlockGallery = state.requirePasswordToUnlockGallery;
   next.inspectorAutoOpen = state.inspectorAutoOpen;
   next.lightboxFitMedia = state.lightboxFitMedia;
+  // Only ids some source still lists are worth remembering; once the file is
+  // gone for real there is nothing left that could bring it back.
+  const cataloguedIds = new Set((next.sources as Array<Record<string, any>>).flatMap((source) => (source["assets"] ?? []).map((asset: Record<string, any>) => String(asset["id"]))));
+  next["removedAssetIds"] = state.removedMediaIds.filter((id) => cataloguedIds.has(id));
   next.allMediaExcludedGalleryIds = [...new Set(state.excludedFolderIds)];
     next.allMediaExcludeOther = state.excludeOtherMedia;
     next.allMediaExcludeDefault = state.excludeDefaultMedia;
@@ -418,7 +592,6 @@ const uid = (p: string) => `${p}-${Math.random().toString(36).slice(2, 9)}`;
 interface Ctx {
   state: AllsightState;
   set: (fn: (s: AllsightState) => AllsightState) => void;
-  setMediaPreview: (id: string, url: string, previewSize?: number) => void;
   setMediaDimensions: (id: string, width: number, height: number) => void;
   reset: () => void;
   // media
@@ -428,7 +601,16 @@ interface Ctx {
   removePropValue: (mediaId: string, groupId: string, value: string) => void;
   hideMedia: (ids: string[]) => void;
   restoreMedia: (id: string) => void;
-  purgeMedia: (id: string) => void;
+  /**
+   * Remove a media from Mosaic. With `remember`, its file is still in a source
+   * and must not be re-imported by a later rescan (the Trash's "delete
+   * forever"); without it, the file itself is already gone.
+   */
+  purgeMedia: (id: string, options?: { remember?: boolean }) => void;
+  /** Drop a media from one Gallery's trash only; it stays everywhere else. */
+  purgeFromFolderTrash: (folderId: string, mediaId: string) => void;
+  /** Mark (or unmark) many media as favourite in one update. */
+  setFavorite: (ids: string[], favorite: boolean) => void;
   restoreFolder: (id: string) => void;
   purgeFolder: (id: string) => void;
   toggleExcludedFolder: (id: string) => void;
@@ -483,16 +665,29 @@ interface Ctx {
   /** Remove only Main Gallery's relationship with a source. */
   detachMainSource: (sourceId: string) => void;
   // groups
-  createGroup: (memberIds: string[]) => void;
+  /**
+   * `anchorId` is the media the Group should appear in place of — the card
+   * that was right-clicked, or the one a drag was dropped onto. Without it the
+   * Group lands where the last member used to be.
+   */
+  createGroup: (memberIds: string[], anchorId?: string) => void;
   addToGroup: (groupId: string, mediaId: string) => void;
   moveGroupMember: (groupId: string, mediaId: string, targetIndex: number) => void;
   insertIntoGroup: (groupId: string, mediaId: string, targetIndex: number) => void;
+  /** Insert several media into a Group at one index, keeping their order. */
+  insertManyIntoGroup: (groupId: string, mediaIds: string[], targetIndex: number) => void;
   removeFromGroup: (mediaId: string) => void;
   dissolveGroup: (groupId: string) => void;
-  updateGroup: (groupId: string, patch: Partial<{ collapsed: boolean; coverId: string | null }>) => void;
+  updateGroup: (groupId: string, patch: Partial<Pick<MediaGroup, "name" | "collapsed" | "coverId" | "fit">>) => void;
   // order
   setOrder: (order: OrderEntry[]) => void;
   moveEntry: (entry: OrderEntry, targetIndex: number) => void;
+  /** Move entries so they sit directly after `target`, keeping their order. */
+  moveEntriesAfter: (target: OrderEntry, entries: OrderEntry[]) => void;
+  /** Move entries to one index as a block, keeping their relative order. */
+  moveEntriesTo: (entries: OrderEntry[], targetIndex: number) => void;
+  /** Bring every media that belongs to no Group to the front of the order. */
+  pushUngroupedToFront: () => void;
   resetOrder: () => void;
   // prefs
   setLanguage: (l: Language) => void;
@@ -513,11 +708,42 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AllsightState>(() => buildEmptyState());
   const [hydrated, setHydrated] = useState(false);
   const skipPersist = useRef(false);
-  const queuedPreviews = useRef(new Map<string, { url: string; previewSize: number }>());
-  const evictedPreviews = useRef(new Set<string>());
   const queuedDimensions = useRef(new Map<string, { width: number; height: number }>());
-  const previewFrame = useRef<number | null>(null);
   const dimensionFrame = useRef<number | null>(null);
+  const latestState = useRef(state);
+  latestState.current = state;
+
+  /**
+   * Run a backend operation that rewrites library.json (rescan, import, folder
+   * sync), then load the snapshot it produced. Saves are held while it runs;
+   * edits the user made meanwhile are rebased onto the snapshot and saved
+   * afterwards instead of being thrown away.
+   */
+  const reloadFromBackend = useCallback(async <T,>(operation?: () => Promise<T>): Promise<T | undefined> => {
+    const bridge = getInDeckBridge();
+    if (!bridge) return undefined;
+    await flushPendingWrite();
+    const base = latestState.current;
+    backendSyncDepth += 1;
+    try {
+      const result = operation ? await operation() : undefined;
+      const { library } = await bridge.readLibrarySnapshot();
+      if (library && typeof library === "object") {
+        desktopLibrary = library as Record<string, any>;
+        const fresh = libraryToState(desktopLibrary);
+        setState((current) => {
+          if (current === base) {
+            skipPersist.current = true;
+            return fresh;
+          }
+          return rebaseLocalEdits(base, current, fresh);
+        });
+      }
+      return result;
+    } finally {
+      backendSyncDepth -= 1;
+    }
+  }, []);
 
   useEffect(() => {
     const bridge = getInDeckBridge();
@@ -554,12 +780,34 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
     const bridge = getInDeckBridge();
     if (!bridge?.onMediaImported) return;
     let active = true;
-    return bridge.onMediaImported(() => {
-      void bridge.readLibrarySnapshot().then(({ library }) => {
-        if (!active || !library || typeof library !== "object") return;
-        desktopLibrary = library as Record<string, any>;
-        skipPersist.current = true;
-        setState(libraryToState(desktopLibrary));
+    const unsubscribe = bridge.onMediaImported(() => {
+      if (!active) return;
+      reloadFromBackend().catch((error) => console.error("Could not reload the Library after an import", error));
+    });
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [reloadFromBackend]);
+
+  // Vault media arrive without dimensions; the backend measures them in the
+  // background and reports each batch. Applied as an ordinary edit so the
+  // next save carries them too, and in one update per batch so a large
+  // Gallery re-lays out once rather than once per media.
+  useEffect(() => {
+    const bridge = getInDeckBridge();
+    if (!bridge?.onMediaDimensions) return;
+    return bridge.onMediaDimensions((dimensions) => {
+      setState((current) => {
+        let changed = false;
+        const media = current.media.map((item) => {
+          const size = dimensions[item.id];
+          if (!size || !(size.width > 0 && size.height > 0)) return item;
+          if (item.width === size.width && item.height === size.height) return item;
+          changed = true;
+          return { ...item, width: size.width, height: size.height };
+        });
+        return changed ? { ...current, media } : current;
       });
     });
   }, []);
@@ -580,19 +828,27 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       queued = true;
       window.setTimeout(() => {
         queued = false;
-        void bridge.refreshSources([folder]).then(() => bridge.readLibrarySnapshot()).then(({ library }) => {
-          if (!active || !library || typeof library !== "object") return;
-          desktopLibrary = library as Record<string, any>;
-          skipPersist.current = true;
-          setState(libraryToState(desktopLibrary));
-        }).catch(() => {});
+        if (!active) return;
+        reloadFromBackend(() => bridge.refreshSources([folder]))
+          .catch((error) => console.error("Could not refresh a Media Source", error));
       }, 80);
     });
     return () => {
       active = false;
       unsubscribe();
     };
-  }, [hydrated, state.sources]);
+  }, [hydrated, state.sources, reloadFromBackend]);
+
+  // Closing the window must not drop an edit that is still being debounced.
+  useEffect(() => {
+    const flush = () => { void flushPendingWrite(); };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+    };
+  }, []);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -602,9 +858,25 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
     }
     const bridge = getInDeckBridge();
     if (bridge && desktopLibrary) {
-      const next = stateToLibrary(state, desktopLibrary);
-      desktopLibrary = next;
-      desktopWriteQueue = desktopWriteQueue.catch(() => {}).then(() => bridge.writeStore(next));
+      // Always serialize the newest state when the write finally runs, so a
+      // burst of edits costs one serialization rather than one each.
+      pendingPersist = () => {
+        if (!desktopLibrary) return;
+        const next = stateToLibrary(latestState.current, desktopLibrary);
+        desktopLibrary = next;
+        desktopWriteQueue = desktopWriteQueue.catch(() => {}).then(() => bridge.writeStore(next));
+      };
+      const now = performance.now();
+      if (!persistDirtySince) persistDirtySince = now;
+      if (persistTimer !== null) window.clearTimeout(persistTimer);
+      const wait = Math.max(0, Math.min(PERSIST_DEBOUNCE_MS, PERSIST_MAX_WAIT_MS - (now - persistDirtySince)));
+      persistTimer = window.setTimeout(() => {
+        persistTimer = null;
+        // Held while a backend operation runs; the rebased state it commits
+        // when done schedules a fresh save that includes this edit.
+        if (backendSyncDepth > 0) return;
+        void flushPendingWrite();
+      }, wait);
       return;
     }
     try {
@@ -615,30 +887,6 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
   }, [state, hydrated]);
 
   const set = useCallback((fn: (s: AllsightState) => AllsightState) => setState(fn), []);
-  const setMediaPreview = useCallback((id: string, url: string, previewSize = 160) => {
-    rememberMemoryPreview(id, url, previewSize).forEach((evictedId) => evictedPreviews.current.add(evictedId));
-    queuedPreviews.current.set(id, { url, previewSize });
-    if (previewFrame.current !== null) return;
-    previewFrame.current = window.requestAnimationFrame(() => {
-      previewFrame.current = null;
-      const updates = queuedPreviews.current;
-      const evicted = evictedPreviews.current;
-      queuedPreviews.current = new Map();
-      evictedPreviews.current = new Set();
-      if (!updates.size) return;
-      skipPersist.current = true;
-      setState((current) => ({
-        ...current,
-        media: current.media.map((media) => {
-          const update = updates.get(media.id);
-          if (evicted.has(media.id) && !update) return { ...media, url: "", previewSize: 0 };
-          return update && (media.url !== update.url || (media.previewSize ?? 0) < update.previewSize)
-            ? { ...media, url: update.url, previewSize: update.previewSize }
-            : media;
-        }),
-      }));
-    });
-  }, []);
   const setMediaDimensions = useCallback((id: string, width: number, height: number) => {
     if (!width || !height) return;
     queuedDimensions.current.set(id, { width, height });
@@ -668,7 +916,6 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
     return {
       state,
       set,
-      setMediaPreview,
       setMediaDimensions,
       reset: () => setState(buildEmptyState()),
       updateMedia: (id, patch) =>
@@ -717,10 +964,11 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           ...s,
           media: s.media.map((m) => (m.id === id ? { ...m, hidden: false } : m)),
         })),
-      purgeMedia: (id) =>
+      purgeMedia: (id, options) =>
         set((s) => ({
           ...s,
           media: s.media.filter((m) => m.id !== id),
+          removedMediaIds: options?.remember && !s.removedMediaIds.includes(id) ? [...s.removedMediaIds, id] : s.removedMediaIds,
           groups: s.groups
             .map((g) => ({ ...g, memberIds: g.memberIds.filter((x) => x !== id) }))
             .filter((g) => g.memberIds.length > 0),
@@ -759,13 +1007,8 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       syncMediaLocation: async () => {
         const bridge = getInDeckBridge();
         if (!bridge) return { moved: 0, renamed: 0, skipped: 0, conflicts: 0 };
-        const result = await bridge.syncMediaLocations();
-        const snapshot = await bridge.readLibrarySnapshot();
-        if (snapshot.library && typeof snapshot.library === "object") {
-          desktopLibrary = snapshot.library as Record<string, any>;
-          skipPersist.current = true;
-          setState(libraryToState(desktopLibrary));
-        }
+        const result = await reloadFromBackend(() => bridge.syncMediaLocations());
+        if (!result) return { moved: 0, renamed: 0, skipped: 0, conflicts: 0 };
         return {
           moved: result.moved?.length ?? 0,
           renamed: result.renamed?.length ?? 0,
@@ -1032,7 +1275,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             media: discardSource
               ? s.media.map((media) => {
                 const target = moved.get(media.path.toLocaleLowerCase());
-                return target ? { ...media, sourceId: discardSource.id, path: target, url: fileUrl(target), originalUrl: fileUrl(target) } : media;
+                return target ? { ...media, sourceId: discardSource.id, path: target, originalUrl: fileUrl(target) } : media;
               })
               : s.media,
             folders: s.folders.filter((item) => item.id !== id).map(remapFolder),
@@ -1139,6 +1382,19 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             mediaIds: folder.mediaIds.filter((id) => id !== mediaId),
             coverId: folder.coverId === mediaId ? (folder.mediaIds.find((id) => id !== mediaId) ?? null) : folder.coverId,
             discardedMediaIds: [...new Set([...(folder.discardedMediaIds ?? []), mediaId])],
+          }),
+        })),
+      setFavorite: (ids, favorite) =>
+        set((s) => {
+          const chosen = new Set(ids);
+          return { ...s, media: s.media.map((m) => (chosen.has(m.id) && m.favorite !== favorite ? { ...m, favorite } : m)) };
+        }),
+      purgeFromFolderTrash: (folderId, mediaId) =>
+        set((s) => ({
+          ...s,
+          folders: s.folders.map((folder) => folder.id !== folderId ? folder : {
+            ...folder,
+            discardedMediaIds: (folder.discardedMediaIds ?? []).filter((id) => id !== mediaId),
           }),
         })),
       restoreFromFolderTrash: (folderId, mediaId) =>
@@ -1346,9 +1602,10 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             path: String(asset.path ?? ""),
             sourceId: id,
             type: asset.type === "video" ? "video" : "image",
-            url: "",
-            originalUrl: asset.contentUrl ? String(asset.contentUrl) : fileUrl(String(asset.path ?? "")),
+                originalUrl: asset.contentUrl ? String(asset.contentUrl) : fileUrl(String(asset.path ?? "")),
             modified: Number(asset.modified ?? 0),
+            size: Number(asset.size ?? 0),
+            ...(asset.duration !== undefined ? { duration: Number(asset.duration) } : {}),
             vault: Boolean(asset.vault),
             contentUrl: asset.contentUrl ? String(asset.contentUrl) : undefined,
             width: Number(asset.width ?? 4),
@@ -1361,10 +1618,13 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           }));
           const known = new Set(s.media.map((media) => media.id));
           const media = [...s.media, ...incoming.filter((media) => !known.has(media.id))];
+          const reAdded = new Set(incoming.map((media: MediaItem) => media.id));
           const incomingIds = media.filter((item) => item.sourceId === id).map((item) => item.id);
           const knownOrder = new Set(s.order.filter((entry) => entry.kind === "media").map((entry) => entry.id));
           return {
             ...s,
+            // Adding the folder on purpose brings back media deleted from it.
+            removedMediaIds: s.removedMediaIds.filter((removedId) => !reAdded.has(removedId)),
             sources: concurrent ? s.sources : [...s.sources, source],
             // Gallery renders from `order`, not directly from `media`.
             // Include freshly scanned files immediately so reopening the app
@@ -1449,15 +1709,17 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           const propertyIds = s.propertyGroups.map((group) => group.id);
           const incoming = scanned.map((asset: Record<string, any>): MediaItem => ({
             id: String(asset.id), name: String(asset.name ?? "Untitled media"), path: String(asset.path ?? ""), sourceId: id,
-            type: asset.type === "video" ? "video" : "image", url: "",
+            type: asset.type === "video" ? "video" : "image",
             originalUrl: asset.contentUrl ? String(asset.contentUrl) : fileUrl(String(asset.path ?? "")),
-            modified: Number(asset.modified ?? 0), vault: Boolean(asset.vault), contentUrl: asset.contentUrl ? String(asset.contentUrl) : undefined,
+            modified: Number(asset.modified ?? 0), size: Number(asset.size ?? 0), ...(asset.duration !== undefined ? { duration: Number(asset.duration) } : {}), vault: Boolean(asset.vault), contentUrl: asset.contentUrl ? String(asset.contentUrl) : undefined,
             width: Number(asset.width ?? 4), height: Number(asset.height ?? 3), favorite: false, hidden: false, notes: "",
             props: Object.fromEntries(propertyIds.map((propertyId) => [propertyId, []])), createdAt: Number(asset.modified ?? Date.now()),
           }));
           const known = new Set(s.media.map((media) => media.id));
           const knownPaths = new Set(s.media.map((media) => normalize(media.path)));
           const accepted = incoming.filter((media) => !known.has(media.id) && !knownPaths.has(normalize(media.path)));
+          // Adding the folder on purpose brings back media deleted from it.
+          const acceptedIds = new Set(accepted.map((media: MediaItem) => media.id));
           const knownOrder = new Set(s.order.filter((entry) => entry.kind === "media").map((entry) => entry.id));
           return {
             ...s,
@@ -1467,6 +1729,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
             // scanned media must be represented in the order immediately.
             order: [...s.order, ...accepted.filter((media) => !knownOrder.has(media.id)).map((media) => ({ kind: "media" as const, id: media.id }))],
             mainSourceIds: [...new Set([...s.mainSourceIds, id])],
+            removedMediaIds: s.removedMediaIds.filter((removedId) => !acceptedIds.has(removedId)),
           };
         });
         return "added";
@@ -1485,33 +1748,36 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           order: stillManaged ? s.order : s.order.filter((entry) => !(entry.kind === "media" && removed.has(entry.id))),
         };
       }),
-      createGroup: (memberIds) =>
+      createGroup: (memberIds, anchorId) =>
         set((s) => {
           if (memberIds.length === 0) return s;
           const id = uid("g");
-          const lastSelectedId = memberIds.at(-1)!;
-          const lastSelectedIdx = s.order.findIndex(
-            (e) =>
-              (e.kind === "media" && e.id === lastSelectedId) ||
-              (e.kind === "group" && s.groups.find((g) => g.id === e.id)?.memberIds.includes(lastSelectedId)),
+          const members = new Set(memberIds);
+          const anchor = anchorId ?? memberIds.at(-1)!;
+          // Sets instead of nested scans: the old version compared every
+          // order entry against every other one, which is quadratic in the
+          // size of the Library and froze large Galleries for seconds.
+          const groupHoldingAnchor = s.groups.find((g) => g.memberIds.includes(anchor))?.id;
+          const anchorIdx = s.order.findIndex(
+            (e) => (e.kind === "media" && e.id === anchor) || (e.kind === "group" && e.id === groupHoldingAnchor),
           );
           const groups = s.groups
-            .map((g) => ({ ...g, memberIds: g.memberIds.filter((m) => !memberIds.includes(m)) }))
+            .map((g) => (g.memberIds.some((m) => members.has(m)) ? { ...g, memberIds: g.memberIds.filter((m) => !members.has(m)) } : g))
             .filter((g) => g.memberIds.length > 0);
-          let order = s.order.filter(
-            (e) =>
-              !(e.kind === "media" && memberIds.includes(e.id)) &&
-              !(e.kind === "group" && !groups.some((g) => g.id === e.id)),
-          );
-          // Keep a newly created group where the user finished selecting,
-          // rather than letting it drift to the first selected item/end.
-          const insertAt = lastSelectedIdx < 0
-            ? order.length
-            : s.order.slice(0, lastSelectedIdx).filter((entry) => order.some((kept) => kept.kind === entry.kind && kept.id === entry.id)).length;
+          const survivingGroups = new Set(groups.map((g) => g.id));
+          const kept = (e: OrderEntry) => (e.kind === "media" ? !members.has(e.id) : survivingGroups.has(e.id));
+          let order = s.order.filter(kept);
+          // The Group takes the place of the anchor card: everything that
+          // stays and sat before it in the old order stays before the Group.
+          let insertAt = order.length;
+          if (anchorIdx >= 0) {
+            insertAt = 0;
+            for (let index = 0; index < anchorIdx; index += 1) if (kept(s.order[index]!)) insertAt += 1;
+          }
           order = [...order.slice(0, insertAt), { kind: "group" as const, id }, ...order.slice(insertAt)];
           return {
             ...s,
-            groups: [...groups, { id, memberIds, collapsed: false, coverId: null }],
+            groups: [...groups, { id, name: "", memberIds, collapsed: false, coverId: null }],
             order,
           };
         }),
@@ -1538,6 +1804,34 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           const index = Math.max(0, Math.min(adjusted, without.length));
           const memberIds = [...without.slice(0, index), mediaId, ...without.slice(index)];
           return { ...s, groups: s.groups.map((item) => item.id === groupId ? { ...item, memberIds } : item) };
+        }),
+      // One update for the whole batch. Inserting media one at a time would
+      // make every call after the first read an index the previous one had
+      // already shifted, so a multi-media drop landed scattered.
+      insertManyIntoGroup: (groupId, mediaIds, targetIndex) =>
+        set((s) => {
+          const target = s.groups.find((group) => group.id === groupId);
+          if (!target || !mediaIds.length) return s;
+          const moving = new Set(mediaIds);
+          // Keep the order the media already had rather than the click order.
+          const incoming = [...target.memberIds, ...s.order.filter((entry) => entry.kind === "media").map((entry) => entry.id)]
+            .filter((id) => moving.has(id));
+          const ordered = [...new Set(incoming.length ? incoming : mediaIds)];
+          const without = target.memberIds.filter((id) => !moving.has(id));
+          const removedBefore = target.memberIds.slice(0, targetIndex).filter((id) => moving.has(id)).length;
+          const index = Math.max(0, Math.min(targetIndex - removedBefore, without.length));
+          const memberIds = [...without.slice(0, index), ...ordered, ...without.slice(index)];
+          return {
+            ...s,
+            groups: s.groups
+              .map((group) => {
+                if (group.id === groupId) return { ...group, memberIds };
+                const kept = group.memberIds.filter((id) => !moving.has(id));
+                return kept.length === group.memberIds.length ? group : { ...group, memberIds: kept };
+              })
+              .filter((group) => group.id === groupId || group.memberIds.length > 0),
+            order: s.order.filter((entry) => !(entry.kind === "media" && moving.has(entry.id))),
+          };
         }),
       insertIntoGroup: (groupId, mediaId, targetIndex) =>
         set((s) => {
@@ -1618,6 +1912,45 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
           return { ...s, order: [...without.slice(0, clamped), entry, ...without.slice(clamped)] };
         }),
 
+      // One atomic reorder rather than a moveEntry per item: each call would
+      // read an order the previous one had already shifted, so a multi-item
+      // paste would scatter instead of landing as a block.
+      moveEntriesAfter: (target, entries) =>
+        set((s) => {
+          const same = (a: OrderEntry, b: OrderEntry) => a.kind === b.kind && a.id === b.id;
+          const moving = entries.filter((entry) => !same(entry, target));
+          if (!moving.length) return s;
+          const isMoving = (entry: OrderEntry) => moving.some((item) => same(item, entry));
+          const without = s.order.filter((entry) => !isMoving(entry));
+          const at = without.findIndex((entry) => same(entry, target));
+          if (at < 0) return s;
+          // Read the moved entries back out of the original order so they keep
+          // the sequence they had in the Gallery, not the click order.
+          const ordered = s.order.filter(isMoving);
+          return { ...s, order: [...without.slice(0, at + 1), ...ordered, ...without.slice(at + 1)] };
+        }),
+      moveEntriesTo: (entries, targetIndex) =>
+        set((s) => {
+          const same = (a: OrderEntry, b: OrderEntry) => a.kind === b.kind && a.id === b.id;
+          const isMoving = (entry: OrderEntry) => entries.some((item) => same(item, entry));
+          const ordered = s.order.filter(isMoving);
+          if (ordered.length < 2) return s;
+          const without = s.order.filter((entry) => !isMoving(entry));
+          // The index came from the untouched order, so it has to lose the
+          // entries removed ahead of it — the same correction moveEntry makes
+          // for one item, counted for the whole block.
+          const removedBefore = s.order.slice(0, targetIndex).filter(isMoving).length;
+          const at = Math.max(0, Math.min(targetIndex - removedBefore, without.length));
+          return { ...s, order: [...without.slice(0, at), ...ordered, ...without.slice(at)] };
+        }),
+      // Media inside a Group is represented by its Group at top level, so the
+      // plain media entries in the order are exactly the ungrouped ones.
+      pushUngroupedToFront: () =>
+        set((s) => {
+          const loose = s.order.filter((entry) => entry.kind === "media");
+          if (!loose.length || loose.length === s.order.length) return s;
+          return { ...s, order: [...loose, ...s.order.filter((entry) => entry.kind !== "media")] };
+        }),
       resetOrder: () =>
         set((s) => {
           const grouped = new Set(s.groups.flatMap((g) => g.memberIds));
@@ -1650,7 +1983,7 @@ export function AllsightProvider({ children }: { children: ReactNode }) {
       setInspectorAutoOpen: (inspectorAutoOpen) => set((s) => ({ ...s, inspectorAutoOpen })),
       setLightboxFitMedia: (lightboxFitMedia) => set((s) => ({ ...s, lightboxFitMedia })),
     };
-  }, [state, set, setMediaDimensions, setMediaPreview]);
+  }, [state, set, setMediaDimensions]);
 
   // appearance
   useEffect(() => {

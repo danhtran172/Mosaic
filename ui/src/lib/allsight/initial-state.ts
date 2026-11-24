@@ -32,5 +32,6 @@ export function buildEmptyState(): AllsightState {
     mainGalleryLayout: "square",
     inspectorAutoOpen: true,
     lightboxFitMedia: false,
+    removedMediaIds: [],
   };
 }

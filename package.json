@@ -19,7 +19,33 @@
   "dependencies": {
     "electron-updater": "^6.6.2",
     "exiftool-vendored": "^33.0.0",
-    "ffmpeg-static": "^5.3.0"
+    "ffmpeg-static": "^5.3.0",
+    "qrcode": "1.5.4"
+  },
+  "mosaicLicense": {
+    "trialDays": 30,
+    "deviceLimit": 2,
+    "pricing": {
+      "default": { "currency": "USD", "amount": 14.99, "checkoutUrl": "" },
+      "regions": {
+        "VN": { "currency": "VND", "amount": 200000, "checkoutUrl": "" }
+      }
+    },
+    "bankTransfer": {
+      "regions": ["VN"],
+      "bankBin": "",
+      "bankName": "",
+      "accountNumber": "",
+      "accountName": "",
+      "contact": ""
+    },
+    "licenseServer": "",
+    "recoverUrl": "https://app.lemonsqueezy.com/my-orders",
+    "lemonSqueezy": {
+      "storeId": null,
+      "productId": null
+    },
+    "publicKey": "MCowBQYDK2VwAyEARDZ8tbgVQ3CVw5UwiGSl/HzN7aKuoVh+uZIssDIAq4c="
   },
   "build": {
     "appId": "com.danhtran.mosaic",

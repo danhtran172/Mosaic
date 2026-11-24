@@ -6,12 +6,13 @@ export interface MediaItem {
   path: string;
   sourceId: string;
   type: MediaType;
-  url: string;
-  /** Full media URL. Grid rendering must prefer the cached thumbnail in url. */
+  /** Original file URL. Previews come from the shared thumbnail cache instead. */
   originalUrl?: string;
-  /** Pixel edge of the current cached preview; lets a larger card request a sharper variant. */
-  previewSize?: number;
   modified?: number;
+  /** Source file size in bytes; part of the thumbnail cache identity. */
+  size?: number;
+  /** Video length in seconds, read during the scan; 0 when it could not be read. */
+  duration?: number;
   vault?: boolean;
   contentUrl?: string;
   width: number;
@@ -68,9 +69,18 @@ export interface PropertyGroup {
 
 export interface MediaGroup {
   id: string;
+  /** Optional user-facing name. Unnamed groups intentionally have no label. */
+  name: string;
   memberIds: string[];
   collapsed: boolean;
   coverId: string | null;
+  /**
+   * Lay the Group out as a card that is exactly as wide as its members, so it
+   * sits inside an ordinary row beside other cards instead of claiming rows of
+   * its own. Only honoured while the members still fit one row at the current
+   * zoom; otherwise the Group falls back to its full-width frame.
+   */
+  fit?: boolean;
 }
 
 /** A visual collection of Galleries. It never owns media. */
@@ -129,4 +139,9 @@ export interface AllsightState {
   inspectorAutoOpen: boolean;
   /** Lightbox: preserve natural pixels, or enlarge inside a fixed contain box. */
   lightboxFitMedia: boolean;
+  /**
+   * Media deleted from Mosaic for good while its file still sits in a watched
+   * folder. Remembered so the next rescan does not bring it back as new.
+   */
+  removedMediaIds: string[];
 }

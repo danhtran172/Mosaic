@@ -14,11 +14,19 @@ const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp
 
 const ready = profile => Boolean(profile?.initialized && profile?.mediaPath);
 const isRecycleBinPath = value => /(?:^|[\\/])\$recycle\.bin(?:[\\/]|$)/i.test(String(value || ''));
-const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
+// Only a missing file falls back. A locked or damaged file throws: returning
+// the fallback here used to be written straight back over the real library.
+function readJson(file, fallback) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
+  return JSON.parse(text.replace(/^﻿/, ''));
+}
 function writeJson(file, value) {
   const temp = `${file}.${process.pid}.tmp`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(temp, JSON.stringify(value, null, 2));
+  try { fs.copyFileSync(file, `${file}.bak`); } catch { /* First write: nothing to back up. */ }
   fs.renameSync(temp, file);
 }
 function registryPath() { return registryPaths.find(file => fs.existsSync(file)) || registryPaths[0]; }

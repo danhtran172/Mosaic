@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mosaic-license",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "vars": {
+    // Bank-transfer price, in VND. Keep it equal to package.json → mosaicLicense.pricing.regions.VN.amount.
+    "PRICE_VND": "200000",
+    // Devices one purchase covers.
+    "DEVICE_LIMIT": "2",
+    // The Lemon Squeezy store and product whose keys this server accepts ("" = card sales off).
+    "LS_STORE_ID": "",
+    "LS_PRODUCT_ID": ""
+  },
+  // Secrets (wrangler secret put …, never in this file):
+  //   SIGNING_KEY       Ed25519 private key, PKCS#8 PEM — the one scripts/issue-license.cjs uses
+  //   ADMIN_TOKEN       bearer token for /v1/admin/*
+  //   SEPAY_API_KEY     API key SePay sends with its webhook
+  //   LS_WEBHOOK_SECRET Lemon Squeezy webhook signing secret
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mosaic-license",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "./migrations"
+    }
+  ]
+}

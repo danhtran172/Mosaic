@@ -204,6 +204,11 @@
 @utility app-scroll {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in oklab, var(--foreground) 10%, transparent) transparent;
+  /* Every scrollable pane owns its wheel gesture. Without this a pane that has
+     reached its end — or that is too short to scroll at all — hands the wheel
+     to whatever scroller sits behind it, which is why scrolling over the nav
+     also moved the Gallery. */
+  overscroll-behavior: contain;
 }
 
 @utility no-drag {

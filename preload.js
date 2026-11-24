@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('vision', {
   deleteProfile: (profileId, typedName, replacementDefaultId) => ipcRenderer.invoke('profiles:delete', profileId, typedName, replacementDefaultId),
   listDiscardedProfiles: () => ipcRenderer.invoke('profiles:discarded-list'),
   recoverProfile: profileId => ipcRenderer.invoke('profiles:recover', profileId),
+  permanentlyDeleteProfile: (profileId, typedName) => ipcRenderer.invoke('profiles:permanently-delete', profileId, typedName),
   libraryLocationStatus: (profileId, folder) => ipcRenderer.invoke('profiles:library-location-status', profileId, folder),
   configureProfileLibrary: (profileId, folder, useExisting) => ipcRenderer.invoke('profiles:configure-library', profileId, folder, useExisting),
   recoverProfileLibrary: profileId => ipcRenderer.invoke('profiles:recover-library', profileId),
@@ -40,6 +41,9 @@ contextBridge.exposeInMainWorld('vision', {
   removeCachedSource: sourceId => ipcRenderer.invoke('source:catalog-remove', sourceId),
   resolveSource: source => ipcRenderer.invoke('source:resolve', source),
   ensureThumbnails: (assets, requestId) => ipcRenderer.invoke('thumbnails:ensure', assets, requestId),
+  thumbnailColors: () => ipcRenderer.invoke('thumbnails:colors'),
+  regenerateThumbnails: assets => ipcRenderer.invoke('thumbnails:regenerate', assets),
+  analyzeThumbnailColors: (assets, requestId) => ipcRenderer.invoke('thumbnails:analyze-colors', assets, requestId),
   cancelThumbnails: requestId => ipcRenderer.invoke('thumbnails:cancel', requestId),
   thumbnailMetrics: () => ipcRenderer.invoke('thumbnails:metrics'),
   listVaultBridges: () => ipcRenderer.invoke('vault:bridges'),
@@ -51,12 +55,35 @@ contextBridge.exposeInMainWorld('vision', {
     ipcRenderer.on('folder:changed', listener);
     return () => ipcRenderer.removeListener('folder:changed', listener);
   },
+  onMediaDimensions: callback => {
+    const listener = (_, dimensions) => callback(dimensions);
+    ipcRenderer.on('media:dimensions', listener);
+    return () => ipcRenderer.removeListener('media:dimensions', listener);
+  },
   onMediaImported: callback => {
     const listener = (_, payload) => callback(payload);
     ipcRenderer.on('media:imported', listener);
     return () => ipcRenderer.removeListener('media:imported', listener);
   },
+  licenseStatus: () => ipcRenderer.invoke('license:status'),
+  activateLicense: (key, email) => ipcRenderer.invoke('license:activate', key, email),
+  recoverLicense: () => ipcRenderer.invoke('license:recover'),
+  deactivateLicense: () => ipcRenderer.invoke('license:deactivate'),
+  buyLicense: () => ipcRenderer.invoke('license:buy'),
+  bankTransfer: email => ipcRenderer.invoke('license:bank-transfer', email),
+  licenseOrderStatus: (code, email) => ipcRenderer.invoke('license:order-status', code, email),
+  licenseDevices: credentials => ipcRenderer.invoke('license:devices', credentials),
+  removeLicenseDevice: (machine, credentials) => ipcRenderer.invoke('license:remove-device', machine, credentials),
+  onLicenseChanged: callback => {
+    const listener = (_, status) => callback(status);
+    ipcRenderer.on('license:changed', listener);
+    return () => ipcRenderer.removeListener('license:changed', listener);
+  },
   copyImage: asset => ipcRenderer.invoke('image:copy', asset),
+  copyText: text => ipcRenderer.invoke('clipboard:write-text', text),
+  copySvg: asset => ipcRenderer.invoke('media:copy-svg', asset),
+  openWith: asset => ipcRenderer.invoke('media:open-with', asset),
+  startDrag: (assets, icon) => ipcRenderer.send('media:start-drag', { assets, icon }),
   showInFolder: asset => ipcRenderer.invoke('image:show-in-folder', asset),
   openWithDefaultApp: asset => ipcRenderer.invoke('media:open-default', asset),
   trashMedia: asset => ipcRenderer.invoke('media:trash', asset)

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   Layers,
   Ungroup,
@@ -20,15 +21,15 @@ import {
   Moon,
   Tag,
   Trash2,
-  EyeOff,
-  Eye,
   RefreshCw,
-  RotateCcw,
   X,
-
+  Search,
   PanelLeftClose,
   PanelLeftOpen,
+  BadgeCheck,
+  Sparkles,
 } from "lucide-react";
+import { LicensePanel, formatPrice, useLicense } from "./License";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -40,8 +41,9 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { useAllsight } from "@/lib/allsight/store";
 import { currentMediaDrag, finishMediaDrag } from "@/lib/allsight/media-drag-transfer";
 import { useT } from "@/lib/allsight/i18n";
-import type { GalleryOrderEntry, MediaItem, PersonalFolder } from "@/lib/allsight/types";
+import type { GalleryOrderEntry, PersonalFolder } from "@/lib/allsight/types";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
+import { LazyThumbnail } from "./Thumbnail";
 import { ProfileManager } from "./ProfileManager";
 import { cn } from "@/lib/utils";
 import type { ConfirmRequest } from "./ConfirmDialog";
@@ -72,32 +74,6 @@ async function passwordHash(value: string) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** Trash cards can be the first place a media item is rendered, so request
- * its cached preview here instead of relying on a previously populated URL. */
-function TrashMediaPreview({ media }: { media: MediaItem }) {
-  const { setMediaPreview } = useAllsight();
-  useEffect(() => {
-    if (media.url) return;
-    const bridge = getInDeckBridge();
-    if (!bridge) return;
-    let active = true;
-    void bridge.ensureThumbnails([{
-      id: media.id,
-      path: media.path,
-      type: media.type,
-      modified: media.modified,
-      vault: media.vault,
-      contentUrl: media.contentUrl,
-      thumbnailSize: 160,
-    }]).then((urls) => {
-      if (active && urls[media.id]) setMediaPreview(media.id, urls[media.id]!, 160);
-    });
-    return () => { active = false; };
-  }, [media, setMediaPreview]);
-
-  if (media.url) return <img src={media.url} alt="" className="size-full object-cover opacity-70 grayscale-[.15]" />;
-  return <span className="grid size-full place-items-center bg-muted/55 text-xs text-muted-foreground">Đang tải preview…</span>;
-}
 
 export function Sidebar({
   view,
@@ -109,6 +85,8 @@ export function Sidebar({
   onManageTags,
   onOpenExtensionManage,
   onOpenTrash,
+  onMediaMovedFromSelection,
+  mainGalleryCount,
 }: {
   view: View;
   unlockedFolderIds: string[];
@@ -119,6 +97,12 @@ export function Sidebar({
   onManageTags: () => void;
   onOpenExtensionManage: () => void;
   onOpenTrash: () => void;
+  /** A card drag dropped here finished moving Gallery media out of the
+   * Library's current selection; that selection is now stale and must clear
+   * the same way the equivalent in-Gallery "Add to Gallery" actions do. */
+  onMediaMovedFromSelection: () => void;
+  /** How many media Main Gallery actually shows under the current rules. */
+  mainGalleryCount: number;
 }) {
   const t = useT();
   const [appDisplayName, setAppDisplayName] = useState("Mosaic");
@@ -144,18 +128,11 @@ export function Sidebar({
     setRequirePasswordToUnlockGallery,
     setAppearance,
     setThemeColor,
-    toggleExcludedFolder,
     syncMediaLocation,
-    restoreMedia,
-    restoreFromFolderTrash,
-    purgeMedia,
-    restoreFolder,
-    purgeFolder,
     updateGalleryGroup,
     createGalleryGroup,
     addGalleryToGroup,
     moveGalleryEntry,
-    moveGalleryInGroup,
     removeGalleryFromGroup,
     attachSourceFolder,
     createPropertyValue,
@@ -181,10 +158,9 @@ export function Sidebar({
   const [securityOpen, setSecurityOpen] = useState(false);
   const [enableAppLockAfterPassword, setEnableAppLockAfterPassword] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [licenseOpen, setLicenseOpen] = useState(false);
+  const [license, setLicense] = useLicense();
   const [profilesOpen, setProfilesOpen] = useState(false);
-  const [discardOpen, setDiscardOpen] = useState(false);
-  const [trashSelection, setTrashSelection] = useState<string[]>([]);
-  const [excludeOpen, setExcludeOpen] = useState(false);
   const [syncResult, setSyncResult] = useState<{ moved: number; renamed: number; skipped: number; conflicts: number } | null>(null);
   const [pwd, setPwd] = useState("");
   const [pwdCurrent, setPwdCurrent] = useState("");
@@ -193,20 +169,55 @@ export function Sidebar({
   const [noGalleryPasswordConfirmOpen, setNoGalleryPasswordConfirmOpen] = useState(false);
   const [noGalleryPassword, setNoGalleryPassword] = useState("");
   const [noGalleryPasswordError, setNoGalleryPasswordError] = useState("");
+  const [navSearchOpen, setNavSearchOpen] = useState(false);
+  const [navSearchQuery, setNavSearchQuery] = useState("");
+  const [navSearchDropActive, setNavSearchDropActive] = useState(false);
+  const [galleryPicker, setGalleryPicker] = useState<{ mediaIds: string[]; sourceFolderId: string | null } | null>(null);
+  const [pickerQuery, setPickerQuery] = useState("");
+  const navSearchRef = useRef<HTMLButtonElement>(null);
+  const navSearchInputRef = useRef<HTMLInputElement>(null);
+  // A card dragged with the pointer (not HTML5 drag-and-drop) is captured here
+  // while it hovers the search field, so the drop still resolves even though
+  // the shared drag payload is cleared by whoever handles pointerup first.
+  const navSearchPayload = useRef<{ mediaIds: string[]; sourceFolderId: string | null } | null>(null);
 
-  const toggleTrashSelection = (event: React.MouseEvent, key: string) => {
-    if (event.ctrlKey || event.metaKey) {
-      setTrashSelection((selected) => selected.includes(key) ? selected.filter((item) => item !== key) : [...selected, key]);
-      return;
-    }
-    setTrashSelection([key]);
+  // Other screens (the Library board, its empty state) open the same
+  // "New Gallery" dialog instead of pointing at the + button.
+  useEffect(() => {
+    const open = () => { setNewFolderNameError(null); setNewFolder({ name: "", nameMode: "required", sourcePaths: [], notes: "", autoTags: {} }); };
+    window.addEventListener("mosaic:new-gallery", open);
+    return () => window.removeEventListener("mosaic:new-gallery", open);
+  }, []);
+
+  const openGalleryPicker = (payload: { mediaIds: string[]; sourceFolderId: string | null }) => {
+    if (!payload.mediaIds.length) return;
+    setPickerQuery("");
+    setNavSearchDropActive(false);
+    setGalleryPicker(payload);
   };
 
-
-  const coverFor = (f: PersonalFolder) => {
-    const id = f.coverId ?? f.mediaIds[0];
-    const media = state.media.find((m) => m.id === id);
-    return media?.url || media?.originalUrl || media?.contentUrl || null;
+  const mediaById = useMemo(() => new Map(state.media.map((media) => [media.id, media])), [state.media]);
+  const coverFor = (f: PersonalFolder) => mediaById.get(f.coverId ?? f.mediaIds[0] ?? "") ?? null;
+  // What each Gallery actually shows: references to media that no longer
+  // exist, or that are hidden, are not counted.
+  const galleryCount = (f: PersonalFolder) => {
+    let count = 0;
+    for (const id of f.mediaIds) {
+      const media = mediaById.get(id);
+      if (media && !media.hidden) count += 1;
+    }
+    return count;
+  };
+  const isSessionLocked = (f: PersonalFolder) => f.locked && !unlockedFolderIds.includes(f.id);
+  // Turning a Gallery's lock off is as good as opening it, so while it is
+  // still locked and protected by the password, it has to be opened first.
+  const toggleGalleryLock = (f: PersonalFolder) => {
+    if (f.locked && isSessionLocked(f) && state.password && state.requirePasswordToUnlockGallery) {
+      onView({ kind: "folder", id: f.id });
+      toast.info(c("Mở khóa Gallery bằng mật khẩu trước khi gỡ khóa.", "Unlock the Gallery with the password before removing its lock."));
+      return;
+    }
+    updateFolder(f.id, { locked: !f.locked });
   };
 
   const folderMenu = (f: PersonalFolder) => {
@@ -238,7 +249,7 @@ export function Sidebar({
       <ContextMenuItem className={menuItem} onSelect={() => setAutoTagFolder(f)}>
         <Tag className="size-4" /> {t("autoTagsConfig")}
       </ContextMenuItem>
-      <ContextMenuItem className={menuItem} onSelect={() => updateFolder(f.id, { locked: !f.locked })}>
+      <ContextMenuItem className={menuItem} onSelect={() => toggleGalleryLock(f)}>
         {f.locked ? <LockOpen className="size-4" /> : <Lock className="size-4" />}
         {f.locked ? t("unlockFolder") : t("lockFolder")}
       </ContextMenuItem>
@@ -278,6 +289,66 @@ export function Sidebar({
       </ContextMenuItem>
     </ContextMenuContent>
     );
+  };
+
+  const submitNewFolder = () => {
+    const name = newFolder?.name?.trim();
+    const sourcePaths = newFolder?.sourcePaths ?? [];
+    if (!name) {
+      setNewFolderNameError(sourcePaths.length > 1 ? c("Đã chọn nhiều folder, hãy nhập tên Gallery trước khi tạo.", "Several folders are selected; enter a Gallery name first.") : c("Hãy nhập tên Gallery trước khi tạo.", "Enter a Gallery name first."));
+      return;
+    }
+    const usedNames = new Set(state.folders.map((folder) => folder.name.trim().toLocaleLowerCase()));
+    let galleryName = name;
+    for (let number = 2; usedNames.has(galleryName.toLocaleLowerCase()); number += 1) {
+      galleryName = `${name} (${number})`;
+    }
+    const id = createFolder(galleryName, {
+      sourceIds: [],
+      notes: newFolder?.notes ?? "",
+      autoTags: newFolder?.autoTags ?? {},
+    });
+    setNewFolder(null);
+    setNewFolderNameError(null);
+    onView({ kind: "folder", id });
+    // Every Gallery owns an InDeck-managed Default Source. Extra
+    // Media Sources are scanned independently and never replaced.
+    void ensureFolderDefaultSource(id, galleryName);
+    void Promise.all(sourcePaths.map((path) => attachSourceFolder(id, path)));
+  };
+
+  const confirmNoGalleryPassword = async () => {
+    if (!state.password || await passwordHash(noGalleryPassword) !== state.password) {
+      setNoGalleryPasswordError(t("wrongPassword"));
+      return;
+    }
+    setRequirePasswordToUnlockGallery(false);
+    setNoGalleryPasswordConfirmOpen(false);
+  };
+  const submitPassword = async () => {
+    if (!pwd.trim()) { setPwdError(c("Nhập mật khẩu mới.", "Enter a new password.")); return; }
+    if (pwd !== pwdConfirm) { setPwdError(c("Xác nhận mật khẩu chưa khớp.", "The confirmation does not match.")); return; }
+    if (state.password && await passwordHash(pwdCurrent) !== state.password) { setPwdError(c("Mật khẩu hiện tại không đúng.", "The current password is incorrect.")); return; }
+    const hash = await passwordHash(pwd);
+    setPassword(hash);
+    // Choosing Lock app before a password exists establishes the
+    // shared password and enables lock-on-next-launch, without
+    // interrupting the current session.
+    if (enableAppLockAfterPassword) setAppLockEnabled(true);
+    setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError("");
+    setEnableAppLockAfterPassword(false); setSecurityOpen(false);
+  };
+  const submitRename = () => {
+    const name = renaming?.name.trim();
+    if (!renaming || !name) return;
+    void renameFolder(renaming.id, name);
+    setRenaming(null);
+  };
+  const submitGalleryGroupRename = () => {
+    const name = renamingGalleryGroup?.name.trim();
+    if (!renamingGalleryGroup || !name) return;
+    updateGalleryGroup(renamingGalleryGroup.id, { name });
+    setRenamingGalleryGroup(null);
   };
 
   const galleryGroupMenu = (groupId: string) => {
@@ -373,6 +444,93 @@ export function Sidebar({
     return () => window.removeEventListener("dragend", clearMediaDrop);
   }, []);
 
+  // Dragging towards either end of the nav scrolls it, so a card can reach a
+  // Gallery that is currently off-screen. Both drag flavours are covered: an
+  // HTML5 drag only emits `dragover`, while Mosaic's own card drag is pointer
+  // driven and emits `pointermove`.
+  useEffect(() => {
+    const NAV_EDGE = 56;
+    const NAV_SPEED = 12;
+    let velocity = 0;
+    let frame = 0;
+    const step = () => {
+      frame = 0;
+      const root = navListRef.current;
+      if (!root || !velocity) return;
+      root.scrollTop += velocity;
+      frame = requestAnimationFrame(step);
+    };
+    const track = (clientX: number, clientY: number) => {
+      const root = navListRef.current;
+      if (!root) return;
+      const rect = root.getBoundingClientRect();
+      // A little slack past each end keeps scrolling alive when the pointer
+      // overshoots the list while the user is still holding the card.
+      // Horizontally there is no slack: the nav owns its own column only, so
+      // dragging near the top of the Gallery does not scroll this list too.
+      const withinReach = clientY >= rect.top - 80 && clientY <= rect.bottom + 80
+        && clientX >= rect.left && clientX <= rect.right;
+      velocity = !withinReach ? 0
+        : clientY < rect.top + NAV_EDGE ? -NAV_SPEED
+        : clientY > rect.bottom - NAV_EDGE ? NAV_SPEED
+        : 0;
+      if (velocity && !frame) frame = requestAnimationFrame(step);
+    };
+    const stop = () => { velocity = 0; setMediaDropTarget(null); };
+    // The drop highlight was only ever set from `onDragOver`, an HTML5 event a
+    // pointer-driven card drag never fires. Dropping worked, but no row ever
+    // lit up, so carrying media — one item or a whole selection — over the nav
+    // looked like nothing was droppable there.
+    const highlight = (clientX: number, clientY: number) => {
+      const row = document.elementsFromPoint(clientX, clientY)
+        .map(element => (element as HTMLElement).closest<HTMLElement>('[data-gallery-media-drop-id]'))
+        .find((element): element is HTMLElement => !!element);
+      const next = row?.dataset['galleryMediaDropId'] ?? null;
+      setMediaDropTarget(current => current === next ? current : next);
+    };
+    const onDragOver = (event: DragEvent) => track(event.clientX, event.clientY);
+    const onPointerMove = (event: PointerEvent) => {
+      if (!currentMediaDrag()) return;
+      track(event.clientX, event.clientY);
+      highlight(event.clientX, event.clientY);
+    };
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("dragend", stop);
+    window.addEventListener("drop", stop);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    return () => {
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("dragend", stop);
+      window.removeEventListener("drop", stop);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  // Pointer-driven card drags do not deliver an HTML5 `drop`, so the search
+  // field resolves its own pointerup while the payload captured on hover is
+  // still available.
+  useEffect(() => {
+    const onPointerUp = (event: PointerEvent) => {
+      const payload = navSearchPayload.current;
+      navSearchPayload.current = null;
+      if (!payload) return;
+      const field = navSearchRef.current;
+      const over = field?.getBoundingClientRect();
+      setNavSearchDropActive(false);
+      if (!over) return;
+      const inside = event.clientX >= over.left && event.clientX <= over.right
+        && event.clientY >= over.top && event.clientY <= over.bottom;
+      if (inside) openGalleryPicker(payload);
+    };
+    window.addEventListener("pointerup", onPointerUp);
+    return () => window.removeEventListener("pointerup", onPointerUp);
+  }, []);
+
   const galleryRow = (f: PersonalFolder, nested = false, groupId?: string, entryIndex = 0, memberIndex = 0) => (
     <ContextMenu key={f.id}>
       <ContextMenuTrigger asChild>
@@ -402,6 +560,7 @@ export function Sidebar({
               event.preventDefault();
               event.stopPropagation();
               moveToFolder(f.id, media.mediaIds, media.sourceFolderId);
+              onMediaMovedFromSelection();
               setMediaDropTarget(null);
               finishMediaDrag();
               return;
@@ -445,13 +604,13 @@ export function Sidebar({
         >
           {coverFor(f) ? (
             <span className="relative size-5 shrink-0 overflow-hidden rounded-[5px]">
-              <img src={coverFor(f)!} alt="" className={cn("size-full object-cover", f.locked && !unlockedFolderIds.includes(f.id) && "scale-105 opacity-70 blur-[1px]")} />
+              <LazyThumbnail media={coverFor(f)!} priority thumbnailSize={160} className={cn("size-full object-cover", f.locked && !unlockedFolderIds.includes(f.id) && "scale-105 opacity-70 blur-[1px]")} />
               {f.locked && !unlockedFolderIds.includes(f.id) && <LockOverlay size="sm" />}
             </span>
           ) : <span className="grid size-5 shrink-0 place-items-center rounded-[5px] bg-muted"><Folder className="size-3 text-muted-foreground" /></span>}
           {!collapsed && <>
             <span className="flex-1 truncate text-left">{f.name}</span>
-            {f.locked && !unlockedFolderIds.includes(f.id) ? <Lock className="size-3 text-muted-foreground" /> : <span className="text-xs text-muted-foreground tabular-nums">{f.mediaIds.length}</span>}
+            {isSessionLocked(f) ? <Lock className="size-3 text-muted-foreground" /> : <span className="text-xs text-muted-foreground tabular-nums">{galleryCount(f)}</span>}
           </>}
         </button>
       </ContextMenuTrigger>
@@ -459,6 +618,7 @@ export function Sidebar({
     </ContextMenu>
   );
 
+  const folderById = new Map(state.folders.map((folder) => [folder.id, folder]));
   const groupedGalleryIds = new Set(state.galleryGroups.flatMap((group) => group.folderIds));
   const navEntries: GalleryOrderEntry[] = state.galleryOrder.filter((entry) =>
     entry.kind === "group"
@@ -468,8 +628,12 @@ export function Sidebar({
   const knownNavEntries = new Set(navEntries.map((entry) => `${entry.kind}:${entry.id}`));
   state.galleryGroups.forEach((group) => { if (!knownNavEntries.has(`group:${group.id}`)) navEntries.push({ kind: "group", id: group.id }); });
   state.folders.filter((folder) => !groupedGalleryIds.has(folder.id)).forEach((folder) => { if (!knownNavEntries.has(`folder:${folder.id}`)) navEntries.push({ kind: "folder", id: folder.id }); });
+  const navQuery = navSearchOpen && !collapsed ? navSearchQuery.trim().toLowerCase() : "";
+  const matchingGalleries = navQuery
+    ? state.folders.filter((folder) => folder.name.toLowerCase().includes(navQuery))
+    : [];
   const galleryGroupRow = (group: typeof state.galleryGroups[number], entryIndex: number) => {
-    const members = group.folderIds.map((id) => state.folders.find((folder) => folder.id === id)).filter((folder): folder is PersonalFolder => !!folder);
+    const members = group.folderIds.map((id) => folderById.get(id)).filter((folder): folder is PersonalFolder => !!folder);
     return (
       <ContextMenu key={group.id}>
         <ContextMenuTrigger asChild>
@@ -541,6 +705,60 @@ export function Sidebar({
           )}
         </button>
         <button
+          ref={navSearchRef}
+          onClick={() => {
+            setCollapsed(false);
+            setNavSearchOpen((open) => {
+              if (open) setNavSearchQuery("");
+              else window.setTimeout(() => navSearchInputRef.current?.focus(), 0);
+              return !open;
+            });
+          }}
+          // Dropping cards straight onto the icon asks which Gallery they
+          // belong in, so the nav never has to be scrolled to find it. Both
+          // drag flavours land here: HTML5 drops fire onDrop, while Mosaic's
+          // pointer drag is resolved by the window pointerup handler using the
+          // payload captured here on hover.
+          onDragOver={(event) => {
+            if (!canDropMedia(event)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            setNavSearchDropActive(true);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node)) setNavSearchDropActive(false);
+          }}
+          onDrop={(event) => {
+            const media = draggedMedia(event);
+            if (!media) return;
+            event.preventDefault();
+            event.stopPropagation();
+            navSearchPayload.current = null;
+            openGalleryPicker(media);
+            finishMediaDrag();
+          }}
+          onPointerMove={() => {
+            const media = currentMediaDrag();
+            if (!media) return;
+            navSearchPayload.current = media;
+            setNavSearchDropActive(true);
+          }}
+          onPointerLeave={() => {
+            navSearchPayload.current = null;
+            setNavSearchDropActive(false);
+          }}
+          aria-label={c("Tìm gallery", "Search galleries")}
+          title={c("Tìm gallery — hoặc thả ảnh vào đây để chọn gallery", "Search galleries — or drop media here to pick one")}
+          className={cn(
+            "grid size-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-accent hover:text-accent-foreground",
+            navSearchDropActive
+              ? "scale-110 bg-primary/25 text-foreground ring-2 ring-primary/70"
+              : navSearchOpen ? "bg-primary/15 text-foreground" : "text-muted-foreground",
+          )}
+        >
+          <Search className="size-4" />
+        </button>
+        <button
           onClick={() => setCollapsed((v) => !v)}
           aria-label={collapsed ? t("expandSidebar") : t("collapseSidebar")}
           title={collapsed ? t("expandSidebar") : t("collapseSidebar")}
@@ -549,6 +767,29 @@ export function Sidebar({
           {collapsed ? <PanelLeftOpen className="size-4" /> : <PanelLeftClose className="size-4" />}
         </button>
       </div>
+
+      {navSearchOpen && !collapsed && (
+        <div className="mx-4 mb-2 flex items-center gap-2 rounded-lg border border-border/60 bg-background/40 px-2.5 py-1.5">
+          <Search className="size-3.5 shrink-0 text-muted-foreground" />
+          <input
+            ref={navSearchInputRef}
+            value={navSearchQuery}
+            onChange={(event) => setNavSearchQuery(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Escape") { setNavSearchQuery(""); setNavSearchOpen(false); } }}
+            placeholder={c("Tìm gallery…", "Search galleries…")}
+            className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+          />
+          {navSearchQuery && (
+            <button
+              onClick={() => { setNavSearchQuery(""); navSearchInputRef.current?.focus(); }}
+              aria-label={c("Xoá tìm kiếm", "Clear search")}
+              className="grid size-4 shrink-0 place-items-center rounded text-muted-foreground hover:text-foreground"
+            >
+              <X className="size-3" />
+            </button>
+          )}
+        </div>
+      )}
 
       <div ref={navListRef} className={cn("app-scroll relative min-h-0 flex-1 overflow-y-auto", collapsed ? "px-2" : "px-3")}>
         {!collapsed && (
@@ -588,7 +829,7 @@ export function Sidebar({
             <>
               <span className="flex-1 text-left">{t("allMedia")}</span>
               <span className="text-xs text-muted-foreground tabular-nums">
-                {state.media.filter((m) => !m.hidden).length}
+                {mainGalleryCount}
               </span>
             </>
           )}
@@ -605,24 +846,112 @@ export function Sidebar({
           </button>
         )}
 
-        {navEntries.map((entry, index) => entry.kind === "group"
-          ? galleryGroupRow(state.galleryGroups.find((group) => group.id === entry.id)!, index)
-          : galleryRow(state.folders.find((folder) => folder.id === entry.id)!, false, undefined, index),
-        )}
+        {/* A search collapses the tree to the galleries that match, groups
+            included — nesting is not useful once the list is already a result
+            set, and a flat list keeps every match one click away. */}
+        {navQuery
+          ? (matchingGalleries.length
+            ? matchingGalleries.map((folder, index) => galleryRow(folder, false, undefined, index))
+            : (
+              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                {c("Không có gallery nào khớp", "No galleries match")}
+              </p>
+            ))
+          : navEntries.map((entry, index) => entry.kind === "group"
+            ? galleryGroupRow(state.galleryGroups.find((group) => group.id === entry.id)!, index)
+            : galleryRow(state.folders.find((folder) => folder.id === entry.id)!, false, undefined, index),
+          )}
         {navRail && <span aria-hidden className="pointer-events-none absolute z-40 h-1 rounded-full border border-white/35 bg-primary shadow-[0_0_0_2px_rgb(255_255_255_/_0.16),0_0_12px_hsl(var(--primary))]" style={{ top: navRail.y, left: navRail.left, width: navRail.width }} />}
 
       </div>
+
+      <Dialog open={!!galleryPicker} onOpenChange={(open) => { if (!open) setGalleryPicker(null); }}>
+        <DialogContent className="glass-float rounded-2xl sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {c(
+                `Chuyển ${galleryPicker?.mediaIds.length ?? 0} ảnh vào gallery`,
+                `Move ${galleryPicker?.mediaIds.length ?? 0} item(s) to a gallery`,
+              )}
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-background/40 px-2.5 py-1.5">
+            <Search className="size-3.5 shrink-0 text-muted-foreground" />
+            <input
+              autoFocus
+              value={pickerQuery}
+              onChange={(event) => setPickerQuery(event.target.value)}
+              placeholder={c("Tìm gallery…", "Search galleries…")}
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+            />
+          </div>
+          <div className="app-scroll max-h-80 space-y-1 overflow-y-auto pr-1">
+            {state.folders
+              .filter((folder) => folder.name.toLowerCase().includes(pickerQuery.trim().toLowerCase()))
+              .map((folder) => {
+                const cover = coverFor(folder);
+                return (
+                  <button
+                    key={folder.id}
+                    onClick={() => {
+                      if (galleryPicker) {
+                        moveToFolder(folder.id, galleryPicker.mediaIds, galleryPicker.sourceFolderId);
+                        onMediaMovedFromSelection();
+                      }
+                      setGalleryPicker(null);
+                    }}
+                    className="flex w-full items-center gap-3 rounded-xl border border-transparent px-2 py-1.5 text-left transition-colors hover:border-border/60 hover:bg-accent/60"
+                  >
+                    <span className="size-10 shrink-0 overflow-hidden rounded-lg bg-muted">
+                      {cover
+                        ? <LazyThumbnail media={cover} priority thumbnailSize={160} className="size-full object-cover" />
+                        : <Folder className="m-3 size-4 text-muted-foreground" />}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium">{folder.name}</span>
+                      <span className="block text-xs text-muted-foreground">
+                        {isSessionLocked(folder) ? t("locked") : c(`${galleryCount(folder)} ảnh`, `${galleryCount(folder)} items`)}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            {!state.folders.some((folder) => folder.name.toLowerCase().includes(pickerQuery.trim().toLowerCase())) && (
+              <p className="px-2 py-8 text-center text-sm text-muted-foreground">
+                {c("Không có gallery nào khớp", "No galleries match")}
+              </p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {navDrag && navDragPoint && (() => {
         const folder = navDrag.kind === "folder"
           ? state.folders.find((item) => item.id === navDrag.id)
           : state.folders.find((item) => item.id === state.galleryGroups.find((group) => group.id === navDrag.id)?.folderIds[0]);
         const cover = folder && coverFor(folder);
-        return <div aria-hidden className="pointer-events-none fixed z-[90] flex w-44 items-center gap-2 rounded-xl border border-white/30 bg-background/55 px-2 py-1.5 opacity-65 shadow-2xl backdrop-blur-md" style={{ left: navDragPoint.x + 14, top: navDragPoint.y + 14 }}><span className="size-8 shrink-0 overflow-hidden rounded-lg bg-muted">{cover ? <img src={cover} alt="" className="size-full object-cover" /> : <Folder className="m-2 size-4 text-muted-foreground" />}</span><span className="truncate text-xs font-medium">{folder?.name ?? "Gallery group"}</span></div>;
+        return <div aria-hidden className="pointer-events-none fixed z-[90] flex w-44 items-center gap-2 rounded-xl border border-white/30 bg-background/55 px-2 py-1.5 opacity-65 shadow-2xl backdrop-blur-md" style={{ left: navDragPoint.x + 14, top: navDragPoint.y + 14 }}><span className="size-8 shrink-0 overflow-hidden rounded-lg bg-muted">{cover ? <LazyThumbnail media={cover} priority thumbnailSize={160} className="size-full object-cover" /> : <Folder className="m-2 size-4 text-muted-foreground" />}</span><span className="truncate text-xs font-medium">{folder?.name ?? "Gallery group"}</span></div>;
       })()}
 
       {/* Bottom: tags + settings */}
       <div className={cn("shrink-0 space-y-1 border-t border-border/60 p-3", collapsed && "px-2")}>
+        {license?.state === "trial" && (
+          <button
+            type="button"
+            onClick={() => setLicenseOpen(true)}
+            title={c(`Dùng thử còn ${license.trialDaysLeft} ngày · Mua Mosaic`, `${license.trialDaysLeft} trial days left · Buy Mosaic`)}
+            data-license-trial-badge
+            className={cn(itemBase, collapsed && "justify-center px-0", "bg-primary/15 hover:bg-primary/25")}
+          >
+            <Sparkles className="size-4 shrink-0 text-primary" />
+            {!collapsed && (
+              <span className="flex min-w-0 flex-1 items-center justify-between gap-2">
+                <span className="truncate">{c(`Dùng thử · còn ${license.trialDaysLeft} ngày`, `Trial · ${license.trialDaysLeft} days left`)}</span>
+                <span className="shrink-0 text-xs font-medium text-primary">{c("Mua", "Buy")}</span>
+              </span>
+            )}
+          </button>
+        )}
         <button
           onClick={() => setSettingsOpen(true)}
           title={t("settings")}
@@ -726,6 +1055,23 @@ export function Sidebar({
               </div>
             </div>
 
+            {license && license.state !== "development" && (
+              <button
+                onClick={() => { setSettingsOpen(false); setLicenseOpen(true); }}
+                data-license-settings
+                className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
+              >
+                {license.license ? <BadgeCheck className="size-4 text-primary" /> : <Sparkles className="size-4 text-muted-foreground" />}
+                <span className="flex-1 text-left">{c("Bản quyền", "License")}</span>
+                <span className="text-xs text-muted-foreground">
+                  {license.license
+                    ? c("Đã mua", "Purchased")
+                    : license.state === "trial"
+                      ? c(`Dùng thử · còn ${license.trialDaysLeft} ngày`, `Trial · ${license.trialDaysLeft} days left`)
+                      : formatPrice(license)}
+                </span>
+              </button>
+            )}
             <button
               onClick={() => {
                 setSettingsOpen(false);
@@ -816,8 +1162,11 @@ export function Sidebar({
             >
               <RefreshCw className="size-4 text-muted-foreground" />
               <span className="flex-1 text-left">{t("syncMediaLocation")}</span>
+              {/* Skipped was counted but never shown, so media a Vault holds —
+                  which Sync deliberately never moves — looked as though it had
+                  been synced along with everything else. */}
               {syncResult !== null && (
-                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult.moved, ordered: syncResult.renamed })}{syncResult.conflicts ? ` · ${syncResult.conflicts} conflict` : ""}</span>
+                <span className="text-xs text-muted-foreground">{t("syncDone", { count: syncResult.moved, ordered: syncResult.renamed })}{syncResult.skipped ? ` · ${syncResult.skipped} ${c("bỏ qua", "skipped")}` : ""}{syncResult.conflicts ? ` · ${syncResult.conflicts} conflict` : ""}</span>
               )}
             </button>
             <p className="text-xs text-muted-foreground">{t("syncMediaHint")}</p>
@@ -828,221 +1177,15 @@ export function Sidebar({
 
       <ProfileManager open={profilesOpen} onOpenChange={setProfilesOpen} />
 
-      {/* Discard pile */}
-      <Dialog open={discardOpen} onOpenChange={(open) => { setDiscardOpen(open); if (!open) setTrashSelection([]); }}>
-        <DialogContent className="glass-float max-h-[82vh] max-w-4xl overflow-hidden rounded-2xl p-0 sm:max-w-4xl">
-          {(() => {
-            const trashedMedia = state.media.filter((m) => m.hidden);
-            const galleryTrash = state.folders.flatMap((gallery) =>
-              (gallery.discardedMediaIds ?? []).map((mediaId) => ({
-                gallery,
-                media: state.media.find((media) => media.id === mediaId),
-              })).filter((entry): entry is { gallery: PersonalFolder; media: typeof state.media[number] } => !!entry.media),
-            );
-            const total = trashedMedia.length + galleryTrash.length + state.trashFolders.length;
-            const selected = new Set(trashSelection);
-            const restoreSelected = () => {
-              trashSelection.forEach((key) => {
-                if (key.startsWith("folder:")) restoreFolder(key.slice("folder:".length));
-                else if (key.startsWith("media:")) restoreMedia(key.slice("media:".length));
-                else if (key.startsWith("gallery-media:")) {
-                  const [galleryId, mediaId] = key.slice("gallery-media:".length).split(":");
-                  if (galleryId && mediaId) restoreFromFolderTrash(galleryId, mediaId);
-                }
-              });
-              setTrashSelection([]);
-            };
-            const purgeSelected = () => {
-              trashSelection.forEach((key) => {
-                if (key.startsWith("folder:")) purgeFolder(key.slice("folder:".length));
-                else if (key.startsWith("media:")) purgeMedia(key.slice("media:".length));
-                else if (key.startsWith("gallery-media:")) {
-                  const [, mediaId] = key.slice("gallery-media:".length).split(":");
-                  if (mediaId) purgeMedia(mediaId);
-                }
-              });
-              setTrashSelection([]);
-            };
-            return (
-              <div className="flex max-h-[82vh] flex-col">
-                <DialogHeader className="border-b border-border/60 bg-secondary/25 px-6 py-5 text-left">
-                  <div className="flex items-center gap-3">
-                    <span className="grid size-10 place-items-center rounded-xl border border-border/70 bg-background/35 text-muted-foreground shadow-sm">
-                      <Trash2 className="size-4" />
-                    </span>
-                    <div className="min-w-0">
-                      <DialogTitle className="font-display text-lg">{t("discardPile")}</DialogTitle>
-                      <p className="mt-0.5 text-xs text-muted-foreground">
-                        {total ? c(`${total} mục có thể khôi phục`, `${total} recoverable items`) : t("discardEmpty")}
-                      </p>
-                    </div>
-                    {trashSelection.length > 0 && (
-                      <div className="ml-auto flex shrink-0 items-center gap-2">
-                        <span className="hidden text-xs text-muted-foreground sm:inline">{c(`${trashSelection.length} đã chọn`, `${trashSelection.length} selected`)}</span>
-                        <button onClick={restoreSelected} className="glass-btn flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
-                        <button onClick={purgeSelected} className="flex h-8 items-center gap-1.5 rounded-lg border border-destructive/30 px-2.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /> {t("deleteForever")}</button>
-                      </div>
-                    )}
-                  </div>
-                </DialogHeader>
-                {!total ? (
-                  <div className="flex min-h-72 flex-col items-center justify-center gap-3 px-6 text-center">
-                    <span className="grid size-12 place-items-center rounded-2xl bg-secondary/50 text-muted-foreground">
-                      <Trash2 className="size-5" />
-                    </span>
-                    <div>
-                      <p className="text-sm font-medium">{t("discardEmpty")}</p>
-                      <p className="mt-1 text-xs text-muted-foreground">{c("Ảnh ẩn khỏi Gallery và Gallery đã xóa sẽ xuất hiện ở đây.", "Images hidden from Galleries and deleted Galleries appear here.")}</p>
-                    </div>
-                  </div>
-                ) : (
-                <div className="app-scroll space-y-7 overflow-y-auto px-6 py-5">
-                {state.trashFolders.length > 0 && (
-                  <section className="space-y-2">
-                    <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
-                      {t("discardedGalleries")}
-                    </h3>
-                    <div className="grid grid-cols-[repeat(auto-fill,minmax(190px,1fr))] gap-3">
-                      {state.trashFolders.map((f) => (
-                        <div
-                          key={f.id}
-                          onClick={(event) => toggleTrashSelection(event, `folder:${f.id}`)}
-                          className={cn("group cursor-pointer overflow-hidden rounded-xl border border-border/65 bg-secondary/20 transition-colors", selected.has(`folder:${f.id}`) && "border-primary bg-primary/10 ring-1 ring-primary")}
-                        >
-                          <div className="flex aspect-[16/7] items-center justify-center bg-muted/55">
-                            <Folder className="size-8 text-muted-foreground/70" />
-                          </div>
-                          <div className="space-y-3 p-3">
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-medium">{f.name}</p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">{c("Gallery đã xóa", "Deleted Galleries")}</p>
-                            </div>
-                            <div className="flex gap-2">
-                              <button onClick={(event) => { event.stopPropagation(); restoreFolder(f.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium">
-                                <RotateCcw className="size-3.5" /> {t("restore")}
-                              </button>
-                              <button onClick={(event) => { event.stopPropagation(); purgeFolder(f.id); }} title={t("deleteForever")} className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground">
-                                <Trash2 className="size-3.5" />
-                              </button>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                )}
-                {trashedMedia.length > 0 && (
-                  <section className="space-y-2">
-                    <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
-                      {t("discardedMedia")}
-                    </h3>
-                    <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
-                      {trashedMedia.map((m) => (
-                        <div
-                          key={m.id}
-                          onClick={(event) => toggleTrashSelection(event, `media:${m.id}`)}
-                          className={cn("group cursor-pointer overflow-hidden rounded-xl border border-border/65 bg-secondary/20 transition-colors", selected.has(`media:${m.id}`) && "border-primary bg-primary/10 ring-1 ring-primary")}
-                        >
-                          <div className="aspect-[4/3] bg-muted/55"><TrashMediaPreview media={m} /></div>
-                          <div className="space-y-2 p-3">
-                            <p className="truncate text-sm font-medium">{m.name}</p>
-                            <div className="flex gap-2">
-                              <button onClick={(event) => { event.stopPropagation(); restoreMedia(m.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
-                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(m.id); }} title={t("deleteForever")} className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                )}
-                {galleryTrash.length > 0 && (
-                  <section className="space-y-2">
-                    <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">{c("Ảnh ẩn khỏi Gallery", "Images hidden from Galleries")}</h3>
-                    <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
-                      {galleryTrash.map(({ gallery, media }) => (
-                        <div
-                          key={`${gallery.id}:${media.id}`}
-                          onClick={(event) => toggleTrashSelection(event, `gallery-media:${gallery.id}:${media.id}`)}
-                          className={cn("group cursor-pointer overflow-hidden rounded-xl border border-border/65 bg-secondary/20 transition-colors", selected.has(`gallery-media:${gallery.id}:${media.id}`) && "border-primary bg-primary/10 ring-1 ring-primary")}
-                        >
-                          <div className="relative aspect-[4/3] bg-muted/55">
-                            <TrashMediaPreview media={media} />
-                            <span className="absolute left-2 top-2 rounded-md border border-white/15 bg-black/35 px-1.5 py-0.5 text-[10px] text-white backdrop-blur-md">{gallery.name}</span>
-                          </div>
-                          <div className="space-y-2 p-3">
-                            <p className="truncate text-sm font-medium">{media.name}</p>
-                            <div className="flex gap-2">
-                              <button onClick={(event) => { event.stopPropagation(); restoreFromFolderTrash(gallery.id, media.id); }} className="glass-btn flex h-8 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-medium"><RotateCcw className="size-3.5" /> {t("restore")}</button>
-                              <button onClick={(event) => { event.stopPropagation(); purgeMedia(media.id); }} title={c("Bỏ ảnh khỏi Mosaic (không xóa file nguồn)", "Remove image from Mosaic (source file is kept)")} className="grid size-8 place-items-center rounded-lg border border-destructive/25 text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"><Trash2 className="size-3.5" /></button>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </section>
-                )}
-                </div>
-                )}
-              </div>
-            );
-          })()}
-        </DialogContent>
-      </Dialog>
-
-      {/* Excluded collections */}
-      <Dialog open={excludeOpen} onOpenChange={setExcludeOpen}>
-        <DialogContent className="glass-float max-h-[80vh] overflow-y-auto rounded-2xl">
+      {/* License: buy, activate a key, or move it to another computer. */}
+      <Dialog open={licenseOpen} onOpenChange={setLicenseOpen}>
+        <DialogContent className="glass-float max-w-md rounded-2xl">
           <DialogHeader>
-            <DialogTitle className="font-display">{t("excludeLibrary")}</DialogTitle>
+            <DialogTitle className="font-display">{c("Bản quyền Mosaic", "Mosaic license")}</DialogTitle>
           </DialogHeader>
-          <p className="text-xs text-muted-foreground">{t("excludeHint")}</p>
-          <div className="space-y-1.5">
-            {state.folders
-              .filter((f) => state.excludedFolderIds.includes(f.id))
-              .map((f) => (
-                <div key={f.id} className="flex items-center gap-2 rounded-lg border border-border/60 px-2.5 py-1.5">
-                  <EyeOff className="size-4 shrink-0 text-muted-foreground" />
-                  <span className="flex-1 truncate text-sm">{f.name}</span>
-                  <button
-                    onClick={() => toggleExcludedFolder(f.id)}
-                    title={t("deleteForever")}
-                    className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-                  >
-                    <X className="size-3.5" />
-                  </button>
-                </div>
-              ))}
-          </div>
-          {(() => {
-            const available = state.folders.filter((f) => !state.excludedFolderIds.includes(f.id));
-            return (
-              <div className="space-y-1.5">
-                <h3 className="text-[11px] font-semibold tracking-[0.12em] text-muted-foreground uppercase">
-                  {t("addExcluded")}
-                </h3>
-                {available.length === 0 ? (
-                  <p className="text-sm text-muted-foreground">{t("allExcluded")}</p>
-                ) : (
-                  available.map((f) => (
-                    <button
-                      key={f.id}
-                      onClick={() => toggleExcludedFolder(f.id)}
-                      className={cn(itemBase, "border border-border/70 bg-secondary/40 hover:bg-accent/60")}
-                    >
-                      <Eye className="size-4 text-muted-foreground" />
-                      <span className="flex-1 truncate text-left">{f.name}</span>
-                      <Plus className="size-3.5 text-muted-foreground" />
-                    </button>
-                  ))
-                )}
-              </div>
-            );
-          })()}
+          <LicensePanel status={license} onStatus={setLicense} />
         </DialogContent>
       </Dialog>
-
-
 
       {/* New folder dialog */}
       <Dialog open={!!newFolder} onOpenChange={(o) => { if (!o) { setNewFolder(null); setNewFolderNameError(null); } }}>
@@ -1055,6 +1198,7 @@ export function Sidebar({
               autoFocus
               value={newFolder?.name ?? ""}
               onChange={(e) => { setNewFolderNameError(null); setNewFolder((s) => s ? { ...s, name: e.target.value, nameMode: "manual" } : s); }}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitNewFolder(); } }}
               placeholder={(newFolder?.sourcePaths.length ?? 0) > 1 ? c("Nhập tên Gallery (bắt buộc)", "Enter a Gallery name (required)") : c("Tên Gallery", "Gallery name")}
               aria-invalid={Boolean(newFolderNameError)}
               className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
@@ -1069,7 +1213,7 @@ export function Sidebar({
                 <button
                   type="button"
                   onClick={() => void (async () => {
-                    const path = await getInDeckBridge()?.pickFolder();
+                    const path = await getInDeckBridge()?.pickFolder().catch(() => null);
                     if (!path) return;
                     const normalized = path.replace(/[\\/]+$/, "").toLowerCase();
                     setNewFolderNameError(null);
@@ -1097,7 +1241,7 @@ export function Sidebar({
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">{source?.name ?? name}</span>
                       <span className="block truncate text-[11px] text-muted-foreground" title={path}>{path}</span>
-                      <span className="mt-0.5 block text-[11px] text-muted-foreground">{count == null ? "Sẽ scan khi tạo Gallery" : `${count} media`}</span>
+                      <span className="mt-0.5 block text-[11px] text-muted-foreground">{count == null ? c("Sẽ quét khi tạo Gallery", "Scanned when the Gallery is created") : `${count} media`}</span>
                     </span>
                 <button type="button" aria-label={c(`Bỏ ${name}`, `Remove ${name}`)} title={c("Bỏ folder", "Remove folder")} onClick={() => {
                       setNewFolderNameError(null);
@@ -1116,7 +1260,7 @@ export function Sidebar({
                 })}
                 {(newFolder?.sourcePaths.length ?? 0) === 0 && <p className="px-3 py-4 text-center text-xs text-muted-foreground">{c("Chưa có Media Source. Thêm một hoặc nhiều folder.", "No Media Sources yet. Add one or more folders.")}</p>}
               </div>
-              {(newFolder?.sourcePaths.length ?? 0) > 1 && !newFolder?.name.trim() && <p className="text-xs text-amber-500">Đã chọn nhiều folder. Hãy nhập tên Gallery trước khi tạo.</p>}
+              {(newFolder?.sourcePaths.length ?? 0) > 1 && !newFolder?.name.trim() && <p className="text-xs text-amber-500">{c("Đã chọn nhiều folder. Hãy nhập tên Gallery trước khi tạo.", "Several folders are selected. Enter a Gallery name first.")}</p>}
             </section>
             <textarea
               value={newFolder?.notes ?? ""}
@@ -1135,38 +1279,14 @@ export function Sidebar({
                 };
                 return <div key={group.id} className="flex items-start gap-2">
                   <span className="w-24 shrink-0 pt-1.5 truncate text-xs text-muted-foreground">{group.name}</span>
-                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-1.5"><PropertyPicker label={`Thêm Prop ${group.name}`} options={group.values.filter((value) => !values.includes(value)).map((value) => ({ id: value, label: value }))} onSelect={(value) => addValue(value)} onCreate={(value) => addValue(value, true)} trigger={<button type="button" className="glass-btn rounded-md px-2 py-1 text-xs">Thêm Prop…</button>} />{values.map((value) => <Chip key={value} label={value} onRemove={() => setNewFolder((draft) => draft ? { ...draft, autoTags: { ...draft.autoTags, [group.id]: (draft.autoTags[group.id] ?? []).filter((item) => item !== value) } } : draft)} />)}</div></div>
+                  <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-1.5"><PropertyPicker label={`${t("addValue")} ${group.name}`} options={group.values.filter((value) => !values.includes(value)).map((value) => ({ id: value, label: value }))} onSelect={(value) => addValue(value)} onCreate={(value) => addValue(value, true)} trigger={<button type="button" className="glass-btn rounded-md px-2 py-1 text-xs">{t("addValue")}…</button>} />{values.map((value) => <Chip key={value} label={value} onRemove={() => setNewFolder((draft) => draft ? { ...draft, autoTags: { ...draft.autoTags, [group.id]: (draft.autoTags[group.id] ?? []).filter((item) => item !== value) } } : draft)} />)}</div></div>
                 </div>;
               })}
             </section>
           </div>
           <DialogFooter>
             <button
-              onClick={() => {
-                const name = newFolder?.name?.trim();
-                const sourcePaths = newFolder?.sourcePaths ?? [];
-                if (!name) {
-                  setNewFolderNameError(sourcePaths.length > 1 ? "Đã chọn nhiều folder, hãy nhập tên Gallery trước khi tạo." : "Hãy nhập tên Gallery trước khi tạo.");
-                  return;
-                }
-                const usedNames = new Set(state.folders.map((folder) => folder.name.trim().toLocaleLowerCase()));
-                let galleryName = name;
-                for (let number = 2; usedNames.has(galleryName.toLocaleLowerCase()); number += 1) {
-                  galleryName = `${name} (${number})`;
-                }
-                const id = createFolder(galleryName, {
-                  sourceIds: [],
-                  notes: newFolder?.notes ?? "",
-                  autoTags: newFolder?.autoTags ?? {},
-                });
-                setNewFolder(null);
-                setNewFolderNameError(null);
-                onView({ kind: "folder", id });
-                // Every Gallery owns an InDeck-managed Default Source. Extra
-                // Media Sources are scanned independently and never replaced.
-                void ensureFolderDefaultSource(id, galleryName);
-                void Promise.all(sourcePaths.map((path) => attachSourceFolder(id, path)));
-              }}
+              onClick={submitNewFolder}
               className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary"
             >
               {c("Tạo Gallery", "Create Gallery")}
@@ -1185,15 +1305,14 @@ export function Sidebar({
             autoFocus
             value={renaming?.name ?? ""}
             onChange={(e) => setRenaming((f) => (f ? { ...f, name: e.target.value } : f))}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitRename(); } }}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
           <DialogFooter>
             <button
-              onClick={() => {
-                if (renaming) void renameFolder(renaming.id, renaming.name);
-                setRenaming(null);
-              }}
-              className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary"
+              disabled={!renaming?.name.trim()}
+              onClick={submitRename}
+              className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary disabled:cursor-not-allowed disabled:opacity-45"
             >
               {t("save")}
             </button>
@@ -1204,8 +1323,8 @@ export function Sidebar({
       <Dialog open={!!renamingGalleryGroup} onOpenChange={(o) => !o && setRenamingGalleryGroup(null)}>
         <DialogContent className="glass-float rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("rename")}</DialogTitle></DialogHeader>
-          <input autoFocus value={renamingGalleryGroup?.name ?? ""} onChange={(e) => setRenamingGalleryGroup((group) => group ? { ...group, name: e.target.value } : group)} className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" />
-          <DialogFooter><button onClick={() => { if (renamingGalleryGroup?.name.trim()) updateGalleryGroup(renamingGalleryGroup.id, { name: renamingGalleryGroup.name.trim() }); setRenamingGalleryGroup(null); }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">{t("save")}</button></DialogFooter>
+          <input autoFocus value={renamingGalleryGroup?.name ?? ""} onChange={(e) => setRenamingGalleryGroup((group) => group ? { ...group, name: e.target.value } : group)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitGalleryGroupRename(); } }} className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring" />
+          <DialogFooter><button disabled={!renamingGalleryGroup?.name.trim()} onClick={submitGalleryGroupRename} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary disabled:cursor-not-allowed disabled:opacity-45">{t("save")}</button></DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -1228,27 +1347,33 @@ export function Sidebar({
           {importFromGallery && (
             <>
               <p className="text-sm text-muted-foreground">
-                Chọn Gallery nguồn để thêm media vào <span className="font-medium text-foreground">{importFromGallery.name}</span>.
+                {c("Chọn Gallery nguồn để thêm media vào ", "Choose a Gallery to add its media to ")}<span className="font-medium text-foreground">{importFromGallery.name}</span>.
               </p>
               <div className="max-h-72 space-y-1.5 overflow-y-auto pr-1">
-                {state.folders.filter((folder) => folder.id !== importFromGallery.id).map((source) => (
-                  <button
-                    key={source.id}
-                    onClick={() => {
-                      addToFolder(importFromGallery.id, source.mediaIds);
-                      setImportFromGallery(null);
-                    }}
-                    className="glass-btn flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left"
-                  >
-                    <span className="grid size-8 place-items-center rounded-lg bg-secondary/70 text-muted-foreground"><Folder className="size-4" /></span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">{source.name}</span>
-                      <span className="block text-xs text-muted-foreground">{source.mediaIds.length} media</span>
-                    </span>
-                    <Plus className="size-4 text-muted-foreground" />
-                  </button>
-                ))}
-                {state.folders.length <= 1 && <p className="py-8 text-center text-sm text-muted-foreground">Chưa có Gallery khác để nhập.</p>}
+                {state.folders.filter((folder) => folder.id !== importFromGallery.id).map((source) => {
+                  // A locked Gallery's media must not leak out through an
+                  // import before it has been unlocked.
+                  const sealed = isSessionLocked(source);
+                  return (
+                    <button
+                      key={source.id}
+                      disabled={sealed}
+                      onClick={() => {
+                        addToFolder(importFromGallery.id, source.mediaIds.filter((id) => mediaById.has(id)));
+                        setImportFromGallery(null);
+                      }}
+                      className="glass-btn flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <span className="grid size-8 place-items-center rounded-lg bg-secondary/70 text-muted-foreground">{sealed ? <Lock className="size-4" /> : <Folder className="size-4" />}</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">{source.name}</span>
+                        <span className="block text-xs text-muted-foreground">{sealed ? t("locked") : `${galleryCount(source)} media`}</span>
+                      </span>
+                      {!sealed && <Plus className="size-4 text-muted-foreground" />}
+                    </button>
+                  );
+                })}
+                {state.folders.length <= 1 && <p className="py-8 text-center text-sm text-muted-foreground">{c("Chưa có Gallery khác để nhập.", "There is no other Gallery to import from.")}</p>}
               </div>
             </>
           )}
@@ -1259,7 +1384,7 @@ export function Sidebar({
       <Dialog open={!!addSourcesToGallery} onOpenChange={(open) => !open && setAddSourcesToGallery(null)}>
         <DialogContent className="glass-float max-w-lg rounded-2xl">
           <DialogHeader>
-            <DialogTitle className="font-display">Thêm nguồn media</DialogTitle>
+            <DialogTitle className="font-display">{c("Thêm nguồn media", "Add Media Sources")}</DialogTitle>
           </DialogHeader>
           {addSourcesToGallery && (() => {
             const gallery = state.folders.find((folder) => folder.id === addSourcesToGallery.galleryId);
@@ -1267,7 +1392,7 @@ export function Sidebar({
             return (
               <>
                 <p className="text-sm text-muted-foreground">
-                  Chọn một hoặc nhiều Media Source để thêm vào <span className="font-medium text-foreground">{gallery?.name ?? "Gallery"}</span>.
+                  {c("Chọn một hoặc nhiều Media Source để thêm vào ", "Choose one or more Media Sources to add to ")}<span className="font-medium text-foreground">{gallery?.name ?? "Gallery"}</span>.
                 </p>
                 <div className="max-h-72 space-y-1 overflow-y-auto rounded-xl border border-border/65 p-1.5">
                   {availableSources.map((source) => {
@@ -1290,7 +1415,7 @@ export function Sidebar({
                       </button>
                     );
                   })}
-                  {availableSources.length === 0 && <p className="px-2 py-6 text-center text-sm text-muted-foreground">Không còn Media Source nào để thêm.</p>}
+                  {availableSources.length === 0 && <p className="px-2 py-6 text-center text-sm text-muted-foreground">{c("Không còn Media Source nào để thêm.", "There are no more Media Sources to add.")}</p>}
                 </div>
                 <DialogFooter>
                   <button onClick={() => setAddSourcesToGallery(null)} className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-accent">{t("cancel")}</button>
@@ -1305,7 +1430,7 @@ export function Sidebar({
                     }}
                     className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Thêm nguồn đã chọn
+                    {c("Thêm nguồn đã chọn", "Add selected sources")}
                   </button>
                 </DialogFooter>
               </>
@@ -1320,34 +1445,32 @@ export function Sidebar({
       }}>
         <DialogContent className="glass-float rounded-2xl">
           <DialogHeader>
-            <DialogTitle className="font-display">Xác nhận bỏ yêu cầu mật khẩu</DialogTitle>
+            <DialogTitle className="font-display">{c("Xác nhận bỏ yêu cầu mật khẩu", "Stop requiring the password")}</DialogTitle>
           </DialogHeader>
-          <p className="text-sm text-muted-foreground">Nhập mật khẩu ứng dụng để cho phép mở Gallery mà không cần mật khẩu.</p>
+          <p className="text-sm text-muted-foreground">{c("Nhập mật khẩu ứng dụng để cho phép mở Gallery mà không cần mật khẩu.", "Enter the app password to allow opening Galleries without it.")}</p>
           <input
             autoFocus
             type="password"
             value={noGalleryPassword}
             onChange={(event) => { setNoGalleryPassword(event.target.value); setNoGalleryPasswordError(""); }}
+            onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void confirmNoGalleryPassword(); } }}
             placeholder={t("password")}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
           {noGalleryPasswordError && <p className="text-xs text-destructive">{noGalleryPasswordError}</p>}
           <DialogFooter className="gap-2">
-            <button onClick={() => setNoGalleryPasswordConfirmOpen(false)} className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-accent">Hủy</button>
-            <button onClick={() => { void (async () => {
-              if (!state.password || await passwordHash(noGalleryPassword) !== state.password) {
-                setNoGalleryPasswordError("Mật khẩu không đúng.");
-                return;
-              }
-              setRequirePasswordToUnlockGallery(false);
-              setNoGalleryPasswordConfirmOpen(false);
-            })(); }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">Xác nhận</button>
+            <button onClick={() => setNoGalleryPasswordConfirmOpen(false)} className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-accent">{t("cancel")}</button>
+            <button onClick={() => { void confirmNoGalleryPassword(); }} className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">{t("confirm")}</button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       {/* Security dialog */}
-      <Dialog open={securityOpen} onOpenChange={(open) => { setSecurityOpen(open); if (!open) setEnableAppLockAfterPassword(false); }}>
+      <Dialog open={securityOpen} onOpenChange={(open) => {
+        setSecurityOpen(open);
+        // Typed passwords never survive a closed dialog.
+        if (!open) { setEnableAppLockAfterPassword(false); setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError(""); }
+      }}>
         <DialogContent className="glass-float rounded-2xl">
           <DialogHeader>
             <DialogTitle className="font-display">{t("password")}</DialogTitle>
@@ -1373,6 +1496,7 @@ export function Sidebar({
             type="password"
             value={pwdConfirm}
             onChange={(e) => { setPwdConfirm(e.target.value); setPwdError(""); }}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void submitPassword(); } }}
             placeholder={t("confirmNewPassword")}
             className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           />
@@ -1381,7 +1505,7 @@ export function Sidebar({
             {state.password && (
               <button
                 onClick={() => { void (async () => {
-                  if (await passwordHash(pwdCurrent) !== state.password) { setPwdError("Mật khẩu hiện tại không đúng."); return; }
+                  if (await passwordHash(pwdCurrent) !== state.password) { setPwdError(c("Mật khẩu hiện tại không đúng.", "The current password is incorrect.")); return; }
                   onConfirm({
                     title: t("removePassword"),
                     onConfirm: () => {
@@ -1396,19 +1520,7 @@ export function Sidebar({
               </button>
             )}
             <button
-              onClick={() => { void (async () => {
-                if (!pwd.trim()) { setPwdError("Nhập mật khẩu mới."); return; }
-                if (pwd !== pwdConfirm) { setPwdError("Xác nhận mật khẩu chưa khớp."); return; }
-                if (state.password && await passwordHash(pwdCurrent) !== state.password) { setPwdError("Mật khẩu hiện tại không đúng."); return; }
-                const hash = await passwordHash(pwd);
-                setPassword(hash);
-                // Choosing Lock app before a password exists establishes the
-                // shared password and enables lock-on-next-launch, without
-                // interrupting the current session.
-                if (enableAppLockAfterPassword) setAppLockEnabled(true);
-                setPwd(""); setPwdCurrent(""); setPwdConfirm(""); setPwdError("");
-                setEnableAppLockAfterPassword(false); setSecurityOpen(false);
-              })(); }}
+              onClick={() => { void submitPassword(); }}
               className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary"
             >
               {state.password ? t("changePassword") : t("setPassword")}

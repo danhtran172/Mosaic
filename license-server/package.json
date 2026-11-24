@@ -1,0 +1,17 @@
+{
+  "name": "mosaic-license-server",
+  "private": true,
+  "description": "Mosaic license server: activations, devices, bank-transfer orders. Cloudflare Workers + D1.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply mosaic-license --local",
+    "migrate:remote": "wrangler d1 migrations apply mosaic-license --remote",
+    "types": "wrangler types",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "4.147.0"
+  }
+}

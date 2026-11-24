@@ -3,6 +3,7 @@ import { ArrowLeft, Folder, Lock, Search, X } from "lucide-react";
 import { useAllsight } from "@/lib/allsight/store";
 import { cn } from "@/lib/utils";
 import { LockOverlay } from "./LockOverlay";
+import { LazyThumbnail } from "./Thumbnail";
 import { useT } from "@/lib/allsight/i18n";
 
 export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => void; unlockedFolderIds: string[] }) {
@@ -20,8 +21,7 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
   );
   const cover = (id: string) => {
     const folder = state.folders.find((item) => item.id === id);
-    const media = state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0]));
-    return media?.url || media?.originalUrl || media?.contentUrl;
+    return state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0])) ?? null;
   };
   const isLocked = (gallery: { id: string; locked: boolean }) => gallery.locked && !unlockedFolderIds.includes(gallery.id);
   const put = (index: number, id: string) => {
@@ -32,7 +32,7 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
     setExtensionGallerySlots(next);
   };
   return (
-    <div className="flex h-screen flex-col bg-background">
+    <div className="flex h-full min-h-0 flex-col bg-background">
       <header className="glass-panel flex items-center gap-3 rounded-none border-x-0 border-t-0 px-5 py-3">
         <button
           onClick={onBack}
@@ -81,7 +81,7 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
                   <span className="relative grid size-9 shrink-0 overflow-hidden rounded-lg bg-muted">
                     {cover(gallery.id) ? (
                       <>
-                        <img src={cover(gallery.id)} alt="" className={cn("size-full object-cover", isLocked(gallery) && "scale-105 blur-md")} />
+                        <LazyThumbnail media={cover(gallery.id)!} priority thumbnailSize={160} className={cn("size-full object-cover", isLocked(gallery) && "scale-105 blur-md")} />
                         {isLocked(gallery) && <LockOverlay size="sm" />}
                       </>
                     ) : (
@@ -134,7 +134,7 @@ export function ExtensionManage({ onBack, unlockedFolderIds }: { onBack: () => v
                       <span className="relative grid size-24 shrink-0 overflow-hidden rounded-xl bg-muted shadow-lg">
                         {cover(gallery.id) ? (
                           <>
-                            <img src={cover(gallery.id)} alt="" className={cn("size-full object-cover", isLocked(gallery) && "scale-105 blur-md")} />
+                            <LazyThumbnail media={cover(gallery.id)!} priority thumbnailSize={160} className={cn("size-full object-cover", isLocked(gallery) && "scale-105 blur-md")} />
                             {isLocked(gallery) && <LockOverlay size="md" />}
                           </>
                         ) : isLocked(gallery) ? (

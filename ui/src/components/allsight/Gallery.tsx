@@ -1,6 +1,9 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
+  AppWindow,
   Boxes,
+  Code2,
+  Link2,
   Shapes,
   ClipboardPaste,
   Copy,
@@ -14,12 +17,16 @@ import {
   ChevronLeft,
   ChevronRight,
 
+  Group,
   Heart,
   Image as ImageIcon,
   Layers as LayersIcon,
   Maximize2,
   Minimize2,
+  Pencil,
   Play,
+  RefreshCw,
+  Scissors,
   Search,
   Tag,
   Trash2,
@@ -31,6 +38,7 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuShortcut,
   ContextMenuSub,
   ContextMenuSubContent,
   ContextMenuSubTrigger,
@@ -38,9 +46,12 @@ import {
 } from "@/components/ui/context-menu";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useAllsight } from "@/lib/allsight/store";
-import { acquireThumbnail, cachedThumbnail, type ThumbnailResource } from "@/lib/allsight/thumbnail-resource-manager";
+import { LazyThumbnail } from "./Thumbnail";
+import { VideoHoverPreview } from "./VideoHoverPreview";
+import { regenerateThumbnails } from "@/lib/allsight/thumbnail-resource-manager";
 import { beginMediaDrag, finishMediaDrag } from "@/lib/allsight/media-drag-transfer";
 import { getInDeckBridge } from "@/lib/indeck/bridge";
+import { canDragOut, copySvgMarkup, copyText, isSvgMedia, openWithChooser, startExternalDrag } from "@/lib/allsight/designer-tools";
 import { useT } from "@/lib/allsight/i18n";
 import { toast } from "sonner";
 import type { GalleryLayout, MediaItem, OrderEntry } from "@/lib/allsight/types";
@@ -52,8 +63,16 @@ const GAP = 8; // 30% tighter than the 12px base grid
 // Media in an expanded Group always keeps this much clear space from every
 // inner edge of the frame. The border is accounted for separately below.
 const GROUP_PAD = 8;
-const GROUP_BORDER = 2;
+const GROUP_BORDER = 1;
 const GROUP_INSET = GROUP_PAD + GROUP_BORDER;
+// Every Group frame opens with a title band — icon, name, count and its
+// controls — so it reads as one container at a glance and none of those
+// controls ever sits on top of a photo. This is the distance from the frame's
+// outer top edge to its first row of media, the band included.
+const GROUP_HEADER = 24;
+const GROUP_TOP_INSET = GROUP_BORDER + GROUP_HEADER;
+// Vertical room a Group frame takes from a row on top of its media.
+const GROUP_CHROME_Y = GROUP_TOP_INSET + GROUP_INSET;
 // Keep a small safety gutter at row end. Browser sub-pixel rounding can
 // otherwise consume the visual right padding when a Group row fills exactly.
 const GROUP_ROW_END_GUTTER = 8;
@@ -68,13 +87,77 @@ const STACK_TILT = 4;
 const STACK_STEP = 2.5;
 const MAIN_GALLERY_DROP_ID = "__mosaic-main-gallery__";
 const EDGE = 50; // reorder hot zone on each side of a cell
+/**
+ * The reorder hot zone, scaled to the card it belongs to. A fixed 50px ate a
+ * whole card once zoom took it under 100px wide: both edges met in the middle,
+ * so the centre — the hold-to-group target — became unreachable and media
+ * could no longer be dragged onto each other at small zoom levels.
+ */
+function edgeFor(rect: DOMRect) {
+  // A quarter of the card each side leaves half of it as the hold target even
+  // for the narrow portrait cards of the smallest zoom level.
+  return Math.min(EDGE, Math.max(6, rect.width * 0.25));
+}
+/**
+ * Once a hold-to-group has started on a card, the pointer may drift this far
+ * into the card's reorder edges without abandoning it. Holding still for 1.5s
+ * over a small card was otherwise nearly impossible: any tremor reset it.
+ */
+function holdKeepFor(rect: DOMRect) {
+  return Math.max(3, rect.width * 0.08);
+}
 const HOLD_MS = 1500;
-const DWELL_MS = 500; // hovering an insertion point this long widens the gap
-const SPREAD = 22; // extra room opened up on each side once dwelled
 const menuItem = "gap-2";
 
 
-type Row = { height: number; items: { item: MediaItem; width: number }[] };
+/**
+ * One solved cell. `width` is the cell's own box. A member of a fitted Group
+ * also carries its own `height`: the Group's frame takes the full row height
+ * and its media sit inside the frame's chrome, so they are shorter than the
+ * loose cards beside them.
+ */
+type RowItem = { item: MediaItem; width: number; height?: number | undefined };
+type Row = { height: number; items: RowItem[] };
+
+/**
+ * Scroll offset per Gallery, surviving navigation away and back for as long as
+ * the app is open. It lives outside React so that restoring a position is a
+ * plain DOM write during layout rather than another render.
+ */
+const galleryScrollMemory = new Map<string, number>();
+const MAIN_GALLERY_SCROLL_KEY = "__main__";
+
+/** The solved geometry of one virtualized row, in Gallery content coordinates. */
+type PositionedVirtualRow = {
+  top: number;
+  height: number;
+  sectionLabel?: string | undefined;
+  groupId?: string | undefined;
+  cells: { item: MediaItem; width: number; height?: number | undefined; fitGroupId?: string | undefined }[];
+};
+
+/**
+ * Where each card of a row sits, relative to the row's own top-left corner.
+ * Mirrors the flex layout the row is rendered with: a fitted Group's frame
+ * adds its chrome around its members, which the members are inset by.
+ */
+function rowCellBoxes(row: PositionedVirtualRow) {
+  const boxes: { id: string; left: number; top: number; width: number; height: number }[] = [];
+  let x = 0;
+  row.cells.forEach((cell, index) => {
+    const fit = cell.fitGroupId;
+    if (fit && fit !== row.cells[index - 1]?.fitGroupId) x += GROUP_INSET;
+    const height = cell.height ?? row.height;
+    // A fitted Group's frame is the full row height; its members sit below
+    // the title band.
+    const top = fit ? GROUP_TOP_INSET : (row.height - height) / 2;
+    boxes.push({ id: cell.item.id, left: x, top, width: cell.width, height });
+    x += cell.width;
+    if (fit && fit !== row.cells[index + 1]?.fitGroupId) x += GROUP_INSET;
+    x += GAP;
+  });
+  return boxes;
+}
 
 function justifiedMaxHeight(targetHeight: number) {
   return Math.max(100, Math.min(400, targetHeight));
@@ -86,11 +169,34 @@ function mediaRatio(item: MediaItem) {
   return Math.max(0.12, Math.min(8, width / height));
 }
 
+/**
+ * `atomic` names the fitted Group each item belongs to, or undefined for a
+ * loose card. A row may never break between two items that share a name: a
+ * Group set to fit its media has to stay on one row for its frame to mean
+ * anything, and that is also the promise the option makes to the user.
+ */
+type AtomicKey = (index: number) => string | undefined;
+
+/** Would breaking the row before `index` split a fitted Group in half? */
+function splitsGroup(atomic: AtomicKey | undefined, index: number) {
+  if (!atomic || index <= 0) return false;
+  const key = atomic(index);
+  return Boolean(key) && key === atomic(index - 1);
+}
+
 // `extraWidth` reports the horizontal room a cell needs on top of its image
-// width — currently only collapsed Groups, whose frame grows to host the
-// tilted pile. Charging it to the row here keeps the row filling the Gallery
-// exactly instead of spilling past the right edge.
-function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: number, extraWidth?: (item: MediaItem, index: number) => number): Row[] {
+// width — collapsed Groups, whose frame grows to host the tilted pile.
+//
+// Every row is solved exactly: its width is linear in the row height,
+//   width(h) = A·h + B
+// where A is the summed aspect ratio of its media and B collects everything
+// that does not scale with h — the gaps, a pile's extra room, and a fitted
+// Group's frame (2·inset wide, and its members lose GROUP_CHROME_Y of
+// height, i.e. −ratio·GROUP_CHROME_Y of width each). Solving for the height
+// that makes the row exactly as wide as the Gallery keeps every full row
+// flush with both edges. Charging a pile's room to the row but not to the
+// pile's own cell, as before, left each such row short of the right edge.
+function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: number, extraWidth?: (item: MediaItem, index: number) => number, atomic?: AtomicKey): Row[] {
   if (!items.length) return [];
   const maxHeight = justifiedMaxHeight(targetHeight);
   // At 175%/200% the old fixed five-card minimum kept the calculated row
@@ -98,65 +204,94 @@ function equalJustifiedRows(items: MediaItem[], width: number, targetHeight: num
   // cards are allowed as the requested thumbnail height grows.
   const minItemsPerRow = Math.max(1, Math.min(5, Math.floor(width / (maxHeight * 1.25))));
 
-  // Keep at least five cards per regular row, then add more only when needed
-  // to fill a wide Gallery without exceeding the visual max height. A fixed
-  // five-card row plus a height cap leaves a large empty strip for portrait
-  // media whenever Inspector is closed (the usable width is then wider).
-  type Cell = { item: MediaItem; extra: number };
-  const rows: Cell[][] = [];
+  type Cell = { item: MediaItem; ratio: number; extra: number; fit: string | undefined };
+  const rows: { cells: Cell[]; a: number; b: number }[] = [];
   let row: Cell[] = [];
-  let ratio = 0;
-  let extras = 0;
+  let a = 0;
+  let b = 0;
   items.forEach((item, index) => {
-    const extra = extraWidth?.(item, index) ?? 0;
-    row.push({ item, extra });
-    ratio += mediaRatio(item);
-    extras += extra;
-    const gaps = GAP * (row.length - 1);
-    const fillsAtMaxHeight = ratio * maxHeight + gaps + extras >= width;
-    if (row.length >= minItemsPerRow && fillsAtMaxHeight) {
-      rows.push(row);
+    const ratio = mediaRatio(item);
+    const fit = atomic?.(index);
+    const extra = fit ? 0 : extraWidth?.(item, index) ?? 0;
+    if (fit) {
+      b -= ratio * GROUP_CHROME_Y;
+      // The frame's horizontal chrome is paid once per Group per row.
+      if (fit !== row[row.length - 1]?.fit) b += GROUP_INSET * 2;
+    } else b += extra;
+    a += ratio;
+    row.push({ item, ratio, extra, fit });
+    const fillsAtMaxHeight = a * maxHeight + b + GAP * (row.length - 1) >= width;
+    // Never close a row between two members of the same fitted Group.
+    if (row.length >= minItemsPerRow && fillsAtMaxHeight && !splitsGroup(atomic, index + 1)) {
+      rows.push({ cells: row, a, b });
       row = [];
-      ratio = 0;
-      extras = 0;
+      a = 0;
+      b = 0;
     }
   });
-  if (row.length) rows.push(row);
+  if (row.length) rows.push({ cells: row, a, b });
 
-  return rows.map((row) => {
-    const gaps = GAP * (row.length - 1);
-    const rowExtras = row.reduce((sum, cell) => sum + cell.extra, 0);
-    const availableWidth = Math.max(width - gaps - rowExtras, 80);
-    const totalRatio = row.reduce((sum, cell) => sum + mediaRatio(cell.item), 0);
-    const height = Math.min(availableWidth / totalRatio, maxHeight);
+  return rows.map(({ cells, a, b }) => {
+    const gaps = GAP * (cells.length - 1);
+    const solved = (width - gaps - b) / a;
+    // A fitted Group needs some room for its media beneath the chrome.
+    const floor = cells.some((cell) => cell.fit) ? GROUP_CHROME_Y + 24 : 24;
+    const height = Math.max(floor, Math.min(solved, maxHeight));
     return {
       height,
-      items: row.map(({ item }) => ({ item, width: mediaRatio(item) * height })),
+      items: cells.map(({ item, ratio, extra, fit }) => fit
+        ? { item, width: ratio * (height - GROUP_CHROME_Y), height: height - GROUP_CHROME_Y }
+        : { item, width: ratio * height + extra }),
     };
   });
 }
 
-// `fillWidth` makes a complete row span its container exactly instead of
-// leaving a ragged right edge — what a Media Group wants inside its frame.
-// The column count still comes from the requested (zoom) size, so zooming
-// works there too; it is rounded up so the cards end up at or just under the
-// requested size rather than stretching past it.
-function squareRows(items: MediaItem[], width: number, targetHeight: number, fillWidth?: boolean): Row[] {
+// A square row always spans its container exactly. Holding the cards at the
+// requested size and flooring the column count left the leftover width as a
+// dead strip down the right-hand side of the Gallery, which is wider the
+// closer the fit came to fitting one more card.
+// The requested (zoom) size chooses the column count rather than the card
+// size: rounding to the nearest count keeps the cards close to what the user
+// asked for, then they stretch to consume the row.
+function squareRows(items: MediaItem[], width: number, targetHeight: number, atomic?: AtomicKey): Row[] {
   if (!items.length) return [];
-  const requestedSide = Math.max(100, Math.min(400, targetHeight));
-  const perRow = (width + GAP) / (requestedSide + GAP);
-  const columns = Math.max(1, fillWidth ? Math.ceil(perRow) : Math.floor(perRow));
-  const side = fillWidth
-    ? Math.max(1, (width - GAP * (columns - 1)) / columns)
-    : requestedSide;
+  const columns = squareColumns(width, targetHeight);
+  const side = Math.max(1, (width - GAP * (columns - 1)) / columns);
   const rows: Row[] = [];
-  for (let index = 0; index < items.length; index += columns) {
+  let row: { item: MediaItem; fit: string | undefined }[] = [];
+  const flush = () => {
+    if (!row.length) return;
+    // A fitted Group keeps exactly the slots its members would take as loose
+    // cards, so the row stays flush; its chrome comes out of its members.
+    const sizes = new Map<string, number>();
+    row.forEach(({ fit }) => { if (fit) sizes.set(fit, (sizes.get(fit) ?? 0) + 1); });
     rows.push({
       height: side,
-      items: items.slice(index, index + columns).map((item) => ({ item, width: side })),
+      items: row.map(({ item, fit }) => fit
+        ? { item, width: Math.max(1, side - (GROUP_INSET * 2) / sizes.get(fit)!), height: Math.max(1, side - GROUP_CHROME_Y) }
+        : { item, width: side }),
     });
+    row = [];
+  };
+  for (let index = 0; index < items.length; index += 1) {
+    // A fitted Group takes one slot per member, exactly as the same number of
+    // loose cards would. Reserve them all before starting it: closing the row
+    // afterwards instead would either cut the Group in half or push the row
+    // past the budget the current zoom allows.
+    let needed = 1;
+    const key = atomic?.(index);
+    if (key && !splitsGroup(atomic, index)) while (atomic?.(index + needed) === key) needed += 1;
+    if (row.length && row.length + needed > columns) flush();
+    row.push({ item: items[index]!, fit: key });
+    if (row.length >= columns && !splitsGroup(atomic, index + 1)) flush();
   }
+  flush();
   return rows;
+}
+/** How many cards one row holds at this width and zoom — the fit budget. */
+function squareColumns(width: number, targetHeight: number) {
+  const requestedSide = Math.max(100, Math.min(400, targetHeight));
+  return Math.max(1, Math.round((width + GAP) / (requestedSide + GAP)));
 }
 
 function layoutRows(
@@ -164,12 +299,12 @@ function layoutRows(
   width: number,
   targetHeight: number,
   layout: GalleryLayout,
-  fillSquareWidth?: boolean,
   extraWidth?: (item: MediaItem, index: number) => number,
+  atomic?: AtomicKey,
 ) {
   return layout === "justified"
-    ? equalJustifiedRows(items, width, targetHeight, extraWidth)
-    : squareRows(items, width, targetHeight, fillSquareWidth);
+    ? equalJustifiedRows(items, width, targetHeight, extraWidth, atomic)
+    : squareRows(items, width, targetHeight, atomic);
 }
 
 function groupContentWidth(width: number) {
@@ -181,11 +316,8 @@ function groupContentWidth(width: number) {
 
 function groupRows(items: MediaItem[], width: number, targetHeight: number, layout: GalleryLayout) {
   const contentWidth = groupContentWidth(width);
-  // Square is the only Group layout that asks for rows flush with the frame.
-  // Justified must keep its aspect-ratio row algorithm independent of that
-  // square-specific requirement.
   return layout === "square"
-    ? squareRows(items, contentWidth, targetHeight, true)
+    ? squareRows(items, contentWidth, targetHeight)
     : equalJustifiedRows(items, contentWidth, targetHeight);
 }
 
@@ -194,20 +326,6 @@ function thumbnailSizeForBox(width: number, height: number) {
   if (devicePixels <= 160) return 160;
   if (devicePixels <= 320) return 320;
   return 512;
-}
-
-function DragPreviewImage({ media }: { media: MediaItem }) {
-  const sources = [media.url, media.originalUrl, media.contentUrl].filter((value, index, all): value is string => Boolean(value) && all.indexOf(value) === index);
-  const [sourceIndex, setSourceIndex] = useState(0);
-  useEffect(() => setSourceIndex(0), [media.id]);
-  const source = sources[sourceIndex];
-  if (!source) return <span className="grid size-full place-items-center bg-muted text-xs text-muted-foreground">Preview</span>;
-  return <img src={source} alt="" draggable={false} onError={() => setSourceIndex((index) => Math.min(index + 1, sources.length - 1))} className="size-full object-cover" />;
-}
-function placeholderColor(id: string) {
-  let value = 0;
-  for (let index = 0; index < id.length; index += 1) value = (value * 31 + id.charCodeAt(index)) >>> 0;
-  return `hsl(${value % 360} 28% 32% / 0.72)`;
 }
 
 function stackJitter(id: string) {
@@ -268,15 +386,13 @@ function stackInsets(coverWidth: number, coverHeight: number, count: number) {
   };
 }
 
-// A justified frame may grow, so the cover keeps the full cell size and the
-// frame absorbs the effect. A square frame is locked to the cell, so the
-// cover shrinks until it plus its insets fit. The insets depend on the cover
-// size, so the square case is iterated — it settles within a few rounds
-// because the effect grows far slower than the cover it is measured against.
-function stackFrame(cellWidth: number, cellHeight: number, count: number, grow: boolean) {
-  if (grow) {
-    return { width: cellWidth, height: cellHeight, insets: stackInsets(cellWidth, cellHeight, count) };
-  }
+// The frame is locked to its cell in both layouts, so a collapsed Group is
+// exactly as tall as the media beside it and the pile leans inside the cell
+// rather than pushing the row taller. The cover shrinks until it plus its
+// insets fit. The insets depend on the cover size, so this is iterated — it
+// settles within a few rounds because the effect grows far slower than the
+// cover it is measured against.
+function stackFrame(cellWidth: number, cellHeight: number, count: number) {
   let width = cellWidth;
   let height = cellHeight;
   let insets = stackInsets(width, height, count);
@@ -291,93 +407,18 @@ function stackFrame(cellWidth: number, cellHeight: number, count: number, grow: 
   }
   return { width, height, insets };
 }
-function BitmapThumbnail({ resource, className, style }: { resource: ThumbnailResource; className: string; style?: CSSProperties }) {
-  const canvas = useRef<HTMLCanvasElement>(null);
-  const draw = useCallback(() => {
-    const element = canvas.current;
-    if (!element || !resource.bitmap) return;
-    const box = element.getBoundingClientRect();
-    const scale = window.devicePixelRatio || 1;
-    const width = Math.max(1, Math.round(box.width * scale));
-    const height = Math.max(1, Math.round(box.height * scale));
-    if (element.width !== width || element.height !== height) { element.width = width; element.height = height; }
-    const context = element.getContext("2d", { alpha: false });
-    if (!context) return;
-    context.imageSmoothingEnabled = true;
-    context.imageSmoothingQuality = "high";
-    // A canvas has no CSS object-fit. Crop to cover instead of stretching a
-    // decoded bitmap into the justified cell: a tiny rounding mismatch (or
-    // EXIF orientation) must never visibly deform the photo.
-    const sourceRatio = resource.width / resource.height;
-    const targetRatio = width / height;
-    let sx = 0, sy = 0, sw = resource.width, sh = resource.height;
-    if (sourceRatio > targetRatio) {
-      sw = resource.height * targetRatio;
-      sx = (resource.width - sw) / 2;
-    } else if (sourceRatio < targetRatio) {
-      sh = resource.width / targetRatio;
-      sy = (resource.height - sh) / 2;
-    }
-    context.drawImage(resource.bitmap, sx, sy, sw, sh, 0, 0, width, height);
-  }, [resource]);
-  useLayoutEffect(() => {
-    draw();
-    const element = canvas.current;
-    if (!element) return;
-    const observer = new ResizeObserver(draw);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [draw]);
-  // ImageBitmap is the normal path. Keep a browser-image fallback only for a
-  // codec/GPU that cannot construct a bitmap for a particular media file.
-  if (!resource.bitmap) return <img src={resource.url} alt="" draggable={false} decoding="async" className={className} style={style} />;
-  return <canvas ref={canvas} aria-hidden className={className} style={style} />;
-}
-
-function LazyThumbnail({ media, className, priority = false, thumbnailSize = 320, thumbnailDistance = Number.MAX_SAFE_INTEGER, style }: { media: MediaItem; className: string; priority?: boolean; thumbnailSize?: number; thumbnailDistance?: number; style?: CSSProperties }) {
-  const target = useRef<HTMLSpanElement>(null);
-  const [resource, setResource] = useState<ThumbnailResource | null>(() => cachedThumbnail(media, thumbnailSize));
-
-  useEffect(() => {
-    let active = true;
-    let release = () => {};
-    const load = () => {
-      const lease = acquireThumbnail(media, thumbnailSize, priority, thumbnailDistance);
-      release = lease.release;
-      if (lease.resource) {
-        setResource(lease.resource);
-        return;
-      }
-      void lease.promise.then((next) => {
-        if (!active || !next) return;
-        setResource(next);
-      });
-    };
-    if (priority) {
-      load();
-      return () => {
-        active = false;
-        release();
-      };
-    }
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      observer.disconnect();
-      load();
-    }, { rootMargin: "600px 0px" });
-    if (target.current) observer.observe(target.current);
-    return () => { active = false; observer.disconnect(); release(); };
-  }, [media, priority, thumbnailDistance, thumbnailSize]);
-
-  if (resource) return <BitmapThumbnail resource={resource} className={className} style={style} />;
-  return <span ref={target} className="block size-full animate-pulse" style={{ backgroundColor: placeholderColor(media.id), ...style }} />;
-}
 
 type DropInfo =
-  | { type: "insert"; index: number; axis: "x" | "y" }
-  | { type: "member-insert"; groupId: string; index: number; railMediaId?: string; railSide?: "left" | "right" }
+  /** `railY` places the horizontal rail of a whole-row insertion, in content coordinates. */
+  | { type: "insert"; index: number; axis: "x" | "y"; railY?: number | undefined }
+  | { type: "member-insert"; groupId: string; index: number; railMediaId?: string | undefined; railSide?: "left" | "right" | undefined }
   | { type: "hold"; kind: "group" | "media" | "ungroup"; id: string }
   | null;
+
+const sameDrop = (a: DropInfo, b: DropInfo) => a === b || JSON.stringify(a) === JSON.stringify(b);
+
+/** A vertical slice of the Gallery a dragged expanded Group can land before or after. */
+type GroupBand = { top: number; bottom: number; first: number; last: number; groupId?: string | undefined };
 
 export function Gallery({
   entries,
@@ -409,10 +450,10 @@ export function Gallery({
   const {
     state,
     moveEntry,
+    moveEntriesAfter,
+    moveEntriesTo,
     createGroup,
-    addToGroup,
-    moveGroupMember,
-    insertIntoGroup,
+    insertManyIntoGroup,
     removeFromGroup,
     dissolveGroup,
     updateGroup,
@@ -442,22 +483,58 @@ export function Gallery({
   const pendingScrollTop = useRef(0);
   const committedScrollTop = useRef(0);
   const [drag, setDrag] = useState<OrderEntry | null>(null);
-  const [dragPoint, setDragPoint] = useState<{ x: number; y: number } | null>(null);
+  // Where the pointer was when a drag began. The preview follows the pointer
+  // by itself from there: tracking every pointer move in Gallery state re-
+  // rendered the whole Gallery on each one, which is what made dragging lag.
+  const [dragOrigin, setDragOrigin] = useState<{ x: number; y: number } | null>(null);
   const [dragPreviewId, setDragPreviewId] = useState<string | null>(null);
   const [drop, setDrop] = useState<DropInfo>(null);
   // Keep a single, top-level rail for Library reordering.  Card-local rails
   // are fine for a group, but can be clipped by a justified Library row.
   const [libraryRail, setLibraryRail] = useState<{ x: number; y: number; height: number } | null>(null);
-  const [holdProgress, setHoldProgress] = useState(0);
-  const [dwelled, setDwelled] = useState(false);
+  // When the current hold-to-group began. The ring animates itself from it.
+  const [holdStart, setHoldStart] = useState<number | null>(null);
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  // The card or Group the one shared context menu was opened on.
+  const [menuTarget, setMenuTarget] = useState<{ kind: "media" | "group"; id: string } | null>(null);
   const [clipboard, setClipboard] = useState<Record<string, string[]>>({});
+  // Media waiting to be pasted somewhere else in the order. Deliberately its
+  // own clipboard: `clipboard` above holds copied Property values, and pasting
+  // one must never be mistaken for pasting the other.
+  const [cutEntries, setCutEntries] = useState<OrderEntry[]>([]);
   const [addToGalleryFor, setAddToGalleryFor] = useState<string | null>(null);
   const [moveToGalleryFor, setMoveToGalleryFor] = useState<string | null>(null);
   const [addGroupToGalleryFor, setAddGroupToGalleryFor] = useState<string[] | null>(null);
   const [galleryPickerQuery, setGalleryPickerQuery] = useState("");
+  const [groupNameDialog, setGroupNameDialog] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => () => { if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current); }, []);
+
+  // Ctrl/Cmd+X and Ctrl/Cmd+V on the current selection. Paste needs exactly one
+  // selected card to aim at, since the cut media land directly after it.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true']")) return;
+      const key = event.key.toLowerCase();
+      if (key === "x" && selected.length) {
+        event.preventDefault();
+        const chosen = new Set(selected);
+        setCutEntries(state.order.filter((entry) => entry.kind === "media" && chosen.has(entry.id)));
+        return;
+      }
+      if (key !== "v" || !cutEntries.length || selected.length !== 1) return;
+      const anchor = selected[0]!;
+      if (cutEntries.some((entry) => entry.kind === "media" && entry.id === anchor)) return;
+      event.preventDefault();
+      moveEntriesAfter({ kind: "media", id: anchor }, cutEntries);
+      setCutEntries([]);
+      setSelected([]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [cutEntries, moveEntriesAfter, selected, setSelected, state.order]);
 
   const galleryPickerFolders = useMemo(() => {
     const needle = galleryPickerQuery.trim().toLowerCase();
@@ -465,29 +542,73 @@ export function Gallery({
   }, [galleryPickerQuery, state.folders]);
   const galleryCover = (folderId: string) => {
     const folder = state.folders.find((item) => item.id === folderId);
-    const media = state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0]));
-    return media?.url || (media?.type === "image" ? media.originalUrl || media.contentUrl || null : null);
+    return state.media.find((item) => item.id === (folder?.coverId ?? folder?.mediaIds[0])) ?? null;
   };
   const copyImageToClipboard = async (media: MediaItem) => {
     if (media.type !== "image") return;
     // Browser Clipboard only received the preview URL before, which is why
     // pasting produced text instead of an image. Electron writes the native
     // image bitmap so it can be pasted into image-aware applications.
-    const copied = await getInDeckBridge()?.copyImage(media) ?? false;
+    const copied = await getInDeckBridge()?.copyImage(media).catch(() => false) ?? false;
     if (copied) toast.success(state.language === "vi" ? "Đã sao chép ảnh." : "Image copied.");
     else toast.error(state.language === "vi" ? "Không thể sao chép ảnh." : "Unable to copy image.");
   };
+  // A thumbnail made before a codec was installed, or a video cover that
+  // missed the moment, is otherwise kept until the file itself changes.
+  const regenerate = async (ids: string[]) => {
+    const medias = ids.map((id) => mediaById(id)).filter((media): media is MediaItem => !!media);
+    try {
+      await regenerateThumbnails(medias);
+      toast.success(c(`Đang tạo lại thumbnail cho ${medias.length} media.`, `Regenerating thumbnails for ${medias.length} media.`));
+    } catch {
+      toast.error(c("Không thể tạo lại thumbnail.", "Unable to regenerate thumbnails."));
+    }
+  };
   const openInFolder = async (media: MediaItem) => {
-    const opened = await getInDeckBridge()?.showInFolder(media) ?? false;
+    const opened = await getInDeckBridge()?.showInFolder(media).catch(() => false) ?? false;
     if (!opened) toast.error(c("Không thể mở vị trí tệp.", "Unable to open the file location."));
   };
 
   const pointerStart = useRef<{ x: number; y: number; entry: OrderEntry } | null>(null);
   const holdRef = useRef<{ key: string; start: number } | null>(null);
-  const dwellRef = useRef<{ key: string; start: number } | null>(null);
   const dropRef = useRef<DropInfo>(null);
   const marqueeStart = useRef<{ x: number; y: number } | null>(null);
   const autoScroll = useRef(0);
+  // A click that ends a drag is not a selection. Without this, dropping a
+  // card back onto itself toggled its selection as the pointer came up.
+  const suppressClickUntil = useRef(0);
+  // Marquee selection and Group dragging read row geometry rather than the
+  // DOM: only a couple of screens of cards are mounted at any time.
+  const virtualGeometry = useRef<{ rows: PositionedVirtualRow[] }>({ rows: [] });
+  const groupBandsRef = useRef<GroupBand[]>([]);
+
+  // Where the user had scrolled to in each Gallery, so reopening one returns
+  // them to what they were looking at instead of the top. Kept outside React
+  // state: restoring it must not itself cause a render.
+  const scrollMemoryKey = currentFolderId ?? MAIN_GALLERY_SCROLL_KEY;
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const remembered = galleryScrollMemory.get(scrollMemoryKey) ?? 0;
+    const apply = () => {
+      el.scrollTop = remembered;
+      committedScrollTop.current = el.scrollTop;
+      pendingScrollTop.current = el.scrollTop;
+      setScrollTop(el.scrollTop);
+    };
+    apply();
+    // On the very first mount the Library may still be hydrating, so the
+    // content is not yet tall enough and the browser clamps the offset to 0.
+    // Retry once the next frame has a real height — but only while the user
+    // has not scrolled themselves, so this never fights a deliberate scroll.
+    const frame = remembered > 0 && el.scrollTop < remembered
+      ? window.requestAnimationFrame(() => { if (el.scrollTop === 0) apply(); })
+      : 0;
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      galleryScrollMemory.set(scrollMemoryKey, el.scrollTop);
+    };
+  }, [scrollMemoryKey]);
 
 
   // Desktop state hydrates asynchronously. On the first render the empty
@@ -500,7 +621,13 @@ export function Gallery({
     const el = containerRef.current;
     if (!el) return;
     const measure = () => {
-      const measured = Math.floor(el.getBoundingClientRect().width);
+      // clientWidth, not getBoundingClientRect(): the border box includes the
+      // vertical scrollbar, which the content box cannot use. A Gallery large
+      // enough to scroll always has one, so measuring the border box made
+      // every justified row solve for ~10px more than it had and overflow the
+      // right edge. Square layouts absorbed the error in their column count,
+      // which is why only justified looked wrong.
+      const measured = Math.floor(el.clientWidth);
       // Preserve the last valid layout until the flex parent has a real size.
       if (measured <= 40) return;
       const next = Math.max(320, measured - 40);
@@ -518,35 +645,85 @@ export function Gallery({
   }, [entries.length, layoutKey]);
 
   // Building the Gallery no longer repeatedly scans every media item for
-  // every card/group. This map is rebuilt only when the media data changes,
-  // never while the user merely scrolls.
+  // every card/group. These maps are rebuilt only when their data changes,
+  // never while the user merely scrolls or drags.
   const mediaById = useMemo(() => {
     const byId = new Map(state.media.map((media) => [media.id, media]));
     return (id: string) => byId.get(id);
   }, [state.media]);
   const visibleMediaIdSet = useMemo(() => new Set(visibleMediaIds), [visibleMediaIds]);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
+  const groupById = useMemo(() => new Map(state.groups.map((group) => [group.id, group])), [state.groups]);
+  const groupOfMedia = useMemo(() => {
+    const byMember = new Map<string, (typeof state.groups)[number]>();
+    for (const group of state.groups) for (const id of group.memberIds) if (!byMember.has(id)) byMember.set(id, group);
+    return byMember;
+  }, [state.groups]);
+
+  // Ctrl/Cmd+G groups the selection; Ctrl/Cmd+Shift+G takes it back out of its
+  // Groups, dissolving any Group that would be left with fewer than two media.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== "g") return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true']")) return;
+      if (document.querySelector("[role=dialog], [role=alertdialog], [role=menu]")) return;
+      if (!event.shiftKey) {
+        if (selected.length < 2) return;
+        event.preventDefault();
+        createGroup([...selected], selected[0]);
+        setSelected([]);
+        return;
+      }
+      const leaving = new Map<string, string[]>();
+      for (const id of selected) {
+        const group = groupOfMedia.get(id);
+        if (group) leaving.set(group.id, [...(leaving.get(group.id) ?? []), id]);
+      }
+      if (!leaving.size) return;
+      event.preventDefault();
+      for (const [groupId, ids] of leaving) {
+        const group = groupById.get(groupId);
+        if (!group) continue;
+        if (group.memberIds.length - ids.length < 2) dissolveGroup(groupId);
+        else for (const id of ids) removeFromGroup(id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [createGroup, dissolveGroup, groupById, groupOfMedia, removeFromGroup, selected, setSelected]);
+  // Position of every entry in the order. Hit testing asks for this for every
+  // candidate card on every pointer move, so a linear search per question
+  // (as before) multiplied into millions of comparisons on a large Library.
+  const orderIndex = useMemo(() => {
+    const byKey = new Map<string, number>();
+    state.order.forEach((entry, index) => {
+      const key = `${entry.kind}:${entry.id}`;
+      if (!byKey.has(key)) byKey.set(key, index);
+    });
+    return byKey;
+  }, [state.order]);
   const globalIndex = useCallback(
-    (entry: OrderEntry) => state.order.findIndex((e) => e.kind === entry.kind && e.id === entry.id),
-    [state.order],
+    (entry: OrderEntry) => orderIndex.get(`${entry.kind}:${entry.id}`) ?? -1,
+    [orderIndex],
   );
 
   useLayoutEffect(() => {
     const isLibraryInsert = drop?.type === "insert" && drop.axis === "x";
-    if (!drag) {
+    if (!drag || !isLibraryInsert || !containerRef.current) {
       setLibraryRail(null);
       return;
     }
-    if (drop?.type === "member-insert") { setLibraryRail(null); return; }
-    if (!isLibraryInsert || !containerRef.current) { setLibraryRail(null); return; }
+    const root = containerRef.current;
 
     const findEntry = (entry: OrderEntry | undefined) => {
       if (!entry) return undefined;
       // A collapsed group is represented by its cover card, while an expanded
-      // group has a frame. Look for both, otherwise the outer Library rail
-      // disappears whenever the seam touches a collapsed Group.
+      // or fitted group has a frame. Look for both, otherwise the outer
+      // Library rail disappears whenever the seam touches a Group.
       const nodes = [
-        ...document.querySelectorAll<HTMLElement>(`[data-entry-id="${entry.id}"][data-entry-kind="${entry.kind}"]`),
-        ...(entry.kind === "group" ? document.querySelectorAll<HTMLElement>(`[data-group-id="${entry.id}"]`) : []),
+        ...root.querySelectorAll<HTMLElement>(`[data-entry-id="${entry.id}"][data-entry-kind="${entry.kind}"]`),
+        ...(entry.kind === "group" ? root.querySelectorAll<HTMLElement>(`[data-group-id="${entry.id}"]`) : []),
       ];
       return [...nodes].find((node) => {
         const rect = node.getBoundingClientRect();
@@ -554,19 +731,14 @@ export function Gallery({
       });
     };
 
-    let beforeNode: HTMLElement | undefined;
-    let afterNode: HTMLElement | undefined;
-    const before = state.order[drop.index];
-    const after = state.order[drop.index - 1];
-    beforeNode = findEntry(before);
-    afterNode = findEntry(after);
+    const beforeNode = findEntry(state.order[drop.index]);
+    const afterNode = findEntry(state.order[drop.index - 1]);
     const target = beforeNode ?? afterNode;
     if (!target) {
       setLibraryRail(null);
       return;
     }
 
-    const root = containerRef.current;
     const rootRect = root.getBoundingClientRect();
     const rect = target.getBoundingClientRect();
     const beforeRect = beforeNode?.getBoundingClientRect();
@@ -574,11 +746,24 @@ export function Gallery({
     // An insertion belongs to the seam, not to either neighbouring card.
     // Using the midpoint gives Library and group members exactly the same
     // single, stable rail even when their current gap has been widened.
-    const seamX = beforeRect && afterRect
-      ? afterRect.right + (beforeRect.left - afterRect.right) / 2
-      : beforeRect ? beforeRect.left : afterRect!.right;
-    const seamTop = beforeRect && afterRect ? Math.max(beforeRect.top, afterRect.top) : rect.top;
-    const seamBottom = beforeRect && afterRect ? Math.min(beforeRect.bottom, afterRect.bottom) : rect.bottom;
+    // That only holds while both neighbours share a row. Across a row break —
+    // a wrap, or the last card of a run followed by a Group block that starts
+    // its own full-width row — they overlap in no vertical band at all, so the
+    // midpoint lands in empty space and Math.min(bottom) - Math.max(top) goes
+    // negative, collapsing the rail to an invisible 1px sliver. That is why
+    // dropping right after the last image before a Group looked impossible.
+    // Anchor to the trailing edge of the preceding card in that case: it is
+    // exactly the "insert right after this one" the drag is aiming at.
+    const sharesRow = Boolean(beforeRect && afterRect
+      && Math.min(beforeRect.bottom, afterRect.bottom) - Math.max(beforeRect.top, afterRect.top) > 0);
+    const anchorRect = sharesRow ? null : afterRect ?? beforeRect ?? rect;
+    const seamX = sharesRow
+      ? afterRect!.right + (beforeRect!.left - afterRect!.right) / 2
+      : afterRect
+        ? anchorRect!.right + GAP / 2
+        : anchorRect!.left - GAP / 2;
+    const seamTop = sharesRow ? Math.max(beforeRect!.top, afterRect!.top) : anchorRect!.top;
+    const seamBottom = sharesRow ? Math.min(beforeRect!.bottom, afterRect!.bottom) : anchorRect!.bottom;
     setLibraryRail({
       x: seamX - rootRect.left + root.scrollLeft - 2,
       y: seamTop - rootRect.top + root.scrollTop,
@@ -589,20 +774,25 @@ export function Gallery({
   // ---- drag machinery -------------------------------------------------
   const finishHold = useCallback(() => {
     holdRef.current = null;
-    setHoldProgress(0);
+    setHoldStart(null);
   }, []);
+
+  // The last pointer position of the current drag, and the hit test bound to
+  // the current render. Auto-scroll moves content under a still pointer, so
+  // it re-runs the hit test from here instead of waiting for a pointer move.
+  const lastPointer = useRef<{ x: number; y: number } | null>(null);
+  const hitTestRef = useRef<(x: number, y: number) => void>(() => {});
 
   useEffect(() => {
     if (!drag) return;
     let raf = 0;
     const tick = () => {
-      if (holdRef.current) {
-        const p = Math.min(1, (performance.now() - holdRef.current.start) / HOLD_MS);
-        setHoldProgress(p);
-      }
-      setDwelled(!!dwellRef.current && performance.now() - dwellRef.current.start >= DWELL_MS);
       const el = containerRef.current;
-      if (el && autoScroll.current !== 0) el.scrollTop += autoScroll.current;
+      if (el && autoScroll.current !== 0) {
+        el.scrollTop += autoScroll.current;
+        const point = lastPointer.current;
+        if (point) hitTestRef.current(point.x, point.y);
+      }
       raf = requestAnimationFrame(tick);
     };
 
@@ -616,54 +806,110 @@ export function Gallery({
       if (!info || info.type !== "hold") return false;
       if (info.kind === "media") return true; // creating a new group
       if (info.kind === "ungroup") {
-        const g = state.groups.find((x) => x.memberIds.includes(info.id));
+        const g = groupOfMedia.get(info.id);
         return !!g && g.memberIds.length <= 2; // last two -> group disbands
       }
       return false; // adding to an existing group is instant
     },
-    [state.groups],
+    [groupOfMedia],
   );
 
+  /**
+   * The media a drag is carrying: the whole selection when the card under the
+   * pointer is part of it, otherwise just that card. Returned in Gallery order
+   * so a batch keeps the sequence it already had wherever it lands.
+   */
+  const draggedMediaIds = useCallback((source: OrderEntry) => {
+    if (source.kind !== "media" || selected.length < 2 || !selectedSet.has(source.id)) return [source.id];
+    const ordered = state.media.filter((media) => selectedSet.has(media.id)).map((media) => media.id);
+    return ordered.length ? ordered : [source.id];
+  }, [selected.length, selectedSet, state.media]);
+
+  /** Apply the current drop target. Reports whether anything changed. */
   const applyDrop = useCallback(() => {
     const source = pointerStart.current?.entry ?? drag;
     const info = dropRef.current;
-    if (!source || !info) return;
+    if (!source || !info) return false;
     if (info.type === "insert") {
-      moveEntry(source, info.index);
-    } else if (info.type === "member-insert") {
-      if (source.kind === "media") insertIntoGroup(info.groupId, source.id, info.index);
-    } else if (info.type === "hold") {
-      if (needsHold(info)) {
-        const held = holdRef.current;
-        const complete = held && performance.now() - held.start >= HOLD_MS;
-        if (!complete) return;
-      }
-      if (info.kind === "media" && source.kind === "media") createGroup([info.id, source.id]);
-      if (info.kind === "group" && source.kind === "media") addToGroup(info.id, source.id);
-      if (info.kind === "ungroup" && source.kind === "media") {
-        const g = state.groups.find((x) => x.memberIds.includes(source.id));
-        if (g && g.memberIds.length <= 2) dissolveGroup(g.id);
-        else removeFromGroup(source.id);
-      }
+      // Dragging one of several selected cards reorders the whole selection,
+      // as a block and in the sequence it already had, rather than pulling out
+      // the single card that happened to be under the pointer.
+      const block = source.kind === "media" && selected.length > 1 && selectedSet.has(source.id)
+        ? state.order.filter((entry) => entry.kind === "media" && selectedSet.has(entry.id))
+        : [];
+      if (block.length > 1) moveEntriesTo(block, info.index);
+      else moveEntry(source, info.index);
+      return true;
     }
-  }, [addToGroup, createGroup, dissolveGroup, drag, insertIntoGroup, moveEntry, moveGroupMember, needsHold, removeFromGroup, state.groups]);
+    if (info.type === "member-insert") {
+      if (source.kind !== "media") return false;
+      insertManyIntoGroup(info.groupId, draggedMediaIds(source), info.index);
+      return true;
+    }
+    if (needsHold(info)) {
+      const held = holdRef.current;
+      const complete = held && performance.now() - held.start >= HOLD_MS;
+      if (!complete) return false;
+    }
+    if (source.kind !== "media") return false;
+    // A new Group takes the place of the card it was dropped onto.
+    if (info.kind === "media") createGroup([info.id, ...draggedMediaIds(source)], info.id);
+    if (info.kind === "group") {
+      const group = groupById.get(info.id);
+      insertManyIntoGroup(info.id, draggedMediaIds(source), group?.memberIds.length ?? 0);
+    }
+    if (info.kind === "ungroup") {
+      const g = groupOfMedia.get(source.id);
+      if (g && g.memberIds.length <= 2) dissolveGroup(g.id);
+      else removeFromGroup(source.id);
+    }
+    return true;
+  }, [createGroup, dissolveGroup, drag, draggedMediaIds, groupById, groupOfMedia, insertManyIntoGroup, moveEntriesTo, moveEntry, needsHold, removeFromGroup, selected.length, selectedSet, state.order]);
 
-  useEffect(() => {
+  // Groups drawn inline in a row — collapsed to a pile, or fitted to their
+  // media — sit among the cards, so dragging one positions it like a card.
+  // Only an expanded full-width Group moves between whole rows.
+  const inlineGroupIds = useRef(new Set<string>());
+
+  // What the pointer is over right now, as a drop target. Pure with respect
+  // to React state apart from the setters at the end, and cheap enough to run
+  // once per animation frame.
+  const hitTest = (x: number, y: number) => {
     if (!drag) return;
-    const onMove = (e: PointerEvent) => {
-      setDragPoint({ x: e.clientX, y: e.clientY });
-      const el = containerRef.current;
-      if (el) {
-        const r = el.getBoundingClientRect();
-        if (e.clientY < r.top + 60) autoScroll.current = -14;
-        else if (e.clientY > r.bottom - 60) autoScroll.current = 14;
-        else autoScroll.current = 0;
+    const root = containerRef.current;
+    if (!root) return;
+    const previous = dropRef.current;
+    let next: DropInfo = null;
+
+    const draggingInlineGroup = drag.kind === "group" && inlineGroupIds.current.has(drag.id);
+    const dragActsAsCard = drag.kind === "media" || draggingInlineGroup;
+
+    if (drag.kind === "group" && !draggingInlineGroup) {
+      // An expanded Group owns whole rows, so it lands between rows: before
+      // or after the band under the pointer — a row of media or another
+      // Group alike. Geometry, not the DOM, so the gaps between rows and the
+      // rows that are not mounted resolve just as well.
+      const inner = innerRef.current;
+      const bands = groupBandsRef.current;
+      if (inner && bands.length) {
+        const cy = y - inner.getBoundingClientRect().top;
+        const index = bands.findIndex((band) => cy < band.bottom + GAP / 2);
+        if (index < 0) {
+          const last = bands[bands.length - 1]!;
+          if (last.groupId !== drag.id) next = { type: "insert", index: last.last + 1, axis: "y", railY: last.bottom + GAP / 2 };
+        } else {
+          const band = bands[index]!;
+          if (band.groupId !== drag.id) {
+            next = cy < (band.top + band.bottom) / 2
+              ? { type: "insert", index: band.first, axis: "y", railY: band.top - GAP / 2 }
+              : { type: "insert", index: band.last + 1, axis: "y", railY: band.bottom + GAP / 2 };
+          }
+        }
       }
-      const stack = document.elementsFromPoint(e.clientX, e.clientY);
+    } else {
+      const stack = document.elementsFromPoint(x, y);
       const mediaEl = stack.find((n) => (n as HTMLElement).dataset?.['mediaId']) as HTMLElement | undefined;
       const groupEl = stack.find((n) => (n as HTMLElement).dataset?.['groupId']) as HTMLElement | undefined;
-      const rowEl = stack.find((n) => (n as HTMLElement).dataset?.['libraryRow']) as HTMLElement | undefined;
-      let next: DropInfo = null;
 
       // Expanded groups contain ordinary media cards. A new image is inserted
       // between those cards directly, with the same seam/rail behaviour as
@@ -671,31 +917,38 @@ export function Gallery({
       // `elementsFromPoint` may stop at the member card and omit its group
       // frame. The member itself carries the authoritative group id.
       const targetGroupId = groupEl?.dataset['groupId'] ?? mediaEl?.dataset['inGroup'];
-      const sourceGroupId = drag.kind === "media" ? state.groups.find((group) => group.memberIds.includes(drag.id))?.id : undefined;
+      const sourceGroupId = drag.kind === "media" ? groupOfMedia.get(drag.id)?.id : undefined;
       const isDraggingWithinOwnGroup = Boolean(sourceGroupId && targetGroupId === sourceGroupId);
-      // An expanded Group owns whole rows, so it can only be dropped between
-      // rows. A collapsed one is a single card sitting in a row of cards, so
-      // it positions exactly like an image: left/right seams and an x rail.
-      const draggingCollapsedGroup =
-        drag.kind === "group" && (state.groups.find((group) => group.id === drag.id)?.collapsed ?? false);
-      const dragActsAsCard = drag.kind === "media" || draggingCollapsedGroup;
+      const memberCards = (groupId: string) => [...root.querySelectorAll<HTMLElement>(`[data-in-group="${groupId}"]`)];
+
+      // Holding over a card to group with it survives small drift into the
+      // card's reorder edges once the hold has begun.
+      if (drag.kind === "media" && previous?.type === "hold" && (previous.kind === "media" || previous.kind === "group") && mediaEl && !mediaEl.dataset['inGroup']) {
+        const heldId = previous.kind === "media" ? mediaEl.dataset['mediaId'] : mediaEl.dataset['entryKind'] === "group" ? mediaEl.dataset['entryId'] : undefined;
+        if (heldId === previous.id) {
+          const rect = mediaEl.getBoundingClientRect();
+          const keep = holdKeepFor(rect);
+          if (x >= rect.left + keep && x <= rect.right - keep) next = previous;
+        }
+      }
+
       // A member dragged inside its own expanded group must use the same
-      // left/right 50px seams as Library, but reorder `memberIds` instead of
+      // left/right seams as Library, but reorder `memberIds` instead of
       // accidentally moving the whole group in the global Library order.
-      if (sourceGroupId && targetGroupId === sourceGroupId && drag.kind === "media") {
-        const group = state.groups.find((item) => item.id === sourceGroupId);
-        const memberCards = [...document.querySelectorAll<HTMLElement>(`[data-in-group="${sourceGroupId}"]`)]
+      if (!next && sourceGroupId && targetGroupId === sourceGroupId && drag.kind === "media") {
+        const group = groupById.get(sourceGroupId);
+        const rowMembers = memberCards(sourceGroupId)
           .filter((card) => {
             const rect = card.getBoundingClientRect();
-            return card.dataset['mediaId'] !== drag.id && e.clientY >= rect.top && e.clientY <= rect.bottom;
+            return card.dataset['mediaId'] !== drag.id && y >= rect.top && y <= rect.bottom;
           })
           .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-        for (let i = 0; group && i < memberCards.length - 1; i += 1) {
-          const left = memberCards[i]!;
-          const right = memberCards[i + 1]!;
+        for (let i = 0; group && i < rowMembers.length - 1; i += 1) {
+          const left = rowMembers[i]!;
+          const right = rowMembers[i + 1]!;
           const leftRect = left.getBoundingClientRect();
           const rightRect = right.getBoundingClientRect();
-          if (e.clientX < leftRect.right - EDGE || e.clientX > rightRect.left + EDGE) continue;
+          if (x < leftRect.right - edgeFor(leftRect) || x > rightRect.left + edgeFor(rightRect)) continue;
           const index = group.memberIds.indexOf(right.dataset['mediaId']!);
           if (index >= 0) next = { type: "member-insert", groupId: sourceGroupId, index };
           break;
@@ -703,8 +956,8 @@ export function Gallery({
         if (!next && mediaEl?.dataset['inGroup'] === sourceGroupId && mediaEl.dataset['mediaId'] !== drag.id && group) {
           const rect = mediaEl.getBoundingClientRect();
           const index = group.memberIds.indexOf(mediaEl.dataset['mediaId']!);
-          if (index >= 0 && e.clientX - rect.left <= EDGE) next = { type: "member-insert", groupId: sourceGroupId, index };
-          else if (index >= 0 && rect.right - e.clientX <= EDGE) next = { type: "member-insert", groupId: sourceGroupId, index: index + 1 };
+          if (index >= 0 && x - rect.left <= edgeFor(rect)) next = { type: "member-insert", groupId: sourceGroupId, index };
+          else if (index >= 0 && rect.right - x <= edgeFor(rect)) next = { type: "member-insert", groupId: sourceGroupId, index: index + 1 };
         }
         // The far-right part of an expanded Group is empty panel, not a media
         // card. It is still the final member seam, so it must be a valid drop
@@ -713,20 +966,21 @@ export function Gallery({
           next = { type: "member-insert", groupId: sourceGroupId, index: group.memberIds.length };
         }
       }
-      if (targetGroupId && drag.kind === "media" && sourceGroupId !== targetGroupId) {
-        const group = state.groups.find((item) => item.id === targetGroupId);
-        const members = [...document.querySelectorAll<HTMLElement>(`[data-in-group="${targetGroupId}"]`)]
+      if (!next && targetGroupId && drag.kind === "media" && sourceGroupId !== targetGroupId) {
+        const group = groupById.get(targetGroupId);
+        const members = memberCards(targetGroupId);
+        const rowMembers = members
           .filter((card) => {
             const rect = card.getBoundingClientRect();
-            return e.clientY >= rect.top && e.clientY <= rect.bottom;
+            return y >= rect.top && y <= rect.bottom;
           })
           .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-        for (let i = 0; group && i < members.length - 1; i += 1) {
-          const left = members[i]!;
-          const right = members[i + 1]!;
+        for (let i = 0; group && i < rowMembers.length - 1; i += 1) {
+          const left = rowMembers[i]!;
+          const right = rowMembers[i + 1]!;
           const leftRect = left.getBoundingClientRect();
           const rightRect = right.getBoundingClientRect();
-          if (e.clientX < leftRect.right - EDGE || e.clientX > rightRect.left + EDGE) continue;
+          if (x < leftRect.right - edgeFor(leftRect) || x > rightRect.left + edgeFor(rightRect)) continue;
           const index = group.memberIds.indexOf(right.dataset['mediaId']!);
           if (index >= 0) next = { type: "member-insert", groupId: targetGroupId, index };
           break;
@@ -734,23 +988,20 @@ export function Gallery({
         if (!next && mediaEl?.dataset['inGroup'] === targetGroupId && group) {
           const rect = mediaEl.getBoundingClientRect();
           const index = group.memberIds.indexOf(mediaEl.dataset['mediaId']!);
-          if (index >= 0) next = { type: "member-insert", groupId: targetGroupId, index: e.clientX < rect.left + rect.width / 2 ? index : index + 1 };
+          if (index >= 0) next = { type: "member-insert", groupId: targetGroupId, index: x < rect.left + rect.width / 2 ? index : index + 1 };
         }
         // Every point in an expanded group resolves to its nearest member
         // seam. It must never fall back to the old hold/spinner treatment.
         if (!next && group) {
-          const allMembers = [...document.querySelectorAll<HTMLElement>(`[data-in-group="${targetGroupId}"]`)];
-          const nearest = allMembers.reduce<HTMLElement | null>((closest, card) => {
+          const distance = (rect: DOMRect) => Math.hypot(x - (rect.left + rect.width / 2), y - (rect.top + rect.height / 2));
+          const nearest = members.reduce<HTMLElement | null>((closest, card) => {
             if (!closest) return card;
-            const a = closest.getBoundingClientRect();
-            const b = card.getBoundingClientRect();
-            const distance = (rect: DOMRect) => Math.hypot(e.clientX - (rect.left + rect.width / 2), e.clientY - (rect.top + rect.height / 2));
-            return distance(b) < distance(a) ? card : closest;
+            return distance(card.getBoundingClientRect()) < distance(closest.getBoundingClientRect()) ? card : closest;
           }, null);
           if (nearest) {
             const rect = nearest.getBoundingClientRect();
             const index = group.memberIds.indexOf(nearest.dataset['mediaId']!);
-            if (index >= 0) next = { type: "member-insert", groupId: targetGroupId, index: e.clientX < rect.left + rect.width / 2 ? index : index + 1 };
+            if (index >= 0) next = { type: "member-insert", groupId: targetGroupId, index: x < rect.left + rect.width / 2 ? index : index + 1 };
           }
         }
         // Do not ever turn an expanded group into a generic "drop on group".
@@ -759,86 +1010,72 @@ export function Gallery({
         if (!next) next = { type: "hold", kind: "group", id: targetGroupId };
       }
 
-      // A seam is one continuous target: the physical gap plus the final/first
-      // 50px of the two neighbouring cards. `elementsFromPoint` cannot see
+      // A seam is one continuous target: the physical gap plus the outer
+      // edges of the two neighbouring cards. `elementsFromPoint` cannot see
       // the gap, which was why dragging to the exact middle did nothing.
-      const rowCards = [...document.querySelectorAll<HTMLElement>("[data-media-id]")]
-        .filter((card) => {
-          const rect = card.getBoundingClientRect();
-          return (
-            card.dataset['entryId'] !== drag.id &&
-            card.dataset['mediaId'] !== drag.id &&
-            !(drag.kind === "group" && card.dataset['inGroup'] === drag.id) &&
-            e.clientY >= rect.top &&
-            e.clientY <= rect.bottom
-          );
-        })
-        .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-      for (let i = 0; !next && dragActsAsCard && !isDraggingWithinOwnGroup && i < rowCards.length - 1; i += 1) {
-        const left = rowCards[i]!;
-        const right = rowCards[i + 1]!;
-        const leftRect = left.getBoundingClientRect();
-        const rightRect = right.getBoundingClientRect();
-        if (e.clientX < leftRect.right - EDGE || e.clientX > rightRect.left + EDGE) continue;
-        const rightEntry = {
-          kind: (right.dataset['entryKind'] ?? "media") as "media" | "group",
-          id: right.dataset['entryId']!,
-        };
-        const raw = globalIndex(rightEntry);
-        const inGroup = right.dataset['inGroup'];
-        const insertionIndex = raw >= 0 ? raw : inGroup ? globalIndex({ kind: "group", id: inGroup }) : -1;
-        if (insertionIndex >= 0) next = { type: "insert", index: insertionIndex, axis: "x" };
-        break;
+      if (!next && dragActsAsCard && !isDraggingWithinOwnGroup) {
+        const rowCards = [...root.querySelectorAll<HTMLElement>("[data-media-id]")]
+          .filter((card) => {
+            const rect = card.getBoundingClientRect();
+            return (
+              card.dataset['entryId'] !== drag.id &&
+              card.dataset['mediaId'] !== drag.id &&
+              !(drag.kind === "group" && card.dataset['inGroup'] === drag.id) &&
+              y >= rect.top &&
+              y <= rect.bottom
+            );
+          })
+          .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+        for (let i = 0; i < rowCards.length - 1; i += 1) {
+          const left = rowCards[i]!;
+          const right = rowCards[i + 1]!;
+          const leftRect = left.getBoundingClientRect();
+          const rightRect = right.getBoundingClientRect();
+          if (x < leftRect.right - edgeFor(leftRect) || x > rightRect.left + edgeFor(rightRect)) continue;
+          const rightEntry = {
+            kind: (right.dataset['entryKind'] ?? "media") as "media" | "group",
+            id: right.dataset['entryId']!,
+          };
+          const raw = globalIndex(rightEntry);
+          const inGroup = right.dataset['inGroup'];
+          const insertionIndex = raw >= 0 ? raw : inGroup ? globalIndex({ kind: "group", id: inGroup }) : -1;
+          if (insertionIndex >= 0) next = { type: "insert", index: insertionIndex, axis: "x" };
+          break;
+        }
       }
 
-      if (!next && dragActsAsCard && !isDraggingWithinOwnGroup && mediaEl && mediaEl.dataset['mediaId'] !== drag.id && mediaEl.dataset['entryId'] !== drag.id) {
+      if (next) {
+        // Resolved above.
+      } else if (dragActsAsCard && !isDraggingWithinOwnGroup && mediaEl && mediaEl.dataset['mediaId'] !== drag.id && mediaEl.dataset['entryId'] !== drag.id) {
         const rect = mediaEl.getBoundingClientRect();
         const entryId = mediaEl.dataset['entryId']!;
         const entryKind = (mediaEl.dataset['entryKind'] ?? "media") as "media" | "group";
         const inGroup = mediaEl.dataset['inGroup'];
-        // A member of an expanded group reorders around its group in the top-level order.
+        // A member of a Group reorders around its Group in the top-level order.
         const raw = globalIndex({ kind: entryKind, id: entryId });
         const idx = raw >= 0 ? raw : inGroup ? globalIndex({ kind: "group", id: inGroup }) : 0;
-        if (e.clientX - rect.left <= EDGE) next = { type: "insert", index: Math.max(idx, 0), axis: "x" };
-        else if (rect.right - e.clientX <= EDGE) next = { type: "insert", index: Math.max(idx, 0) + 1, axis: "x" };
+        if (x - rect.left <= edgeFor(rect)) next = { type: "insert", index: Math.max(idx, 0), axis: "x" };
+        else if (rect.right - x <= edgeFor(rect)) next = { type: "insert", index: Math.max(idx, 0) + 1, axis: "x" };
         else if (entryKind === "group" && drag.kind === "media") next = { type: "hold", kind: "group", id: entryId };
-        else if (drag.kind === "media") next = { type: "hold", kind: "media", id: mediaEl.dataset['mediaId']! };
+        else if (drag.kind === "media" && !inGroup) next = { type: "hold", kind: "media", id: mediaEl.dataset['mediaId']! };
       } else if (!isDraggingWithinOwnGroup && groupEl && groupEl.dataset['groupId'] !== drag.id) {
         const rect = groupEl.getBoundingClientRect();
         const idx = globalIndex({ kind: "group", id: groupEl.dataset['groupId']! });
-        if (drag.kind === "group" && !draggingCollapsedGroup) {
-          next =
-            e.clientY < rect.top + rect.height / 2
-              ? { type: "insert", index: idx, axis: "y" }
-              : { type: "insert", index: idx + 1, axis: "y" };
-        } else if (e.clientX - rect.left <= EDGE) next = { type: "insert", index: idx, axis: "x" };
-        else if (rect.right - e.clientX <= EDGE) next = { type: "insert", index: idx + 1, axis: "x" };
-        // A collapsed Group cannot be nested into another Group, so the hold
-        // target does not apply — it falls back to the nearer side instead.
-        else if (draggingCollapsedGroup) {
-          next = { type: "insert", index: e.clientX < rect.left + rect.width / 2 ? idx : idx + 1, axis: "x" };
+        if (x - rect.left <= edgeFor(rect)) next = { type: "insert", index: idx, axis: "x" };
+        else if (rect.right - x <= edgeFor(rect)) next = { type: "insert", index: idx + 1, axis: "x" };
+        // A Group cannot be nested into another Group, so the hold target
+        // does not apply — it falls back to the nearer side instead.
+        else if (draggingInlineGroup) {
+          next = { type: "insert", index: x < rect.left + rect.width / 2 ? idx : idx + 1, axis: "x" };
         } else next = { type: "hold", kind: "group", id: groupEl.dataset['groupId']! };
-      } else if (drag.kind === "group" && !draggingCollapsedGroup && rowEl) {
-        const rowEntries = [...rowEl.querySelectorAll<HTMLElement>("[data-entry-id]")]
-          .map((node) => ({
-            index: globalIndex({ kind: (node.dataset['entryKind'] ?? "media") as "media" | "group", id: node.dataset['entryId']! }),
-          }))
-          .filter((entry) => entry.index >= 0)
-          .map((entry) => entry.index);
-        if (rowEntries.length) {
-          const rect = rowEl.getBoundingClientRect();
-          next = e.clientY < rect.top + rect.height / 2
-            ? { type: "insert", index: Math.min(...rowEntries), axis: "y" }
-            : { type: "insert", index: Math.max(...rowEntries) + 1, axis: "y" };
-        }
-      } else if (!isDraggingWithinOwnGroup && ((drag.kind === "media" && sourceGroupId) || draggingCollapsedGroup)) {
-        // Dragging a member out — or dragging a collapsed Group, which is a
+      } else if (!isDraggingWithinOwnGroup && ((drag.kind === "media" && sourceGroupId) || draggingInlineGroup)) {
+        // Dragging a member out — or dragging an inline Group, which is a
         // card like any other — must behave exactly like positioning an
         // ordinary Library card. Even a blank part of a row resolves to the
         // nearest top-level item and shows an insertion rail — never a hold.
         const candidates = [
-          ...document.querySelectorAll<HTMLElement>("[data-entry-id]"),
-          ...document.querySelectorAll<HTMLElement>("[data-group-id]"),
+          ...root.querySelectorAll<HTMLElement>("[data-entry-id]"),
+          ...root.querySelectorAll<HTMLElement>("[data-group-id]"),
         ].filter((node, index, all) => all.indexOf(node) === index).filter((node) => {
           const entry = node.dataset['groupId']
             ? { kind: "group" as const, id: node.dataset['groupId']! }
@@ -848,9 +1085,9 @@ export function Gallery({
           if (entry.id === drag.id) return false;
           return globalIndex(entry) >= 0 && rect.width > 0 && rect.height > 0;
         });
+        const distance = (rect: DOMRect) => Math.hypot(x - (rect.left + rect.width / 2), y - (rect.top + rect.height / 2));
         const nearest = candidates.reduce<HTMLElement | null>((closest, node) => {
           if (!closest) return node;
-          const distance = (rect: DOMRect) => Math.hypot(e.clientX - (rect.left + rect.width / 2), e.clientY - (rect.top + rect.height / 2));
           return distance(node.getBoundingClientRect()) < distance(closest.getBoundingClientRect()) ? node : closest;
         }, null);
         if (nearest) {
@@ -859,43 +1096,120 @@ export function Gallery({
             : { kind: (nearest.dataset['entryKind'] ?? "media") as "media" | "group", id: nearest.dataset['entryId']! };
           const index = globalIndex(entry);
           const rect = nearest.getBoundingClientRect();
-          if (index >= 0) next = { type: "insert", index: e.clientX < rect.left + rect.width / 2 ? index : index + 1, axis: "x" };
+          if (index >= 0) next = { type: "insert", index: x < rect.left + rect.width / 2 ? index : index + 1, axis: "x" };
         }
         // Only a media card can be pulled out of its Group; a Group itself has
         // nothing to ungroup into, so it simply finds no target.
         if (!next && drag.kind === "media") next = { type: "hold", kind: "ungroup", id: drag.id };
       }
 
-      const key = next?.type === "hold" && needsHold(next) ? `${next.kind}:${next.id}` : "";
-      if (!key) {
-        holdRef.current = null;
-        setHoldProgress(0);
-      } else if (holdRef.current?.key !== key) {
-        holdRef.current = { key, start: performance.now() };
-        setHoldProgress(0);
+      // Blank canvas is a real drop target, resolved to the nearest card's
+      // near seam. Every earlier branch needs a card under the pointer, so the
+      // empty area past the final card produced no target at all — which is
+      // why an item could never be ordered after the last media.
+      if (!next && dragActsAsCard && !isDraggingWithinOwnGroup) {
+        const distance = (rect: DOMRect) => Math.hypot(x - (rect.left + rect.width / 2), y - (rect.top + rect.height / 2));
+        const candidates = [...root.querySelectorAll<HTMLElement>("[data-entry-id]")].filter((node) => {
+          const rect = node.getBoundingClientRect();
+          // Members of a Group belong to the member-insert path.
+          return node.dataset['entryId'] !== drag.id && !node.dataset['inGroup'] && rect.width > 0 && rect.height > 0;
+        });
+        const nearest = candidates.reduce<HTMLElement | null>(
+          (closest, node) => (!closest || distance(node.getBoundingClientRect()) < distance(closest.getBoundingClientRect()) ? node : closest),
+          null,
+        );
+        if (nearest) {
+          const rect = nearest.getBoundingClientRect();
+          const index = globalIndex({
+            kind: (nearest.dataset['entryKind'] ?? "media") as "media" | "group",
+            id: nearest.dataset['entryId']!,
+          });
+          // Below the card's row, or past its midpoint on the same row, means
+          // the seam after it — that is the trailing position of the Gallery.
+          const after = y > rect.bottom || (y >= rect.top && x > rect.left + rect.width / 2);
+          if (index >= 0) next = { type: "insert", index: after ? index + 1 : index, axis: "x" };
+        }
       }
+    }
 
-      const dwellKey = next?.type === "insert" ? `${next.axis}:${next.index}` : next?.type === "member-insert" ? `${next.groupId}:${next.index}` : "";
-      if (!dwellKey) {
-        dwellRef.current = null;
-        setDwelled(false);
-      } else if (dwellRef.current?.key !== dwellKey) {
-        dwellRef.current = { key: dwellKey, start: performance.now() };
-        setDwelled(false);
-      }
+    const key = next?.type === "hold" && needsHold(next) ? `${next.kind}:${next.id}` : "";
+    if (!key) {
+      if (holdRef.current) finishHold();
+    } else if (holdRef.current?.key !== key) {
+      const start = performance.now();
+      holdRef.current = { key, start };
+      setHoldStart(start);
+    }
 
-      if (next?.type === "member-insert") {
-        const group = state.groups.find((item) => item.id === next.groupId);
-        const beforeId = group?.memberIds[next.index];
-        const afterId = group?.memberIds[next.index - 1];
-        next = { ...next, railMediaId: beforeId ?? afterId, railSide: beforeId ? "left" : "right" };
+    if (next?.type === "member-insert") {
+      const group = groupById.get(next.groupId);
+      const beforeId = group?.memberIds[next.index];
+      const afterId = group?.memberIds[next.index - 1];
+      next = { ...next, railMediaId: beforeId ?? afterId, railSide: beforeId ? "left" : "right" };
+    }
+    dropRef.current = next;
+    // Re-rendering the Gallery only when the target actually changes, rather
+    // than on every pointer move, is most of what keeps a drag smooth.
+    if (!sameDrop(previous, next)) setDrop(next);
+  };
+  hitTestRef.current = hitTest;
+
+  useEffect(() => {
+    if (!drag) return;
+    let frame = 0;
+    const onMove = (e: PointerEvent) => {
+      // Carrying media past the window's edge hands it to the OS as files,
+      // so it can be dropped into Figma, Photoshop, Explorer or a browser.
+      // The in-app drag ends there: nothing inside Mosaic is the target.
+      const outside = e.clientX < 0 || e.clientY < 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight;
+      if (outside && drag.kind === "media") {
+        const ids = selected.includes(drag.id) ? selected : [drag.id];
+        const medias = ids.map((id) => mediaById(id)).filter((media): media is MediaItem => !!media);
+        if (startExternalDrag(medias)) {
+          if (frame) { cancelAnimationFrame(frame); frame = 0; }
+          suppressClickUntil.current = performance.now() + 250;
+          autoScroll.current = 0;
+          lastPointer.current = null;
+          pointerStart.current = null;
+          dropRef.current = null;
+          finishHold();
+          setDrop(null);
+          setDrag(null);
+          setDragOrigin(null);
+          setDragPreviewId(null);
+          finishMediaDrag();
+          return;
+        }
       }
-      dropRef.current = next;
-      setDrop(next);
+      lastPointer.current = { x: e.clientX, y: e.clientY };
+      const el = containerRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        // Drag auto-scroll belongs to the pane the pointer is actually over.
+        // Testing clientY alone meant carrying a card up the Sidebar scrolled
+        // the Gallery behind it too, on top of the Sidebar's own scrolling.
+        const overGallery = e.clientX >= r.left && e.clientX <= r.right;
+        if (!overGallery) autoScroll.current = 0;
+        else if (e.clientY < r.top + 60) autoScroll.current = -14;
+        else if (e.clientY > r.bottom - 60) autoScroll.current = 14;
+        else autoScroll.current = 0;
+      }
+      // Pointer events can arrive several times per frame. Hit testing reads
+      // the layout of every mounted card, so do it at most once per frame,
+      // for the latest position.
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        const point = lastPointer.current;
+        if (point) hitTestRef.current(point.x, point.y);
+      });
     };
 
-
     const onUp = (event: PointerEvent) => {
+      if (frame) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+      }
       // Sidebar rows are outside the Gallery's React subtree, so handling the
       // final pointer position here is more reliable than depending on a
       // cross-panel pointerenter/drop event in Electron. It also leaves the
@@ -904,8 +1218,9 @@ export function Gallery({
         ? document.elementsFromPoint(event.clientX, event.clientY)
           .map((element) => (element as HTMLElement).closest<HTMLElement>("[data-gallery-media-drop-id]"))
           .find((element): element is HTMLElement => !!element)
-          ?.dataset.galleryMediaDropId
+          ?.dataset['galleryMediaDropId']
         : undefined;
+      let changed = false;
       if (targetGalleryId) {
         const mediaIds = selected.includes(drag.id) ? selected : [drag.id];
         if (targetGalleryId === MAIN_GALLERY_DROP_ID) {
@@ -916,32 +1231,40 @@ export function Gallery({
         } else {
           moveToFolder(targetGalleryId, mediaIds, currentFolderId);
         }
+        changed = true;
       } else {
-        applyDrop();
+        // Resolve the target for the exact release point: the last frame's
+        // hit test may be a few pixels behind it.
+        hitTestRef.current(event.clientX, event.clientY);
+        changed = applyDrop();
       }
+      // The dragged batch has just been acted on. Leaving it selected is what
+      // let the next Ctrl/Cmd-click add to that stale, already-moved batch
+      // instead of starting a fresh pick.
+      if (changed) setSelected([]);
+      suppressClickUntil.current = performance.now() + 250;
       autoScroll.current = 0;
+      lastPointer.current = null;
       pointerStart.current = null;
       dropRef.current = null;
-      dwellRef.current = null;
-      setDwelled(false);
       finishHold();
       setDrop(null);
       setDrag(null);
-      setDragPoint(null);
+      setDragOrigin(null);
       setDragPreviewId(null);
       // Sidebar also observes the same pointer drag as a reliable fallback
       // for Electron builds that suppress native HTML drag/drop events.
       finishMediaDrag();
     };
 
-
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     return () => {
+      if (frame) cancelAnimationFrame(frame);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [applyDrop, currentFolderId, drag, finishHold, globalIndex, moveToFolder, needsHold, removeFromFolder, selected, state.groups]);
+  }, [applyDrop, currentFolderId, drag, finishHold, mediaById, moveToFolder, removeFromFolder, selected, setSelected]);
 
   const startPointer = (e: React.PointerEvent, entry: OrderEntry, previewMediaId?: string) => {
     if (e.button !== 0) return;
@@ -954,8 +1277,9 @@ export function Gallery({
           const mediaIds = selected.includes(entry.id) ? selected : [entry.id];
           beginMediaDrag({ mediaIds, sourceFolderId: currentFolderId ?? null });
         }
+        lastPointer.current = { x: ev.clientX, y: ev.clientY };
         setDrag(entry);
-        setDragPoint({ x: ev.clientX, y: ev.clientY });
+        setDragOrigin({ x: ev.clientX, y: ev.clientY });
         setDragPreviewId(previewMediaId ?? null);
         window.removeEventListener("pointermove", onMove);
       }
@@ -990,13 +1314,28 @@ export function Gallery({
       };
       setMarquee(box);
       const hits: string[] = [];
-      el.querySelectorAll<HTMLElement>("[data-media-id]").forEach((node) => {
-        const r = node.getBoundingClientRect();
-        const nx = r.left - rect.left;
-        const ny = r.top - rect.top + el.scrollTop;
-        if (nx < box.x + box.w && nx + r.width > box.x && ny < box.y + box.h && ny + r.height > box.y)
-          hits.push(node.dataset['mediaId']!);
-      });
+      const inner = innerRef.current;
+      if (inner) {
+        // Only a couple of screens of cards are mounted, so the box is tested
+        // against the solved row geometry instead of the DOM; a DOM sweep
+        // silently dropped every media the box covered outside that window.
+        // Content coordinates start at the scroll container's border box,
+        // while a row's `top` is measured from the inner box, so the two
+        // differ by the container's padding.
+        const innerRect = inner.getBoundingClientRect();
+        const offsetX = innerRect.left - rect.left;
+        const offsetY = innerRect.top - rect.top + el.scrollTop;
+        for (const row of virtualGeometry.current.rows) {
+          const top = row.top + offsetY;
+          if (top >= box.y + box.h || top + row.height <= box.y) continue;
+          const left = offsetX + (row.groupId ? GROUP_INSET : 0);
+          for (const cell of rowCellBoxes(row)) {
+            const x = left + cell.left;
+            const y = top + cell.top;
+            if (x < box.x + box.w && x + cell.width > box.x && y < box.y + box.h && y + cell.height > box.y) hits.push(cell.id);
+          }
+        }
+      }
       setSelected(hits);
     };
     const up = () => {
@@ -1009,12 +1348,63 @@ export function Gallery({
     window.addEventListener("pointerup", up);
   };
 
-  const handleSelect = (e: React.MouseEvent, id: string) => {
+  const handleSelect = (e: React.MouseEvent | React.KeyboardEvent, id: string) => {
+    if (performance.now() < suppressClickUntil.current) return;
     if (e.metaKey || e.ctrlKey) {
-      setSelected(selected.includes(id) ? selected.filter((s) => s !== id) : [...selected, id]);
-    } else {
-      setSelected([id]);
+      setSelected(selectedSet.has(id) ? selected.filter((s) => s !== id) : [...selected, id]);
+      return;
     }
+    // Clicking the card that is already the whole selection clears it, so the
+    // same plain click both selects and unselects. `detail` counts clicks in
+    // the current sequence: skipping it at 2 keeps the second click of a
+    // double-click — the one that opens the Lightbox — from unselecting.
+    const detail = "detail" in e ? e.detail : 1;
+    if (detail < 2 && selected.length === 1 && selected[0] === id) {
+      setSelected([]);
+      return;
+    }
+    // Clicking one of several selected cards narrows down to it rather than
+    // dropping it, which is what keeps a multi-selection collapsible.
+    setSelected([id]);
+  };
+
+  // Cards are memoized, so they receive one stable set of handlers that
+  // always forwards to the handlers of the latest render.
+  const cardHandlers = useRef<CardActions | null>(null);
+  cardHandlers.current = {
+    pointerDown: startPointer,
+    select: handleSelect,
+    open: onOpen,
+    toggleFavorite,
+    expandGroup: (groupId) => updateGroup(groupId, { collapsed: false }),
+  };
+  const cardActions = useMemo<CardActions>(() => ({
+    pointerDown: (event, entry, mediaId) => cardHandlers.current!.pointerDown(event, entry, mediaId),
+    select: (event, id) => cardHandlers.current!.select(event, id),
+    open: (id) => cardHandlers.current!.open(id),
+    toggleFavorite: (id) => cardHandlers.current!.toggleFavorite(id),
+    expandGroup: (groupId) => cardHandlers.current!.expandGroup(groupId),
+  }), []);
+  const cardLabels = useMemo(() => ({ expandGroup: t("expandGroup"), dragToReorder: t("dragToReorder") }), [t]);
+
+  // One context menu for the whole Gallery. A Radix menu per card mounted
+  // hundreds of menu roots, and rebuilt every card's menu items on every
+  // render; this one builds the menu for the card actually right-clicked.
+  const onGalleryContextMenu = (event: React.MouseEvent) => {
+    const target = event.target as HTMLElement;
+    const card = target.closest<HTMLElement>("[data-media-id]");
+    if (card && containerRef.current?.contains(card)) {
+      if (card.dataset['entryKind'] === "group") setMenuTarget({ kind: "group", id: card.dataset['entryId']! });
+      else setMenuTarget({ kind: "media", id: card.dataset['mediaId']! });
+      return;
+    }
+    const frame = target.closest<HTMLElement>("[data-group-id]");
+    if (frame && containerRef.current?.contains(frame)) {
+      setMenuTarget({ kind: "group", id: frame.dataset['groupId']! });
+      return;
+    }
+    // Blank canvas has no menu.
+    event.preventDefault();
   };
 
   // Radix renders menus and dialogs in portals, but their React events still
@@ -1024,15 +1414,33 @@ export function Gallery({
   const stopCanvasPointerDown = (event: React.PointerEvent) => event.stopPropagation();
 
   // ---- context menu ---------------------------------------------------
-  const selectionMenu = (ids: string[]) => {
+  // `anchorId` is the card the menu was opened on: a Group made from the
+  // selection appears in its place, rather than wherever the last-clicked
+  // member happened to sit.
+  const selectionMenu = (ids: string[], anchorId: string) => {
     const hasClipboard = Object.values(clipboard).some((values) => values.length);
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
-        <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids); setSelected([]); }}>
+        <ContextMenuItem className={menuItem} onSelect={() => { createGroup(ids, anchorId); setSelected([]); }}>
           <Shapes className="size-4 text-[#A56F63]" /> {c(`Tạo group từ ${ids.length} ảnh đã chọn`, `Create group from ${ids.length} selected images`)}
         </ContextMenuItem>
         <ContextMenuItem className={menuItem} onSelect={() => { setGalleryPickerQuery(""); setAddGroupToGalleryFor(ids); }}>
           <FolderPlus className="size-4 text-[#C59A18]" /> {c(`Thêm ${ids.length} ảnh vào Gallery`, `Add ${ids.length} images to Gallery`)}
+        </ContextMenuItem>
+        <ContextMenuItem className={menuItem} onSelect={() => setCutEntries(ids.map((id) => ({ kind: "media", id })))}>
+          <Scissors className="size-4 text-[#8E7CC3]" /> {c(`Cắt ${ids.length} media`, `Cut ${ids.length} media`)}
+        </ContextMenuItem>
+        <ContextMenuItem className={menuItem} onSelect={() => { void regenerate(ids); }}>
+          <RefreshCw className="size-4 text-[#5F839A]" /> {c(`Tạo lại thumbnail cho ${ids.length} media`, `Regenerate thumbnails for ${ids.length} media`)}
+        </ContextMenuItem>
+        <ContextMenuItem
+          className={menuItem}
+          onSelect={() => {
+            const paths = ids.map((id) => mediaById(id)).filter((media): media is MediaItem => !!media && canDragOut(media)).map((media) => media.path);
+            if (paths.length) void copyText(paths.join("\n"), state.language, c(`${paths.length} đường dẫn`, `${paths.length} paths`));
+          }}
+        >
+          <Link2 className="size-4 text-[#5F839A]" /> {c(`Sao chép ${ids.length} đường dẫn`, `Copy ${ids.length} paths`)}
         </ContextMenuItem>
         {hasClipboard && (
           <ContextMenuItem
@@ -1083,13 +1491,14 @@ export function Gallery({
   };
 
   const mediaMenu = (m: MediaItem) => {
-    const selectedIds = selected.length >= 2 && selected.includes(m.id)
-      ? [...new Set(selected)].filter((id) => state.media.some((media) => media.id === id))
+    const mediaEntry: OrderEntry = { kind: "media", id: m.id };
+    const selectedIds = selected.length >= 2 && selectedSet.has(m.id)
+      ? [...new Set(selected)].filter((id) => !!mediaById(id))
       : [];
     // Right-clicking one of several selected cards is a bulk operation. Do
     // not expose open/copy/cover/delete-one actions in that situation.
-    if (selectedIds.length >= 2) return selectionMenu(selectedIds);
-    const group = state.groups.find((g) => g.memberIds.includes(m.id));
+    if (selectedIds.length >= 2) return selectionMenu(selectedIds, m.id);
+    const group = groupOfMedia.get(m.id);
     const hasClipboard = Object.values(clipboard).some((v) => v.length);
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
@@ -1101,14 +1510,27 @@ export function Gallery({
         </ContextMenuItem>
         <ContextMenuItem
           className={menuItem}
+          // RAW/HEIC/TIFF/PSD and SVG copy the 2048 px rendering main.js makes.
           disabled={m.type !== "image"}
           onSelect={() => { void copyImageToClipboard(m); }}
         >
           <Copy className="size-4 text-[#4A9D72]" /> {t("copyImage")}
         </ContextMenuItem>
-        {selected.length >= 2 && selected.includes(m.id) && (
-          <ContextMenuItem className={menuItem} onSelect={() => { createGroup([...selected]); setSelected([]); }}>
+        {isSvgMedia(m) && (
+          <ContextMenuItem className={menuItem} onSelect={() => { void copySvgMarkup(m, state.language); }}>
+            <Code2 className="size-4 text-[#4A9D72]" /> {c("Sao chép mã SVG", "Copy SVG code")}
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem className={menuItem} disabled={!canDragOut(m)} onSelect={() => { void copyText(m.path, state.language, c("đường dẫn", "the path")); }}>
+          <Link2 className="size-4 text-[#5F839A]" /> {c("Sao chép đường dẫn", "Copy path")}
+        </ContextMenuItem>
+        <ContextMenuItem className={menuItem} disabled={!canDragOut(m)} onSelect={() => { void openWithChooser(m, state.language); }}>
+          <AppWindow className="size-4 text-[#1686DC]" /> {c("Mở bằng…", "Open with…")}
+        </ContextMenuItem>
+        {selected.length >= 2 && selectedSet.has(m.id) && (
+          <ContextMenuItem className={menuItem} onSelect={() => { createGroup([...selected], m.id); setSelected([]); }}>
             <Boxes className="size-4" /> {t("createGroupSelected")}
+            <ContextMenuShortcut>Ctrl+G</ContextMenuShortcut>
           </ContextMenuItem>
         )}
         {group && (
@@ -1122,6 +1544,7 @@ export function Gallery({
               }}
             >
               <Ungroup className="size-4" /> {t("removeFromGroup")}
+              <ContextMenuShortcut>Ctrl+Shift+G</ContextMenuShortcut>
             </ContextMenuItem>
             {group.coverId !== m.id && (
               <ContextMenuItem className={menuItem} onSelect={() => updateGroup(group.id, { coverId: m.id })}>
@@ -1132,6 +1555,18 @@ export function Gallery({
           </>
         )}
         {!group && <ContextMenuSeparator />}
+        <ContextMenuItem className={menuItem} onSelect={() => setCutEntries([mediaEntry])}>
+          <Scissors className="size-4 text-[#8E7CC3]" /> {c("Cắt media", "Cut media")}
+        </ContextMenuItem>
+        {cutEntries.length > 0 && !cutEntries.some((item) => item.kind === "media" && item.id === m.id) && (
+          <ContextMenuItem
+            className={menuItem}
+            onSelect={() => { moveEntriesAfter(mediaEntry, cutEntries); setCutEntries([]); setSelected([]); }}
+          >
+            <ClipboardPaste className="size-4 text-[#8E7CC3]" />
+            {c(`Dán ${cutEntries.length} media vào sau ảnh này`, `Paste ${cutEntries.length} media after this one`)}
+          </ContextMenuItem>
+        )}
         {state.propertyGroups.map((g) => (
           <ContextMenuItem
             key={g.id}
@@ -1156,6 +1591,9 @@ export function Gallery({
         <ContextMenuSeparator />
         <ContextMenuItem className={menuItem} onSelect={() => duplicateMedia(m.id)}>
           <CopyPlus className="size-4 text-[#24B1B1]" /> {t("duplicate")}
+        </ContextMenuItem>
+        <ContextMenuItem className={menuItem} onSelect={() => { void regenerate([m.id]); }}>
+          <RefreshCw className="size-4 text-[#5F839A]" /> {c("Tạo lại thumbnail", "Regenerate thumbnail")}
         </ContextMenuItem>
         {currentFolderId && (
           <ContextMenuItem
@@ -1200,9 +1638,16 @@ export function Gallery({
         )}
         <ContextMenuItem
           className={menuItem}
+          // A Vault keeps no file on disk, so it answers with its own trash
+          // instead of the Recycle Bin. Both are recoverable, so the wording
+          // only has to name the right destination.
           onSelect={() => onConfirm({
-            title: c("Đưa file vào Thùng rác máy tính?", "Move file to the Windows Recycle Bin?"),
-            description: c("File gốc sẽ được chuyển vào Thùng rác của Windows để có thể khôi phục.", "The original file will be moved to the Windows Recycle Bin and can be restored."),
+            title: m.vault
+              ? c("Đưa file vào Thùng rác của Vault?", "Move file to the Vault trash?")
+              : c("Đưa file vào Thùng rác máy tính?", "Move file to the Windows Recycle Bin?"),
+            description: m.vault
+              ? c("File vẫn được mã hóa trong Vault và có thể khôi phục từ Thùng rác của Vault.", "The file stays encrypted inside the Vault and can be restored from the Vault trash.")
+              : c("File gốc sẽ được chuyển vào Thùng rác của Windows để có thể khôi phục.", "The original file will be moved to the Windows Recycle Bin and can be restored."),
             onConfirm: () => {
               const bridge = getInDeckBridge();
               if (!bridge) return;
@@ -1211,19 +1656,39 @@ export function Gallery({
                 path: m.path,
                 vault: m.vault,
                 contentUrl: m.contentUrl,
-              }).then((removed) => { if (removed) purgeMedia(m.id); });
+              }).catch(() => false).then((result) => {
+                if (result === true) {
+                  purgeMedia(m.id);
+                  return;
+                }
+                // Silence here read as "nothing happened" after a confirmation
+                // that promised the file was going somewhere recoverable.
+                const reason = typeof result === "object" && result ? result.reason : undefined;
+                if (reason === "vault-no-trash") {
+                  toast.error(c(
+                    "Vault đang chạy chưa hỗ trợ thùng rác nên file được giữ nguyên. Hãy cập nhật Vault rồi thử lại.",
+                    "The running Vault has no trash yet, so the file was kept. Update Vault and try again.",
+                  ));
+                } else if (reason === "vault-unavailable") {
+                  toast.error(c("Không kết nối được Vault. Hãy mở Vault rồi thử lại.", "Vault could not be reached. Open Vault and try again."));
+                } else if (m.vault) toast.error(c("Không thể đưa file vào Thùng rác của Vault.", "Unable to move the file to the Vault trash."));
+                else toast.error(c("Không thể chuyển file vào Thùng rác.", "Unable to move the file to the Recycle Bin."));
+              });
             },
           })}
         >
-          <Trash2 className="size-4 text-[#B81E2D]" /> {c("Đưa file vào Thùng rác máy tính", "Move file to Windows Recycle Bin")}
+          <Trash2 className="size-4 text-[#B81E2D]" /> {m.vault
+            ? c("Đưa file vào Thùng rác của Vault", "Move file to Vault trash")
+            : c("Đưa file vào Thùng rác máy tính", "Move file to Windows Recycle Bin")}
         </ContextMenuItem>
       </ContextMenuContent>
     );
   };
 
   const groupMenu = (groupId: string) => {
-    const group = state.groups.find((g) => g.id === groupId);
+    const group = groupById.get(groupId);
     if (!group) return null;
+    const hasName = Boolean(group.name.trim());
     return (
       <ContextMenuContent onPointerDown={stopCanvasPointerDown} className="glass-float w-64 rounded-xl">
         <ContextMenuItem className={menuItem} onSelect={() => setSelected(group.memberIds)}>
@@ -1239,6 +1704,30 @@ export function Gallery({
           {group.collapsed ? <Maximize2 className="size-4 text-[#6FCF97]" /> : <Minimize2 className="size-4 text-[#325E6A]" />}
           {group.collapsed ? t("expandGroup") : t("collapseGroup")}
         </ContextMenuItem>
+        <ContextMenuItem className={menuItem} onSelect={() => setGroupNameDialog({ id: group.id, name: group.name })}>
+          <Pencil className="size-4 text-[#5F839A]" /> {c(hasName ? "Đổi tên group" : "Đặt tên group", hasName ? "Rename group" : "Set Group Name")}
+        </ContextMenuItem>
+        {cutEntries.length > 0 && (
+          <ContextMenuItem
+            className={menuItem}
+            onSelect={() => {
+              insertManyIntoGroup(group.id, cutEntries.filter((entry) => entry.kind === "media").map((entry) => entry.id), group.memberIds.length);
+              setCutEntries([]);
+              setSelected([]);
+            }}
+          >
+            <ClipboardPaste className="size-4 text-[#8E7CC3]" />
+            {c(`Dán ${cutEntries.length} media vào group`, `Paste ${cutEntries.length} media into this group`)}
+          </ContextMenuItem>
+        )}
+        {!group.collapsed && (
+          <ContextMenuItem className={menuItem} onSelect={() => updateGroup(group.id, { fit: !group.fit })}>
+            <Group className="size-4 text-[#8E7CC3]" />
+            {group.fit
+              ? c("Bỏ vừa với media", "Stop fitting to media")
+              : c("Vừa với media", "Fit to media")}
+          </ContextMenuItem>
+        )}
         <ContextMenuSeparator />
         <ContextMenuItem
           className={menuItem}
@@ -1252,175 +1741,89 @@ export function Gallery({
     );
   };
 
+  // While a selection is being dragged, every card in it is on the move.
+  const draggingIds = useMemo(() => {
+    if (drag?.kind !== "media") return null;
+    return selectedSet.has(drag.id) && selectedSet.size > 1 ? selectedSet : new Set([drag.id]);
+  }, [drag, selectedSet]);
 
-
-  const renderMedia = (
+  const renderCard = (
     m: MediaItem,
     entry: OrderEntry,
     w: number,
     h: number,
-    badge?: number,
-    stack?: MediaItem[],
-    inGroupId?: string,
-    priorityThumbnail = false,
-    thumbnailDistance = Number.MAX_SAFE_INTEGER,
+    options: {
+      badge?: number | undefined;
+      stack?: MediaItem[] | undefined;
+      inGroupId?: string | undefined;
+      priority: boolean;
+      distance: number;
+    },
   ) => {
-    const isSelected = selected.includes(m.id);
-    const pile = stack ? stackFrame(w, h, stack.length, galleryLayout === "justified") : null;
-    const holding =
-      drop?.type === "hold" &&
-      ((drop.kind === "media" && drop.id === m.id) || (drop.kind === "group" && drop.id === entry.id));
-    const memberRail = drop?.type === "member-insert" && drop.groupId === inGroupId && drop.railMediaId === m.id ? drop.railSide : null;
+    const { badge, stack, inGroupId, priority, distance } = options;
+    const holdTarget = drop?.type === "hold" && needsHold(drop)
+      && ((drop.kind === "media" && entry.kind === "media" && drop.id === m.id) || (drop.kind === "group" && entry.kind === "group" && drop.id === entry.id));
+    const memberRail = drop?.type === "member-insert" && drop.groupId === inGroupId && drop.railMediaId === m.id ? drop.railSide ?? null : null;
+    const groupName = entry.kind === "group" && !inGroupId ? groupById.get(entry.id)?.name.trim() : undefined;
+    const dimmed = Boolean(draggingIds?.has(m.id) && entry.kind === "media") || (drag?.kind === "group" && entry.kind === "group" && drag.id === entry.id);
     return (
-      <ContextMenu key={`${entry.kind}:${entry.id}:${m.id}`}>
-        <ContextMenuTrigger asChild>
-          <div
-            data-media-id={m.id}
-            data-entry-id={entry.id}
-            data-entry-kind={entry.kind}
-            data-in-group={inGroupId}
-            style={pile
-              ? {
-                  width: pile.width + pile.insets.left + pile.insets.right,
-                  height: pile.height + pile.insets.top + pile.insets.bottom,
-                  // The frame is border-box and carries a 1px border, so the
-                  // padding is the inset less that border. The content box is
-                  // then exactly the cover.
-                  paddingTop: pile.insets.top - 1,
-                  paddingRight: pile.insets.right - 1,
-                  paddingBottom: pile.insets.bottom - 1,
-                  paddingLeft: pile.insets.left - 1,
-                }
-              : { width: w, height: h }}
-
-            onPointerDown={(e) => startPointer(e, entry, m.id)}
-            onClick={(e) => handleSelect(e, m.id)}
-            onDoubleClick={() => onOpen(m.id)}
-            tabIndex={0}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") onOpen(m.id);
-              if (e.key === " ") {
-                e.preventDefault();
-                handleSelect(e as unknown as React.MouseEvent, m.id);
-              }
-            }}
-            className={cn(
-              // Keep text unselectable while pointer dragging. The drag
-              // gesture is handled in the renderer so Gallery reordering,
-              // hover-to-group, and dropping onto the Sidebar share it.
-              "select-none group relative shrink-0 rounded-lg border transition-all duration-200 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-              stack ? "glass-panel box-border overflow-visible" : "overflow-hidden",
-              isSelected
-                ? "border-primary ring-[3px] ring-primary/90 shadow-[0_0_0_1px_rgb(255_255_255_/_0.7)]"
-                : "border-border/60 hover:shadow-lg",
-              drag?.id === m.id && "opacity-40",
-              memberRail && "z-20 overflow-visible",
-            )}
-
-          >
-            {stack && pile ? (
-              // The content box is exactly the cover, so every photo is
-              // `inset-0` and the photos behind simply lean and fan out of it
-              // into the padding the insets already reserved for them.
-              <div className="relative size-full">
-                {stack.map((s, depth) => ({ s, depth })).reverse().map(({ s, depth }) => {
-                  const isCover = depth === 0;
-                  return (
-                    <LazyThumbnail
-                      key={s.id}
-                      media={s}
-                      className={cn(
-                        "absolute inset-0 size-full rounded-md border object-cover",
-                        isCover ? "border-border/70 shadow-lg" : "border-border/50 shadow-soft",
-                      )}
-                      priority={priorityThumbnail}
-                      thumbnailDistance={thumbnailDistance}
-                      thumbnailSize={thumbnailSizeForBox(pile.width, pile.height)}
-                      style={{
-                        transform: isCover
-                          ? undefined
-                          : `translate(${depth * STACK_STEP}px, ${depth * STACK_STEP}px) rotate(${stackTilt(s.id, depth)}deg)`,
-                        zIndex: stack.length - depth,
-                      }}
-                    />
-                  );
-                })}
-              </div>
-            ) : (
-              <LazyThumbnail media={m} className="size-full object-cover" priority={priorityThumbnail} thumbnailDistance={thumbnailDistance} thumbnailSize={thumbnailSizeForBox(w, h)} />
-            )}
-            {m.type === "video" && !stack && (
-              <span className="glass-panel absolute top-1.5 left-1.5 grid size-6 place-items-center rounded-full">
-                <Play className="size-3" />
-              </span>
-            )}
-            {!stack && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleFavorite(m.id);
-                }}
-                className={cn(
-                  "absolute top-1 right-1 grid size-5 place-items-center rounded-full border border-glass-border/50 bg-glass/40 shadow-soft backdrop-blur-md transition-opacity",
-                  m.favorite ? "opacity-100" : "opacity-0 group-hover:opacity-100",
-                )}
-              >
-                <Heart className={cn("size-2.5", m.favorite && "fill-favorite text-favorite")} />
-              </button>
-            )}
-            {badge !== undefined && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  updateGroup(entry.id, { collapsed: false });
-                }}
-                title={t("expandGroup")}
-                className="glass-float absolute right-2 bottom-2 z-20 flex items-center rounded-md px-[6.6px] py-[2.2px] text-[11px] font-medium"
-              >
-                {badge}
-              </button>
-            )}
-            {stack && (
-              <span
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  startPointer(e, entry, m.id);
-                }}
-                title={t("dragToReorder")}
-                className="glass-float absolute bottom-2 left-2 z-20 grid size-6 cursor-grab place-items-center rounded-md opacity-0 transition-opacity group-hover:opacity-100"
-              >
-                <GripVertical className="size-3.5" />
-              </span>
-            )}
-            {holding && needsHold(drop) && <HoldRing progress={holdProgress} />}
-            {memberRail && <InsertBar side={memberRail} spread={false} />}
-
-          </div>
-        </ContextMenuTrigger>
-        {stack ? groupMenu(entry.id) : mediaMenu(m)}
-      </ContextMenu>
+      <MediaCard
+        key={`${entry.kind}:${entry.id}:${m.id}`}
+        media={m}
+        entryKind={entry.kind}
+        entryId={entry.id}
+        width={w}
+        height={h}
+        badge={badge}
+        stack={stack}
+        inGroupId={inGroupId}
+        priority={priority}
+        distance={distance}
+        selected={selectedSet.has(m.id)}
+        dimmed={dimmed}
+        holdStart={holdTarget ? holdStart : null}
+        memberRail={memberRail}
+        groupName={groupName || undefined}
+        labels={cardLabels}
+        actions={cardActions}
+      />
     );
   };
 
   // ---- blocks ---------------------------------------------------------
   const displaySections = useMemo(() => {
     if (groupBy.length === 0) return [{ entries, label: "" }];
-    const mediaForEntry = (entry: OrderEntry) => entry.kind === "media"
-      ? state.media.filter((media) => media.id === entry.id)
-      : state.groups.find((group) => group.id === entry.id)?.memberIds
-        .map((id) => state.media.find((media) => media.id === id))
-        .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id)) ?? [];
+    // Gallery membership per media, built once instead of scanning every
+    // Gallery for every media of every section.
+    const galleriesOfMedia = new Map<string, string[]>();
+    for (const folder of state.folders) {
+      for (const id of folder.mediaIds) {
+        const names = galleriesOfMedia.get(id);
+        if (names) names.push(folder.name);
+        else galleriesOfMedia.set(id, [folder.name]);
+      }
+    }
+    const sourceNames = new Map(state.sources.map((source) => [source.id, source.name]));
+    const mediaForEntry = (entry: OrderEntry): MediaItem[] => {
+      if (entry.kind === "media") {
+        const media = mediaById(entry.id);
+        return media ? [media] : [];
+      }
+      return (groupById.get(entry.id)?.memberIds ?? [])
+        .map(mediaById)
+        .filter((media): media is MediaItem => !!media && visibleMediaIdSet.has(media.id));
+    };
     // A Group by value is a display facet, rather than a mutually-exclusive
     // bucket. Return every matching value so a media item can be rendered in
     // each relevant section while all copies still point at its single ID.
     const keysFor = (entry: OrderEntry, group: MediaGroupBy) => {
       const media = mediaForEntry(entry);
       if (group.kind === "media-source") {
-        const values = [...new Set(media.map((item) => state.sources.find((source) => source.id === item.sourceId)?.name ?? "Unknown source"))];
+        const values = [...new Set(media.map((item) => sourceNames.get(item.sourceId) ?? "Unknown source"))];
         return values.length ? values.sort() : ["Unknown source"];
       }
       if (group.kind === "gallery-source") {
-        const values = [...new Set(media.flatMap((item) => state.folders.filter((folder) => folder.mediaIds.includes(item.id)).map((folder) => folder.name)))];
+        const values = [...new Set(media.flatMap((item) => galleriesOfMedia.get(item.id) ?? []))];
         return values.length ? values.sort() : ["No Gallery source"];
       }
       const values = [...new Set(media.flatMap((item) => item.props[group.propertyId] ?? []))];
@@ -1445,7 +1848,7 @@ export function Gallery({
       });
     }
     return sections;
-  }, [entries, groupBy, state.folders, state.groups, state.media, state.propertyGroups, state.sources, visibleMediaIdSet]);
+  }, [entries, groupBy, groupById, mediaById, state.folders, state.propertyGroups, state.sources, visibleMediaIdSet]);
 
   type Block =
     | {
@@ -1454,28 +1857,40 @@ export function Gallery({
         items: MediaItem[];
         badges: (number | undefined)[];
         stacks: (MediaItem[] | undefined)[];
+        /** For each item, the fitted Group it belongs to, if any. */
+        fits: (string | undefined)[];
         section: number;
         sectionStart: boolean;
         sectionLabel: string;
       }
     | { kind: "group"; entry: OrderEntry; items: MediaItem[]; section: number; sectionStart: boolean; sectionLabel: string };
 
+  // How many cards one row holds right now. A Group may only fit into a row if
+  // its whole membership stays within that budget; past it the Group keeps its
+  // full-width frame, so zooming in pushes an over-long fitted Group back to
+  // rows of its own rather than silently cutting it in half.
+  const fitBudget = galleryLayout === "square"
+    ? squareColumns(width, state.thumbHeight)
+    : Math.max(1, Math.floor(width / (justifiedMaxHeight(state.thumbHeight) * 0.55)));
+
   const blocks = useMemo(() => {
     const nextBlocks: Block[] = [];
-    const pushRun = (entry: OrderEntry, m: MediaItem, section: number, badge?: number, stack?: MediaItem[]) => {
+    const inline = new Set<string>();
+    const pushRun = (entry: OrderEntry, m: MediaItem, section: number, badge?: number, stack?: MediaItem[], fitGroupId?: string) => {
       const last = nextBlocks[nextBlocks.length - 1];
       if (last && last.kind === "run" && last.section === section) {
         last.items.push(m);
         last.entries.push(entry);
         last.badges.push(badge);
         last.stacks.push(stack);
+        last.fits.push(fitGroupId);
       } else {
-        nextBlocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack], section, sectionStart: false, sectionLabel: "" });
+        nextBlocks.push({ kind: "run", entries: [entry], items: [m], badges: [badge], stacks: [stack], fits: [fitGroupId], section, sectionStart: false, sectionLabel: "" });
       }
     };
     displaySections.forEach((displaySection, section) => displaySection.entries.forEach((entry) => {
       if (entry.kind === "group") {
-        const group = state.groups.find((item) => item.id === entry.id);
+        const group = groupById.get(entry.id);
         if (!group) return;
         const items = group.memberIds
           .map(mediaById)
@@ -1484,7 +1899,15 @@ export function Gallery({
           const cover = items.find((media) => media.id === group.coverId) ?? items[0];
           if (!cover) return;
           const rest = items.filter((media) => media.id !== cover.id);
+          inline.add(group.id);
           pushRun(entry, cover, section, items.length, [cover, ...rest].slice(0, STACK_MAX_ITEMS));
+        } else if (group.fit && items.length > 1 && items.length <= fitBudget) {
+          // Small enough to sit in an ordinary row: its members become cells
+          // like any other card, tagged so the solver keeps them together and
+          // the row draws one frame around them. Each is still a member, so
+          // it behaves exactly like a member of an expanded Group.
+          inline.add(group.id);
+          items.forEach((media) => pushRun({ kind: "media", id: media.id }, media, section, undefined, undefined, group.id));
         } else {
           nextBlocks.push({ kind: "group", entry, items, section, sectionStart: false, sectionLabel: "" });
         }
@@ -1499,21 +1922,14 @@ export function Gallery({
       block.sectionLabel = block.sectionStart ? displaySections[block.section]?.label ?? "" : "";
       markedSections.add(block.section);
     });
-    return nextBlocks;
-  }, [displaySections, groupBy.length, mediaById, state.groups, visibleMediaIdSet]);
+    return { blocks: nextBlocks, inline };
+  }, [displaySections, fitBudget, groupBy.length, groupById, mediaById, visibleMediaIdSet]);
+  inlineGroupIds.current = blocks.inline;
 
-  // Large libraries used to build every justified row and every card at
-  // once. Even though thumbnails were lazy, thousands of DOM nodes, menus,
-  // and event handlers still made opening and scrolling a Gallery janky.
-  // Window the same justified rows used by ordinary Galleries instead of
-  // switching to a fixed-card grid: Gallery size must never change image
-  // aspect ratios or visual layout.
   // Collapsed Groups in a justified row occupy a wider frame than their image
   // so the tilted pile gets its own room. The row solver has to know that
-  // width up front or the row overflows the Gallery. The cell size is not
-  // known until the row is solved, so this charges the row for the widest the
-  // insets can get — at the row's height cap. The frame drawn later is never
-  // wider than that, so a row can come up a couple of px short but never over.
+  // width up front, and it is measured at the row's height cap: the pile's
+  // reach only shrinks as the row comes out shorter than that.
   const runStackExtra = useCallback(
     (block: Extract<Block, { kind: "run" }>) => {
       if (galleryLayout !== "justified") return undefined;
@@ -1521,7 +1937,7 @@ export function Gallery({
       return (item: MediaItem, index: number) => {
         const stack = block.stacks[index];
         if (!stack) return 0;
-        const { insets } = stackFrame(mediaRatio(item) * capHeight, capHeight, stack.length, true);
+        const { insets } = stackFrame(mediaRatio(item) * capHeight, capHeight, stack.length);
         return insets.left + insets.right;
       };
     },
@@ -1532,74 +1948,62 @@ export function Gallery({
     item: MediaItem;
     entry: OrderEntry;
     width: number;
-    badge?: number;
-    stack?: MediaItem[];
-    inGroupId?: string;
-    sectionLabel?: string;
+    /** Set on the members of a fitted Group, which sit inside its frame. */
+    height?: number | undefined;
+    badge?: number | undefined;
+    stack?: MediaItem[] | undefined;
+    inGroupId?: string | undefined;
+    /** Set when this cell is one member of a Group laid out to fit its media. */
+    fitGroupId?: string | undefined;
   };
   type VirtualLayoutRow = {
     cells: VirtualCell[];
     height: number;
-    // Height of the media itself. Smaller than `height` on justified rows
-    // that hold a collapsed Group, whose frame is grown to fit its pile.
-    cellHeight: number;
-    sectionLabel?: string;
-    groupKey?: string;
-    groupStart?: boolean;
-    groupEnd?: boolean;
+    sectionLabel?: string | undefined;
+    groupKey?: string | undefined;
+    groupId?: string | undefined;
+    groupStart?: boolean | undefined;
+    groupEnd?: boolean | undefined;
   };
   // This is deliberately independent of scrollTop. The justified row
   // geometry is expensive but only changes when the Gallery data, width, or
   // requested thumbnail height changes.
   const virtualLayout = useMemo(() => {
     const virtualRows: VirtualLayoutRow[] = [];
-    blocks.forEach((block) => {
+    blocks.blocks.forEach((block) => {
       const groupKey = block.kind === "group" ? `${block.section}:${block.entry.id}:${virtualRows.length}` : undefined;
       const rows = block.kind === "group"
         ? groupRows(block.items, width, state.thumbHeight, galleryLayout)
-        : layoutRows(block.items, width, state.thumbHeight, galleryLayout, undefined, runStackExtra(block));
+        : layoutRows(block.items, width, state.thumbHeight, galleryLayout, runStackExtra(block), (index) => block.fits[index]);
       let itemOffset = 0;
       rows.forEach((row, rowIndex) => {
         const sectionLabel = block.sectionStart && rowIndex === 0 ? block.sectionLabel : undefined;
         if (block.kind === "run") {
-          const cells = row.items.map(({ item, width: cellWidth }, index) => {
+          const cells = row.items.map(({ item, width: cellWidth, height: cellHeight }, index) => {
             const itemIndex = itemOffset + index;
             return {
               item,
               width: cellWidth,
-              entry: block.entries[itemIndex] ?? { kind: "media", id: item.id },
+              height: cellHeight,
+              entry: block.entries[itemIndex] ?? { kind: "media" as const, id: item.id },
               badge: block.badges[itemIndex],
               stack: block.stacks[itemIndex],
+              fitGroupId: block.fits[itemIndex],
             };
           });
-          // Square frames stay exactly one cell tall; justified ones grow by
-          // whatever their top and bottom insets ask for, and the row takes
-          // the tallest of them so every card still shares a baseline.
-          const stackExtra = galleryLayout === "justified"
-            ? cells.reduce((tallest, cell) => {
-                if (!cell.stack) return tallest;
-                const { insets } = stackFrame(cell.width, row.height, cell.stack.length, true);
-                return Math.max(tallest, insets.top + insets.bottom);
-              }, 0)
-            : 0;
-          virtualRows.push({
-            height: row.height + stackExtra,
-            cellHeight: row.height,
-            sectionLabel,
-            cells,
-          });
+          virtualRows.push({ height: row.height, sectionLabel, cells });
         } else {
           virtualRows.push({
             height: row.height,
-            cellHeight: row.height,
             sectionLabel,
             groupKey,
+            groupId: block.entry.id,
             groupStart: rowIndex === 0,
             groupEnd: rowIndex === rows.length - 1,
             cells: row.items.map(({ item, width: cellWidth }) => ({
               item,
               width: cellWidth,
-              entry: { kind: "media", id: item.id },
+              entry: { kind: "media" as const, id: item.id },
               inGroupId: block.entry.id,
             })),
           });
@@ -1607,43 +2011,84 @@ export function Gallery({
         itemOffset += row.items.length;
       });
     });
-    let virtualHeight = 0;
+    // A section label sits above its row, and an expanded Group's title band
+    // and padding sit between the label and the Group's first row of media.
+    let y = 0;
     const positionedVirtualRows = virtualRows.map((row) => {
-      // An expanded Group needs its own inner whitespace in virtualized
-      // Galleries too. Previously we only inset rows horizontally, leaving
-      // the first and last media flush with the Group frame.
-      const leadingPadding = row.groupStart ? GROUP_INSET : 0;
-      const trailingPadding = row.groupEnd ? GROUP_INSET : 0;
-      const top = virtualHeight + leadingPadding;
-      virtualHeight = top + row.height + trailingPadding + (row.sectionLabel ? 28 : 0) + GAP;
-      return { ...row, top };
+      let labelTop: number | undefined;
+      if (row.sectionLabel) {
+        labelTop = y;
+        y += SECTION_LABEL_HEIGHT;
+      }
+      const top = y + (row.groupStart ? GROUP_TOP_INSET : 0);
+      y = top + row.height + (row.groupEnd ? GROUP_INSET : 0) + GAP;
+      return { ...row, top, labelTop };
     });
-    const groupFrames = new Map<string, { key: string; top: number; bottom: number }>();
+    const groupFrames = new Map<string, { key: string; id: string; top: number; bottom: number }>();
     positionedVirtualRows.forEach((row) => {
       if (!row.groupKey) return;
-      const frame = groupFrames.get(row.groupKey) ?? { key: row.groupKey, top: row.top - GROUP_INSET, bottom: row.top + row.height };
-      frame.top = Math.min(frame.top, row.top - (row.groupStart ? GROUP_INSET : 0));
+      const frame = groupFrames.get(row.groupKey) ?? { key: row.groupKey, id: row.groupId ?? "", top: row.top - GROUP_TOP_INSET, bottom: row.top + row.height };
+      if (row.groupStart) frame.top = row.top - GROUP_TOP_INSET;
       frame.bottom = Math.max(frame.bottom, row.top + row.height + (row.groupEnd ? GROUP_INSET : 0));
       groupFrames.set(row.groupKey, frame);
     });
     return {
       positionedVirtualRows,
       virtualGroupFrames: [...groupFrames.values()],
-      virtualHeight: Math.max(0, virtualHeight - GAP),
-      mediaCount: virtualRows.reduce((total, row) => total + row.cells.length, 0),
+      virtualHeight: Math.max(0, y - GAP),
     };
   }, [blocks, galleryLayout, runStackExtra, state.thumbHeight, width]);
   const { positionedVirtualRows, virtualGroupFrames, virtualHeight } = virtualLayout;
-  const shouldVirtualize = virtualLayout.mediaCount > 160;
+  virtualGeometry.current = { rows: positionedVirtualRows };
+
+  // The vertical bands an expanded Group can be dropped before or after:
+  // every ordinary row, and every other expanded Group as one block.
+  groupBandsRef.current = useMemo(() => {
+    const bands: GroupBand[] = [];
+    for (const row of positionedVirtualRows) {
+      if (row.groupId) continue;
+      let first = Infinity;
+      let last = -Infinity;
+      for (const cell of row.cells) {
+        const index = cell.fitGroupId ? globalIndex({ kind: "group", id: cell.fitGroupId }) : globalIndex(cell.entry);
+        if (index < 0) continue;
+        first = Math.min(first, index);
+        last = Math.max(last, index);
+      }
+      if (first <= last) bands.push({ top: row.top, bottom: row.top + row.height, first, last });
+    }
+    for (const frame of virtualGroupFrames) {
+      const index = globalIndex({ kind: "group", id: frame.id });
+      if (index >= 0) bands.push({ top: frame.top, bottom: frame.bottom, first: index, last: index, groupId: frame.id });
+    }
+    return bands.sort((a, b) => a.top - b.top);
+  }, [globalIndex, positionedVirtualRows, virtualGroupFrames]);
+
   // Two full screens on either side give thumbnail loading enough lead time
   // without allowing a scroll fling to mount the entire Gallery.
   const virtualOverscan = Math.max(viewportHeight * 2, 640);
   const virtualStart = Math.max(0, scrollTop - (scrollDirection.current === "down" ? virtualOverscan : virtualOverscan * 1.5));
   const virtualEnd = scrollTop + viewportHeight + (scrollDirection.current === "down" ? virtualOverscan * 1.5 : virtualOverscan);
-  let virtualFirstRow = 0;
-  while (virtualFirstRow < positionedVirtualRows.length && positionedVirtualRows[virtualFirstRow]!.top + positionedVirtualRows[virtualFirstRow]!.height < virtualStart) virtualFirstRow += 1;
+  // Rows are sorted by position, so the visible window is found by bisection
+  // rather than by walking every row from the top on every scroll frame.
+  let low = 0;
+  let high = positionedVirtualRows.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    const row = positionedVirtualRows[mid]!;
+    if (row.top + row.height < virtualStart) low = mid + 1;
+    else high = mid;
+  }
+  const virtualFirstRow = low;
   let virtualLastRow = virtualFirstRow;
   while (virtualLastRow < positionedVirtualRows.length && positionedVirtualRows[virtualLastRow]!.top < virtualEnd) virtualLastRow += 1;
+
+  const menuContent = (() => {
+    if (!menuTarget) return null;
+    if (menuTarget.kind === "group") return groupMenu(menuTarget.id);
+    const media = mediaById(menuTarget.id);
+    return media ? mediaMenu(media) : null;
+  })();
 
   if (entries.length === 0) {
     return (
@@ -1654,10 +2099,16 @@ export function Gallery({
     );
   }
 
+  const groupHeaderLabels = { group: c("Group", "Group"), collapse: t("collapseGroup"), drag: t("dragToReorder") };
+  const yRail = drop?.type === "insert" && drop.axis === "y" ? drop.railY : undefined;
+
   return (
+    <ContextMenu onOpenChange={(open) => { if (!open) setMenuTarget(null); }}>
+    <ContextMenuTrigger asChild>
     <div
       ref={containerRef}
       onPointerDown={onBackgroundPointerDown}
+      onContextMenu={onGalleryContextMenu}
       onScroll={(event) => {
         const next = event.currentTarget.scrollTop;
         pendingScrollTop.current = next;
@@ -1672,176 +2123,136 @@ export function Gallery({
       }}
       className="app-scroll relative min-w-0 flex-1 overflow-y-auto px-5 py-4"
       >
-      {shouldVirtualize ? (
         <div ref={innerRef} className="relative w-full min-w-0" style={{ height: virtualHeight }}>
-          {virtualGroupFrames.map((frame) => (
-            <div
-              key={frame.key}
-              aria-hidden
-              className="pointer-events-none absolute right-0 left-0 box-border rounded-xl border-2 border-primary/40 bg-primary/[0.035] shadow-[inset_0_0_0_1px_rgb(255_255_255_/_0.08)]"
-              style={{ top: frame.top, height: frame.bottom - frame.top }}
-            />
-          ))}
+          {/* An expanded Group's frame, title band and controls. The frame
+              is painted before the rows, so the member cards above it still
+              receive their own clicks; the band itself sits above the first
+              row of media and is never covered by one. */}
+          {virtualGroupFrames.map((frame) => {
+            const group = groupById.get(frame.id);
+            if (!group) return null;
+            const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
+            return (
+              <div
+                key={frame.key}
+                data-group-id={group.id}
+                className={cn(
+                  GROUP_FRAME_CLASS,
+                  "absolute right-0 left-0 transition-opacity",
+                  drag?.id === group.id && "opacity-50",
+                  holdingGroup && "ring-2 ring-primary/60",
+                )}
+                style={{ top: frame.top, height: frame.bottom - frame.top }}
+              >
+                <GroupHeader
+                  name={group.name.trim()}
+                  count={group.memberIds.filter((id) => visibleMediaIdSet.has(id)).length}
+                  labels={groupHeaderLabels}
+                  onGripPointerDown={(event) => {
+                    event.stopPropagation();
+                    startPointer(event, { kind: "group", id: group.id });
+                  }}
+                  onCollapse={() => updateGroup(group.id, { collapsed: true })}
+                />
+              </div>
+            );
+          })}
           {positionedVirtualRows.slice(virtualFirstRow, virtualLastRow).map((row, offset) => {
             const rowIndex = virtualFirstRow + offset;
-            const inGroup = Boolean(row.cells[0]?.inGroupId);
-            const priorityThumbnail = row.top + row.height >= scrollTop - 120
+            // A fitted Group's members sit in an ordinary row beside loose
+            // cards, so only the rows of an expanded Group take the inset.
+            const inGroup = Boolean(row.groupId);
+            const priority = row.top + row.height >= scrollTop - 120
               && row.top <= scrollTop + viewportHeight + 320;
+            const distance = Math.abs(row.top + row.height / 2 - (scrollTop + viewportHeight / 2));
+            // Consecutive members of one fitted Group are wrapped in its frame.
+            const segments: Array<{ fitGroupId?: string | undefined; cells: VirtualCell[] }> = [];
+            for (const cell of row.cells) {
+              const last = segments[segments.length - 1];
+              if (cell.fitGroupId && last?.fitGroupId === cell.fitGroupId) last.cells.push(cell);
+              else segments.push({ fitGroupId: cell.fitGroupId, cells: [cell] });
+            }
+            const card = (cell: VirtualCell) => renderCard(cell.item, cell.entry, cell.width, cell.height ?? row.height, {
+              badge: cell.badge,
+              stack: cell.stack,
+              inGroupId: cell.inGroupId ?? cell.fitGroupId,
+              priority,
+              distance,
+            });
             return (
               <Fragment key={`virtual-${rowIndex}`}>
-                {row.sectionLabel && (
-                  <div className="absolute right-0 left-0" style={{ top: row.top }}>
+                {row.labelTop !== undefined && row.sectionLabel && (
+                  <div className="absolute right-0 left-0" style={{ top: row.labelTop }}>
                     <GroupDivider label={row.sectionLabel} />
                   </div>
                 )}
                 <div
                   data-library-row
-                  className="absolute flex items-center"
+                  // A Group's rows are painted over its frame, so the row box
+                  // would otherwise swallow every right-click that lands in a
+                  // gap between cards or in the blank tail of a short row, and
+                  // the Group would only answer on the thin strips of padding
+                  // the rows do not cover. The row itself needs no pointer
+                  // events — only its cards do — so let the rest fall through
+                  // to the frame beneath.
+                  className={cn("absolute flex items-center", inGroup && "pointer-events-none")}
                   style={{
-                    top: row.top + (row.sectionLabel ? 28 : 0),
+                    top: row.top,
                     left: inGroup ? GROUP_INSET : 0,
                     right: inGroup ? GROUP_INSET : 0,
                     gap: GAP,
                     height: row.height,
                   }}
                 >
-                  {row.cells.map((cell) => renderMedia(
-                    cell.item,
-                    cell.entry,
-                    cell.width,
-                    row.cellHeight,
-                    cell.badge,
-                    cell.stack,
-                    cell.inGroupId,
-                    priorityThumbnail,
-                    Math.abs(row.top + row.height / 2 - (scrollTop + viewportHeight / 2)),
-                  ))}
+                  {segments.flatMap((segment) => {
+                    if (!segment.fitGroupId) return segment.cells.map(card);
+                    const group = groupById.get(segment.fitGroupId);
+                    if (!group) return segment.cells.map(card);
+                    // A Group fitted to its media: one frame around exactly
+                    // its members, the same span they would take as loose
+                    // cards, with the same title band as an expanded Group.
+                    return (
+                      <div
+                        key={`fit-${group.id}`}
+                        data-group-id={group.id}
+                        className={cn(GROUP_FRAME_CLASS, "relative flex shrink-0 items-start transition-opacity", drag?.id === group.id && "opacity-50")}
+                        style={{
+                          height: row.height,
+                          gap: GAP,
+                          paddingTop: GROUP_HEADER,
+                          paddingRight: GROUP_PAD,
+                          paddingBottom: GROUP_PAD,
+                          paddingLeft: GROUP_PAD,
+                        }}
+                      >
+                        <GroupHeader
+                          name={group.name.trim()}
+                          count={segment.cells.length}
+                          labels={groupHeaderLabels}
+                          compact
+                          onGripPointerDown={(event) => {
+                            event.stopPropagation();
+                            startPointer(event, { kind: "group", id: group.id });
+                          }}
+                          onCollapse={() => updateGroup(group.id, { collapsed: true })}
+                        />
+                        {segment.cells.map(card)}
+                      </div>
+                    );
+                  })}
                 </div>
               </Fragment>
             );
           })}
+          {/* Where a dragged expanded Group will land: between two rows. */}
+          {yRail !== undefined && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute right-0 left-0 z-50 block h-1 rounded-full border border-white/30 bg-primary shadow-[0_0_0_2px_rgb(255_255_255_/_0.16),0_0_16px_rgb(255_255_255_/_0.3)]"
+              style={{ top: yRail - 2 }}
+            />
+          )}
         </div>
-      ) : (
-      <div ref={innerRef} className="flex w-full min-w-0 flex-col" style={{ gap: GAP }}>
-        {blocks.map((block, bi) => {
-          if (block.kind === "run") {
-            return layoutRows(block.items, width, state.thumbHeight, galleryLayout, undefined, runStackExtra(block)).map((row, ri) => {
-              const cells = row.items.map(({ item, width: w }) => {
-                const i = block.items.indexOf(item);
-                const entry = block.entries[i] ?? { kind: "media" as const, id: item.id };
-                return { item, w, entry, badge: block.badges[i], stack: block.stacks[i] };
-              });
-              const groupBar =
-                drag?.kind === "group" && drop?.type === "insert"
-                  ? cells.some((c) => drop.index === globalIndex(c.entry))
-                    ? "before"
-                    : cells.some((c) => drop.index === globalIndex(c.entry) + 1)
-                      ? "after"
-                      : null
-                  : null;
-              return (
-                <Fragment key={`${bi}-${ri}`}>
-                  {block.sectionStart && ri === 0 && <GroupDivider label={block.sectionLabel} />}
-                  <div data-library-row className="relative flex items-center" style={{ gap: GAP }}>
-                    {cells.map(({ item, w, entry, badge, stack }) =>
-                      renderMedia(item, entry, w, row.height, badge, stack),
-                    )}
-                    {groupBar === "before" && (
-                      <span className="pointer-events-none absolute -top-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
-                    )}
-                    {groupBar === "after" && (
-                      <span className="pointer-events-none absolute -bottom-[5px] right-1 left-1 h-[3px] rounded-full bg-primary" />
-                    )}
-                  </div>
-                </Fragment>
-              );
-            });
-          }
-          const group = state.groups.find((g) => g.id === block.entry.id)!;
-          const gi = globalIndex(block.entry);
-          const rows = groupRows(block.items, width, state.thumbHeight, galleryLayout);
-          const holdingGroup = drop?.type === "hold" && drop.kind === "group" && drop.id === group.id;
-          const insertY =
-            drop?.type === "insert" && drop.axis === "y"
-              ? drop.index === gi
-                ? "before"
-                : drop.index === gi + 1
-                  ? "after"
-                  : null
-              : null;
-          const insertX =
-            drop?.type === "insert" && drop.axis === "x"
-              ? drop.index === gi
-                ? "before"
-                : drop.index === gi + 1
-                  ? "after"
-                  : null
-              : null;
-          return (
-            <Fragment key={group.id}>
-              {block.sectionStart && <GroupDivider label={block.sectionLabel} />}
-              <ContextMenu>
-              <ContextMenuTrigger asChild>
-                <div
-                  data-group-id={group.id}
-                  style={{
-                    padding: GROUP_PAD,
-                    marginTop: dwelled && insertY === "before" ? SPREAD : undefined,
-                    marginBottom: dwelled && insertY === "after" ? SPREAD : undefined,
-                  }}
-                  className={cn(
-                    "glass-panel group/frame relative box-border w-full rounded-xl border-2 border-primary/40 bg-primary/[0.035] shadow-[inset_0_0_0_1px_rgb(255_255_255_/_0.08)] transition-all",
-                    drag?.id === group.id && "opacity-50",
-                    holdingGroup && "ring-2 ring-primary/60",
-                  )}
-                >
-                  <div className="flex min-w-0 flex-col" style={{ gap: GAP }}>
-                    {!group.collapsed &&
-                      rows.map((row, ri) => (
-                        <div key={ri} className="flex min-w-0" style={{ gap: GAP }}>
-                          {row.items.map(({ item, width: w }) =>
-                            renderMedia(
-                              item,
-                              { kind: "media", id: item.id },
-                              w,
-                              row.height,
-                              undefined,
-                              undefined,
-                              group.id,
-                            ),
-                          )}
-                        </div>
-                      ))}
-                    {group.collapsed && (
-                      <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
-                        {t("count", { count: block.items.length })}
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      startPointer(e, block.entry);
-                    }}
-                    aria-label={t("dragToReorder")}
-                    title={t("dragToReorder")}
-                    className="glass-float absolute bottom-1.5 left-1.5 z-30 grid size-6 cursor-grab place-items-center rounded-md opacity-0 transition-opacity group-hover/frame:opacity-100 active:cursor-grabbing"
-                  >
-                    <GripVertical className="size-3.5" />
-                  </button>
-                  {holdingGroup && needsHold(drop) && <HoldRing progress={holdProgress} />}
-                  {insertY === "before" && <InsertBar horizontal side="top" spread={dwelled} />}
-                  {insertY === "after" && <InsertBar horizontal side="bottom" spread={dwelled} />}
-                </div>
-
-              </ContextMenuTrigger>
-              {groupMenu(group.id)}
-              </ContextMenu>
-            </Fragment>
-          );
-        })}
-      </div>
-      )}
 
       {libraryRail && (
         <span
@@ -1851,20 +2262,12 @@ export function Gallery({
         />
       )}
 
-      {dragPreviewId && dragPoint && mediaById(dragPreviewId) && (
-        <div
-          aria-hidden
-          className="pointer-events-none fixed z-[80] h-20 w-28 overflow-hidden rounded-lg border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm"
-          style={{ left: dragPoint.x + 14, top: dragPoint.y + 14 }}
-        >
-          {selected.includes(dragPreviewId) && selected.length > 1 ? (
-            <span className="grid size-full place-items-center bg-background/70 px-2 text-center text-sm font-medium text-foreground">
-              {selected.length} items
-            </span>
-          ) : (
-            <DragPreviewImage media={mediaById(dragPreviewId)!} />
-          )}
-        </div>
+      {dragPreviewId && dragOrigin && mediaById(dragPreviewId) && (
+        <DragPreview
+          media={mediaById(dragPreviewId)!}
+          origin={dragOrigin}
+          count={selectedSet.has(dragPreviewId) && selected.length > 1 ? selected.length : 1}
+        />
       )}
 
       {marquee && (
@@ -1874,11 +2277,48 @@ export function Gallery({
         />
       )}
 
-      {drop?.type === "hold" && drop.kind === "ungroup" && needsHold(drop) && (
+      {drop?.type === "hold" && drop.kind === "ungroup" && needsHold(drop) && holdStart !== null && (
         <div className="glass-float pointer-events-none fixed bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full px-4 py-2 text-xs">
-          {t("removeFromGroup")} · {((1 - holdProgress) * (HOLD_MS / 1000)).toFixed(1)}s
+          {t("removeFromGroup")} · <HoldCountdown start={holdStart} />
         </div>
       )}
+
+      <Dialog open={!!groupNameDialog} onOpenChange={(open) => !open && setGroupNameDialog(null)}>
+        <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float rounded-2xl">
+          <DialogHeader>
+            <DialogTitle className="font-display">{c(groupNameDialog?.name.trim() ? "Đổi tên group" : "Đặt tên group", groupNameDialog?.name.trim() ? "Rename group" : "Set Group Name")}</DialogTitle>
+          </DialogHeader>
+          <input
+            autoFocus
+            value={groupNameDialog?.name ?? ""}
+            onChange={(event) => setGroupNameDialog((group) => group ? { ...group, name: event.target.value } : group)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              const name = groupNameDialog?.name.trim();
+              if (!groupNameDialog || !name) return;
+              updateGroup(groupNameDialog.id, { name });
+              setGroupNameDialog(null);
+            }}
+            placeholder={c("Tên group", "Group name")}
+            className="w-full rounded-lg border border-border bg-background/60 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+          />
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setGroupNameDialog(null)} className="glass-btn rounded-lg px-4 py-2 text-sm">{c("Hủy", "Cancel")}</button>
+            <button
+              disabled={!groupNameDialog?.name.trim()}
+              onClick={() => {
+                const name = groupNameDialog?.name.trim();
+                if (!groupNameDialog || !name) return;
+                updateGroup(groupNameDialog.id, { name });
+                setGroupNameDialog(null);
+              }}
+              className="rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-45"
+            >
+              {c("Lưu", "Save")}
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
       <Dialog open={!!addToGalleryFor} onOpenChange={(open) => !open && setAddToGalleryFor(null)}>
         <DialogContent onPointerDown={stopCanvasPointerDown} className="glass-float max-w-md rounded-2xl">
           <DialogHeader><DialogTitle className="font-display">{t("addToFolder")}</DialogTitle></DialogHeader>
@@ -1887,7 +2327,7 @@ export function Gallery({
             {galleryPickerFolders.map((folder) => {
               const alreadyAdded = !!addToGalleryFor && folder.mediaIds.includes(addToGalleryFor);
               const cover = galleryCover(folder.id);
-              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">{t("added")}</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
+              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (addToGalleryFor) addToFolder(folder.id, [addToGalleryFor]); setAddToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <LazyThumbnail media={cover} priority thumbnailSize={160} className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span>{alreadyAdded ? <span className="text-xs text-muted-foreground">{t("added")}</span> : <FolderPlus className="size-4 text-muted-foreground" />}</button>;
             })}
             {state.folders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("noGalleries")}</p>}
             {state.folders.length > 0 && galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("galleryNotFound")}</p>}
@@ -1921,12 +2361,68 @@ export function Gallery({
               const mediaIds = addGroupToGalleryFor ?? [];
               const alreadyAdded = mediaIds.length > 0 && mediaIds.every((id) => folder.mediaIds.includes(id));
               const cover = galleryCover(folder.id);
-              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (mediaIds.length) addToFolder(folder.id, mediaIds); setAddGroupToGalleryFor(null); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <img src={cover} alt="" className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span><FolderPlus className="size-4 text-muted-foreground" /></button>;
+              return <button key={folder.id} disabled={alreadyAdded} onClick={() => { if (mediaIds.length) addToFolder(folder.id, mediaIds); setAddGroupToGalleryFor(null); setSelected([]); }} className={cn("glass-btn flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm", alreadyAdded && "cursor-not-allowed opacity-45")}>{cover ? <LazyThumbnail media={cover} priority thumbnailSize={160} className="size-8 shrink-0 rounded-md object-cover" /> : <span className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary/60"><Folder className="size-4 text-muted-foreground" /></span>}<span className="flex-1 truncate">{folder.name}</span><FolderPlus className="size-4 text-muted-foreground" /></button>;
             })}
             {galleryPickerFolders.length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">{t("galleryNotFound")}</p>}
           </div>
         </DialogContent>
       </Dialog>
+    </div>
+    </ContextMenuTrigger>
+    {menuContent}
+    </ContextMenu>
+  );
+}
+
+const SECTION_LABEL_HEIGHT = 28;
+
+/**
+ * One look for every Group frame — expanded, or fitted to its media. A clear
+ * tinted tray with a strong border, so a Group reads as a single container
+ * among loose cards at any zoom level.
+ */
+const GROUP_FRAME_CLASS =
+  "box-border rounded-xl border border-primary/30 bg-primary/[0.05] shadow-[inset_0_1px_0_rgb(255_255_255_/_0.04)]";
+
+/**
+ * The title band across the top of a Group frame: drag handle, Group icon,
+ * name, member count and the collapse control. It lives in the frame's own top
+ * padding, so it never covers a photo.
+ */
+function GroupHeader({ name, count, labels, compact = false, onGripPointerDown, onCollapse }: {
+  name: string;
+  count: number;
+  labels: { group: string; collapse: string; drag: string };
+  compact?: boolean;
+  onGripPointerDown: (event: React.PointerEvent) => void;
+  onCollapse: () => void;
+}) {
+  return (
+    <div
+      className="absolute top-0 right-0 left-0 flex items-center gap-1 rounded-t-[11px] border-b border-primary/15 bg-primary/[0.06] px-1 text-[11px] leading-none"
+      style={{ height: GROUP_HEADER - 4 }}
+    >
+      <button
+        type="button"
+        onPointerDown={onGripPointerDown}
+        aria-label={labels.drag}
+        title={labels.drag}
+        className="grid size-5 shrink-0 cursor-grab place-items-center rounded-md text-muted-foreground/60 transition-colors hover:bg-primary/15 hover:text-primary active:cursor-grabbing"
+      >
+        <GripVertical className="size-3.5" />
+      </button>
+      <LayersIcon className="size-3.5 shrink-0 text-primary/75" aria-hidden />
+      <span
+        className={cn(
+          "min-w-0 truncate font-medium tracking-tight",
+          name ? "text-foreground/85" : "text-muted-foreground",
+          compact && !name && "sr-only",
+        )}
+      >
+        {name || labels.group}
+      </span>
+      <span className="min-w-1 flex-1" />
+      <GroupCountPill count={count} collapsed={false} onToggle={onCollapse} label={labels.collapse} className="shrink-0" />
     </div>
   );
 }
@@ -1941,44 +2437,84 @@ function GroupDivider({ label }: { label: string }) {
   );
 }
 
-/** Old-style insertion rail, restyled with the app's translucent glass material. */
-function InsertBar({
-  side,
-  spread,
-  horizontal,
-}: {
-  side: "left" | "right" | "top" | "bottom";
-  spread: boolean;
-  horizontal?: boolean;
+/**
+ * A Media Group's member count, which doubles as its expand/collapse control.
+ * Hovering swaps the count for the action it performs. Both live in the same
+ * grid cell behind a fixed height, so the pill never resizes as they trade
+ * places.
+ */
+function GroupCountPill({ count, collapsed, onToggle, label, className, style }: {
+  count: number;
+  collapsed: boolean;
+  onToggle: () => void;
+  label: string;
+  className?: string;
+  style?: CSSProperties;
 }) {
-  if (horizontal) {
-    return (
-      <span
-        className={cn(
-          "pointer-events-none absolute inset-x-1 z-30 block h-1 rounded-full border border-white/20 bg-primary shadow-[0_0_0_2px_rgb(255_255_255_/_0.16),0_0_14px_rgb(255_255_255_/_0.22)] backdrop-blur-md transition-all",
-          side === "top" ? "-top-[6px]" : "-bottom-[6px]",
-          spread && "h-[5px]",
-        )}
-      />
-    );
-  }
+  const Icon = collapsed ? Maximize2 : Minimize2;
+  return (
+    <button
+      type="button"
+      // The card underneath starts a drag on pointerdown, so the press that
+      // opens this control must not also pick the Group up.
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => { event.stopPropagation(); onToggle(); }}
+      title={label}
+      aria-label={label}
+      style={style}
+      className={cn(
+        "grid h-[18px] min-w-[30px] place-items-center rounded-md border border-primary/35 bg-background/85 px-1.5 text-[11px] leading-none font-medium text-foreground/85 shadow-sm backdrop-blur-md transition-colors",
+        "hover:border-primary hover:bg-primary hover:text-primary-foreground",
+        "group/count",
+        className,
+      )}
+    >
+      <span className="col-start-1 row-start-1 inline-flex items-center gap-1 transition-opacity group-hover/count:opacity-0">
+        <LayersIcon className="size-3 text-primary/75" aria-hidden />
+        {count}
+      </span>
+      <Icon className="col-start-1 row-start-1 size-3 opacity-0 transition-opacity group-hover/count:opacity-100" />
+    </button>
+  );
+}
+
+/** Old-style insertion rail, restyled with the app's translucent glass material. */
+function InsertBar({ side }: { side: "left" | "right" }) {
   return (
     <span
       className={cn(
         "pointer-events-none absolute inset-y-0 z-30 block w-1 rounded-full border border-white/20 bg-primary shadow-[0_0_0_2px_rgb(255_255_255_/_0.16),0_0_14px_rgb(255_255_255_/_0.22)] backdrop-blur-md transition-all",
         side === "left" ? "-left-[6px]" : "-right-[6px]",
-        spread && "w-[5px]",
       )}
     />
   );
 }
 
+/** Seconds left on a hold that started at `start`, counting itself down. */
+function useHoldProgress(start: number) {
+  const [progress, setProgress] = useState(() => Math.min(1, (performance.now() - start) / HOLD_MS));
+  useEffect(() => {
+    let raf = 0;
+    const tick = () => {
+      const next = Math.min(1, (performance.now() - start) / HOLD_MS);
+      setProgress(next);
+      if (next < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [start]);
+  return progress;
+}
 
-
-function HoldRing({ progress }: { progress: number }) {
+/**
+ * The hold-to-group ring. It animates itself from the moment the hold began,
+ * so only this ring re-renders each frame, not the whole Gallery.
+ */
+function HoldRing({ start }: { start: number }) {
+  const progress = useHoldProgress(start);
   return (
-    <div className="pointer-events-none absolute inset-0 grid place-items-center bg-background/20 backdrop-blur-[1px]">
-      <svg viewBox="0 0 36 36" className="size-12 -rotate-90">
+    <div className="pointer-events-none absolute inset-0 z-30 grid place-items-center bg-background/20 backdrop-blur-[1px]">
+      <svg viewBox="0 0 36 36" className="size-12 max-h-[70%] max-w-[70%] -rotate-90">
         <circle cx="18" cy="18" r="15" className="fill-none stroke-border/40" strokeWidth="3" />
         <circle
           cx="18"
@@ -1994,3 +2530,237 @@ function HoldRing({ progress }: { progress: number }) {
     </div>
   );
 }
+
+function HoldCountdown({ start }: { start: number }) {
+  const progress = useHoldProgress(start);
+  return <>{((1 - progress) * (HOLD_MS / 1000)).toFixed(1)}s</>;
+}
+
+/**
+ * The card that follows the pointer during a drag. It moves itself with a
+ * transform on every pointer move instead of through React state, so the
+ * Gallery underneath is not re-rendered to move it.
+ */
+const DragPreview = memo(function DragPreview({ media, origin, count }: { media: MediaItem; origin: { x: number; y: number }; count: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const element = ref.current;
+      if (element) element.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`;
+    };
+    window.addEventListener("pointermove", move, { passive: true });
+    return () => window.removeEventListener("pointermove", move);
+  }, []);
+  return (
+    <div
+      ref={ref}
+      aria-hidden
+      className="pointer-events-none fixed top-0 left-0 z-[80] h-20 w-28 overflow-hidden rounded-lg border border-white/35 bg-background/35 opacity-60 shadow-2xl backdrop-blur-sm will-change-transform"
+      style={{ transform: `translate3d(${origin.x + 14}px, ${origin.y + 14}px, 0)` }}
+    >
+      {count > 1 ? (
+        <span className="grid size-full place-items-center bg-background/70 px-2 text-center text-sm font-medium text-foreground">
+          {count} items
+        </span>
+      ) : (
+        <LazyThumbnail media={media} priority className="size-full object-cover" thumbnailSize={160} />
+      )}
+    </div>
+  );
+});
+
+type CardActions = {
+  pointerDown: (event: React.PointerEvent, entry: OrderEntry, mediaId?: string) => void;
+  select: (event: React.MouseEvent | React.KeyboardEvent, id: string) => void;
+  open: (id: string) => void;
+  toggleFavorite: (id: string) => void;
+  expandGroup: (groupId: string) => void;
+};
+
+type MediaCardProps = {
+  media: MediaItem;
+  entryKind: "media" | "group";
+  entryId: string;
+  width: number;
+  height: number;
+  badge?: number | undefined;
+  stack?: MediaItem[] | undefined;
+  inGroupId?: string | undefined;
+  priority: boolean;
+  /** A queue-ordering hint read once when the thumbnail is requested. */
+  distance: number;
+  selected: boolean;
+  dimmed: boolean;
+  /** When the hold-to-group on this card began, if it is the hold target. */
+  holdStart: number | null;
+  memberRail: "left" | "right" | null;
+  groupName?: string | undefined;
+  labels: { expandGroup: string; dragToReorder: string };
+  actions: CardActions;
+};
+
+// `distance` changes on every scroll frame but is only read when a thumbnail
+// is first requested; re-rendering every visible card for it is what made
+// scrolling heavy. Everything else is compared as usual.
+function cardPropsEqual(previous: MediaCardProps, next: MediaCardProps) {
+  for (const key of Object.keys(next) as (keyof MediaCardProps)[]) {
+    if (key === "distance") continue;
+    if (previous[key] !== next[key]) return false;
+  }
+  return true;
+}
+
+/**
+ * One card of the Gallery: a media, or the cover of a collapsed Group. Memo-
+ * ized, so a drag, a hover or a scroll only re-renders the cards it changes.
+ */
+const MediaCard = memo(function MediaCard({
+  media: m,
+  entryKind,
+  entryId,
+  width: w,
+  height: h,
+  badge,
+  stack,
+  inGroupId,
+  priority,
+  distance,
+  selected: isSelected,
+  dimmed,
+  holdStart,
+  memberRail,
+  groupName,
+  labels,
+  actions,
+}: MediaCardProps) {
+  const pile = stack ? stackFrame(w, h, stack.length) : null;
+  return (
+    <div
+      data-media-id={m.id}
+      data-entry-id={entryId}
+      data-entry-kind={entryKind}
+      data-in-group={inGroupId}
+      style={pile
+        ? {
+            width: pile.width + pile.insets.left + pile.insets.right,
+            height: pile.height + pile.insets.top + pile.insets.bottom,
+            // The frame is border-box and carries a 2px border, so the
+            // padding is the inset less that border. The content box is
+            // then exactly the cover.
+            paddingTop: pile.insets.top - 2,
+            paddingRight: pile.insets.right - 2,
+            paddingBottom: pile.insets.bottom - 2,
+            paddingLeft: pile.insets.left - 2,
+          }
+        : { width: w, height: h }}
+      onPointerDown={(e) => actions.pointerDown(e, { kind: entryKind, id: entryId }, m.id)}
+      onClick={(e) => actions.select(e, m.id)}
+      onDoubleClick={() => actions.open(m.id)}
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") actions.open(m.id);
+        if (e.key === " ") {
+          e.preventDefault();
+          actions.select(e, m.id);
+        }
+      }}
+      className={cn(
+        // Keep text unselectable while pointer dragging. The drag
+        // gesture is handled in the renderer so Gallery reordering,
+        // hover-to-group, and dropping onto the Sidebar share it.
+        // pointer-events-auto: a Group's row is transparent to pointer
+        // events so its frame can answer the gaps; the cards must opt
+        // back in.
+        "pointer-events-auto select-none group relative shrink-0 rounded-lg border transition-[box-shadow,opacity,border-color] duration-200 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+        stack ? "box-border overflow-visible border-2 border-primary/40 bg-primary/[0.06] shadow-[0_0_0_1px_rgb(0_0_0_/_0.25)]" : "overflow-hidden",
+        isSelected
+          ? "border-primary ring-[3px] ring-primary/90 shadow-[0_0_0_1px_rgb(255_255_255_/_0.7)]"
+          : stack ? "hover:shadow-lg" : "border-border/60 hover:shadow-lg",
+        dimmed && "opacity-40",
+        memberRail && "z-20 overflow-visible",
+      )}
+    >
+      {stack && pile ? (
+        // The content box is exactly the cover, so every photo is
+        // `inset-0` and the photos behind simply lean and fan out of it
+        // into the padding the insets already reserved for them.
+        <div className="relative size-full">
+          {stack.map((s, depth) => ({ s, depth })).reverse().map(({ s, depth }) => {
+            const isCover = depth === 0;
+            return (
+              <LazyThumbnail
+                key={s.id}
+                media={s}
+                className={cn(
+                  "absolute inset-0 size-full rounded-md border object-cover",
+                  isCover ? "border-border/70 shadow-lg" : "border-border/50 shadow-soft",
+                )}
+                priority={priority}
+                thumbnailDistance={distance}
+                thumbnailSize={thumbnailSizeForBox(pile.width, pile.height)}
+                style={{
+                  transform: isCover
+                    ? undefined
+                    : `translate(${depth * STACK_STEP}px, ${depth * STACK_STEP}px) rotate(${stackTilt(s.id, depth)}deg)`,
+                  zIndex: stack.length - depth,
+                }}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <LazyThumbnail media={m} className="size-full object-cover" priority={priority} thumbnailDistance={distance} thumbnailSize={thumbnailSizeForBox(w, h)} />
+      )}
+      {m.type === "video" && !stack && <VideoHoverPreview media={m} compact={w < 96 || h < 72} />}
+      {m.type === "video" && !stack && (
+        <span className="glass-panel pointer-events-none absolute top-1.5 left-1.5 grid size-6 place-items-center rounded-full">
+          <Play className="size-3" />
+        </span>
+      )}
+      {!stack && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            actions.toggleFavorite(m.id);
+          }}
+          className={cn(
+            "absolute top-1 right-1 grid size-5 place-items-center rounded-full border border-glass-border/50 bg-glass/40 shadow-soft backdrop-blur-md transition-opacity",
+            m.favorite ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+          )}
+        >
+          <Heart className={cn("size-2.5", m.favorite && "fill-favorite text-favorite")} />
+        </button>
+      )}
+      {badge !== undefined && (
+        <GroupCountPill
+          count={badge}
+          collapsed
+          onToggle={() => actions.expandGroup(entryId)}
+          label={labels.expandGroup}
+          className="absolute right-2 bottom-2 z-20"
+        />
+      )}
+      {stack && (
+        <span
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            actions.pointerDown(e, { kind: entryKind, id: entryId }, m.id);
+          }}
+          title={labels.dragToReorder}
+          className="glass-float absolute bottom-2 left-2 z-20 grid size-6 cursor-grab place-items-center rounded-md opacity-0 transition-opacity group-hover:opacity-100"
+        >
+          <GripVertical className="size-3.5" />
+        </span>
+      )}
+      {groupName && (
+        <span className="pointer-events-none absolute top-[3px] left-[3px] z-30 inline-flex max-w-[calc(100%-1rem)] items-center gap-1 truncate whitespace-nowrap rounded-md border border-primary/30 bg-background/80 px-1.5 py-0.5 text-[11px] leading-none font-medium tracking-tight text-foreground/90 shadow-sm backdrop-blur-md">
+          <LayersIcon className="size-3 shrink-0 text-primary/75" aria-hidden />
+          <span className="truncate">{groupName}</span>
+        </span>
+      )}
+      {holdStart !== null && <HoldRing start={holdStart} />}
+      {memberRail && <InsertBar side={memberRail} />}
+    </div>
+  );
+}, cardPropsEqual);
